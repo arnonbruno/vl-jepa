@@ -1,0 +1,92 @@
+[
+  {
+    "epoch": 1,
+    "avg_vision_loss": 9.049050991351788,
+    "avg_language_loss": 10.408745563947237,
+    "avg_total_loss": 19.45779654918573
+  },
+  {
+    "epoch": 2,
+    "avg_vision_loss": 9.032862565456293,
+    "avg_language_loss": 10.367376193022116,
+    "avg_total_loss": 19.40023885629116
+  },
+  {
+    "epoch": 3,
+    "avg_vision_loss": 9.030285437901815,
+    "avg_language_loss": 10.361160645118126,
+    "avg_total_loss": 19.391446040226864
+  },
+  {
+    "epoch": 4,
+    "avg_vision_loss": 9.028202753800612,
+    "avg_language_loss": 10.356916776070229,
+    "avg_total_loss": 19.385119425944794
+  },
+  {
+    "epoch": 5,
+    "avg_vision_loss": 9.026774174127823,
+    "avg_language_loss": 10.353160760341547,
+    "avg_total_loss": 19.379934934469368
+  },
+  {
+    "epoch": 6,
+    "avg_vision_loss": 9.02540628115336,
+    "avg_language_loss": 10.350794871648153,
+    "avg_total_loss": 19.3762011772547
+  },
+  {
+    "epoch": 7,
+    "avg_vision_loss": 9.02416799007318,
+    "avg_language_loss": 10.348965296378502,
+    "avg_total_loss": 19.37313323143201
+  },
+  {
+    "epoch": 8,
+    "avg_vision_loss": 9.023383122224073,
+    "avg_language_loss": 10.346783699133457,
+    "avg_total_loss": 19.37016682747083
+  },
+  {
+    "epoch": 9,
+    "avg_vision_loss": 9.022427088175064,
+    "avg_language_loss": 10.344733103727682,
+    "avg_total_loss": 19.36716018578945
+  },
+  {
+    "epoch": 10,
+    "avg_vision_loss": 9.021646866431603,
+    "avg_language_loss": 10.343696844883453,
+    "avg_total_loss": 19.365343656295384
+  },
+  {
+    "epoch": 11,
+    "avg_vision_loss": 9.020777390553402,
+    "avg_language_loss": 10.34261364203233,
+    "avg_total_loss": 19.363391057038918
+  },
+  {
+    "epoch": 12,
+    "avg_vision_loss": 9.02010860809913,
+    "avg_language_loss": 10.341387687585293,
+    "avg_total_loss": 19.361496314024315
+  },
+  {
+    "epoch": 13,
+    "avg_vision_loss": 9.019546307050264,
+    "avg_language_loss": 10.3401084007361,
+    "avg_total_loss": 19.35965475669274
+  },
+  {
+    "epoch": 14,
+    "avg_vision_loss": 9.018821911934095,
+    "avg_language_loss": 10.339351550126688,
+    "avg_total_loss": 19.35817350485386
+  },
+  {
+    "epoch": 15,
+    "avg_vision_loss": 9.018204695139175,
+    "avg_language_loss": 10.33869558114272,
+    "avg_total_loss": 19.356900239602112
+  }
+]

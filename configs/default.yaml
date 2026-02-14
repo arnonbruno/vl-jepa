@@ -1,0 +1,36 @@
+# VL-JEPA Default Configuration
+
+# Model
+model:
+  hidden_dim: 768
+  patch_size: 16
+  image_size: 224
+  vocab_size_vision: 8192
+  vocab_size_language: 30522
+  num_heads: 12
+  num_layers: 12
+  ff_dim: 3072
+
+# Training
+training:
+  batch_size: 32
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  num_epochs: 10
+  warmup_steps: 1000
+  
+# Data
+data:
+  num_workers: 4
+  prefetch: 2
+  
+# Logging
+logging:
+  log_every: 100
+  eval_every: 500
+  checkpoint_every: 1000
+  
+# Hardware
+device: cuda  # or 'cpu'
+mixed_precision: true
+gradient_clip: 1.0
