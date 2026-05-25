@@ -3,6 +3,8 @@ Experiment 08: Large-Scale Synthetic Training (50 Epochs)
 Full validation run: synthetic data, real convergence, production pipeline.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import json
@@ -37,6 +39,12 @@ class SyntheticDataset:
 
 
 def main():
+    warnings.warn(
+        "experiments/exp_08_synthetic_50epochs.py is deprecated and uses an outdated API. "
+        "Use experiments/exp_jepa_training.py instead.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
     print("=" * 70)
     print("VL-JEPA Experiment 08: Synthetic Training (50 Epochs)")
     print("=" * 70)

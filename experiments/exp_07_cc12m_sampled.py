@@ -3,6 +3,8 @@ Experiment 07: Training on Conceptual Captions 12M (Sampled Subset)
 Downloads 50K random CC12M images and trains 50 epochs on real data.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import json
@@ -212,6 +214,12 @@ class CC12MSampledDataset:
 
 
 def main():
+    warnings.warn(
+        "experiments/exp_07_cc12m_sampled.py is deprecated and uses an outdated API. "
+        "Use experiments/exp_jepa_training.py instead.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
     print("=" * 70)
     print("VL-JEPA Experiment 07: Training on CC12M (50K Sampled Images)")
     print("=" * 70)

@@ -3,6 +3,8 @@ Experiment 02: Realistic Training with Data Pipeline
 Tests training over multiple epochs with proper logging.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import json
@@ -36,6 +38,12 @@ class SyntheticDataset:
 
 
 def main():
+    warnings.warn(
+        "experiments/exp_02_realistic_training.py is deprecated and uses an outdated API. "
+        "Use experiments/exp_jepa_training.py instead.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
     print("=" * 70)
     print("VL-JEPA Experiment 02: Realistic Training")
     print("=" * 70)

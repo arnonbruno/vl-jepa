@@ -37,33 +37,40 @@ def random_patch_mask(batch_size: int, num_patches: int,
 @torch.no_grad()
 def random_token_mask(batch_size: int, seq_len: int,
                       mask_ratio: float = 0.15,
-                      mask_token_id: int = 103,
-                      input_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """Return boolean mask (True = masked) for language tokens.
-
-    Follows BERT-style masking: 80% [MASK], 10% random, 10% unchanged.
-    When input_ids is provided the mask is applied in-place (modifying input_ids).
-    """
+                      device: Optional[torch.device] = None) -> torch.Tensor:
+    """Return boolean mask (True = masked) for language tokens."""
     num_masked = max(1, int(seq_len * mask_ratio))
-    mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=input_ids.device if input_ids is not None else None)
+    mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
     for i in range(batch_size):
         idx = torch.randperm(seq_len, device=mask.device)[:num_masked]
         mask[i, idx] = True
-
-    if input_ids is not None:
-        # BERT-style masking
-        rand = torch.rand(batch_size, seq_len, device=input_ids.device)
-        # 80% [MASK]
-        input_ids = torch.where(mask & (rand < 0.8),
-                                torch.full_like(input_ids, mask_token_id),
-                                input_ids)
-        # 10% random vocab
-        input_ids = torch.where(mask & (rand >= 0.8) & (rand < 0.9),
-                                torch.randint(0, 30522, input_ids.shape, device=input_ids.device),
-                                input_ids)
-        # 10% unchanged — nothing to do
-
     return mask
+
+
+@torch.no_grad()
+def apply_bert_token_mask(
+    input_ids: torch.Tensor,
+    mask: torch.Tensor,
+    mask_token_id: int = 103,
+    vocab_size: int = 30522,
+) -> torch.Tensor:
+    """Apply BERT-style masking and return a new tensor (no in-place mutation).
+
+    80% [MASK], 10% random token, 10% unchanged.
+    """
+    masked_ids = input_ids.clone()
+    rand = torch.rand(input_ids.shape, device=input_ids.device)
+    masked_ids = torch.where(
+        mask & (rand < 0.8),
+        torch.full_like(masked_ids, mask_token_id),
+        masked_ids,
+    )
+    masked_ids = torch.where(
+        mask & (rand >= 0.8) & (rand < 0.9),
+        torch.randint(0, vocab_size, input_ids.shape, device=input_ids.device),
+        masked_ids,
+    )
+    return masked_ids
 
 
 # ---------------------------------------------------------------------------
@@ -103,9 +110,10 @@ class VisionEncoder(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+        for name, p in self.named_parameters():
+            if p.dim() < 2 or 'bias' in name or 'norm' in name.lower():
+                continue
+            nn.init.xavier_uniform_(p)
 
     def forward(self, x: torch.Tensor,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -173,9 +181,10 @@ class LanguageEncoder(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+        for name, p in self.named_parameters():
+            if p.dim() < 2 or 'bias' in name or 'norm' in name.lower():
+                continue
+            nn.init.xavier_uniform_(p)
 
     def forward(self, input_ids: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -232,9 +241,10 @@ class Predictor(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+        for name, p in self.named_parameters():
+            if p.dim() < 2 or 'bias' in name or 'norm' in name.lower():
+                continue
+            nn.init.xavier_uniform_(p)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -314,15 +324,6 @@ class VL_JEPA(nn.Module):
                                 self.target_encoder.parameters()):
             tgt_p.data = tau * tgt_p.data + (1 - tau) * ctx_p.data
 
-    def encode_vision(self, images: torch.Tensor,
-                      mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Encode images through context encoder (with optional masking)."""
-        return self.context_encoder(images, mask)
-
-    def encode_language(self, input_ids: torch.Tensor,
-                        attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return self.language_encoder(input_ids, attention_mask)
-
     def forward(
         self,
         images: torch.Tensor,
@@ -361,10 +362,12 @@ class VL_JEPA(nn.Module):
         # ---- 3. Predictor ----
         predicted = self.predictor(context_emb)  # (B, N+1, D)
 
-        # ---- 4. Language encoding ----
-        if token_mask is not None:
-            # BERT-style masking applied in-place to input_ids
-            _ = random_token_mask(B, input_ids.size(1), 0.15, 103, input_ids)
+        # ---- 4. Language encoding (BERT-style masking only when mask not provided) ----
+        if token_mask is None:
+            token_mask = random_token_mask(
+                B, input_ids.size(1), mask_ratio=0.15, device=device,
+            )
+            input_ids = apply_bert_token_mask(input_ids, token_mask)
 
         language_emb = self.language_encoder(input_ids, attention_mask)  # (B, S, D)
 

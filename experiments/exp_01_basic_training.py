@@ -3,6 +3,8 @@ Experiment 01: Basic Training Loop
 Tests end-to-end training with synthetic data.
 """
 
+import warnings
+
 import torch
 from pathlib import Path
 import sys
@@ -25,6 +27,12 @@ def create_synthetic_batch(batch_size=4, num_patches=196, seq_len=128):
 
 
 def main():
+    warnings.warn(
+        "experiments/exp_01_basic_training.py is deprecated and uses an outdated API. "
+        "Use experiments/exp_jepa_training.py instead.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
     print("=" * 70)
     print("VL-JEPA Experiment 01: Basic Training Loop")
     print("=" * 70)

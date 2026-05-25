@@ -8,6 +8,7 @@ Fixed with proper JEPA training loop:
   - TensorBoard logging
 """
 
+import contextlib
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,6 +18,35 @@ from typing import Dict, Tuple, Optional, Iterator, Any
 from pathlib import Path
 
 from .model import VL_JEPA, compute_jepa_loss
+
+
+def _amp_autocast(device: torch.device):
+    """AMP autocast with fallback for PyTorch < 2.4."""
+    if device.type != 'cuda':
+        return contextlib.nullcontext()
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+        return torch.amp.autocast('cuda')
+    return torch.cuda.amp.autocast()
+
+
+def _make_grad_scaler(device: torch.device):
+    """GradScaler with fallback for PyTorch < 2.4."""
+    if device.type != 'cuda':
+        return None
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+        return torch.amp.GradScaler('cuda')
+    return torch.cuda.amp.GradScaler()
+
+
+def _unpack_batch(batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Unpack (images, input_ids) or (images, input_ids, attention_mask) batches."""
+    if not isinstance(batch, (list, tuple)):
+        raise TypeError(f"Expected batch tuple/list, got {type(batch)}")
+    if len(batch) < 2:
+        raise ValueError(f"Batch must have at least 2 elements, got {len(batch)}")
+    images, input_ids = batch[0], batch[1]
+    attention_mask = batch[2] if len(batch) > 2 else None
+    return images, input_ids, attention_mask
 
 
 class VL_JEPA_Trainer:
@@ -70,7 +100,7 @@ class VL_JEPA_Trainer:
         ]
 
         self.optimizer = optim.AdamW(param_groups, lr=learning_rate, betas=(0.9, 0.95))
-        self.scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+        self.scaler = _make_grad_scaler(device)
 
         # Warmup + cosine scheduler
         self.warmup_steps = warmup_steps
@@ -108,14 +138,14 @@ class VL_JEPA_Trainer:
         """Single training step with proper JEPA loss."""
         self.model.train()
 
-        images = images.to(self.device, non_blocking=True)
-        input_ids = input_ids.to(self.device, non_blocking=True)
+        images = images.to(self.device)
+        input_ids = input_ids.to(self.device)
         if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device, non_blocking=True)
+            attention_mask = attention_mask.to(self.device)
 
         # Forward pass (with AMP)
         if self.scaler is not None:
-            with torch.amp.autocast('cuda'):
+            with _amp_autocast(self.device):
                 outputs = self.model(images, input_ids, attention_mask)
                 loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
                 loss = loss_dict['total_loss']
@@ -127,6 +157,10 @@ class VL_JEPA_Trainer:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 3.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            # GradScaler does not set _opt_called on LambdaLR-wrapped optimizers
+            self.optimizer._opt_called = True
+            self.scheduler.step()
+            self._step += 1
         else:
             outputs = self.model(images, input_ids, attention_mask)
             loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
@@ -136,15 +170,13 @@ class VL_JEPA_Trainer:
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 3.0)
             self.optimizer.step()
+            self.scheduler.step()
+            self._step += 1
 
         # Momentum update (EMA)
-        tau = self._momentum_schedule[self._step].item() if self._step < len(self._momentum_schedule) else self.momentum_tau_end
+        tau = self._momentum_schedule[self._step - 1].item() if (self._step - 1) < len(self._momentum_schedule) else self.momentum_tau_end
         self.model.momentum_tau = tau
         self.model.momentum_update()
-
-        # LR scheduler
-        self.scheduler.step()
-        self._step += 1
 
         # Running average
         self.running_loss += loss.item()
@@ -177,11 +209,7 @@ class VL_JEPA_Trainer:
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
 
-        if self.scaler is not None:
-            with torch.amp.autocast('cuda'):
-                outputs = self.model(images, input_ids, attention_mask)
-                loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
-        else:
+        with _amp_autocast(self.device):
             outputs = self.model(images, input_ids, attention_mask)
             loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
 
@@ -208,16 +236,7 @@ class VL_JEPA_Trainer:
             if num_batches and batch_idx >= num_batches:
                 break
 
-            # Handle different batch formats
-            if len(batch) == 2:
-                images, input_ids = batch
-                attention_mask = None
-            elif len(batch) == 3:
-                images, input_ids, attention_mask = batch
-            else:
-                images, input_ids = batch[0], batch[1]
-                attention_mask = batch[2] if len(batch) > 2 else None
-
+            images, input_ids, attention_mask = _unpack_batch(batch)
             metrics = self.train_step(images, input_ids, attention_mask)
 
             for key in epoch_metrics:
@@ -263,15 +282,7 @@ class VL_JEPA_Trainer:
             if num_batches and batch_idx >= num_batches:
                 break
 
-            if len(batch) == 2:
-                images, input_ids = batch
-                attention_mask = None
-            elif len(batch) == 3:
-                images, input_ids, attention_mask = batch
-            else:
-                images, input_ids = batch[0], batch[1]
-                attention_mask = batch[2] if len(batch) > 2 else None
-
+            images, input_ids, attention_mask = _unpack_batch(batch)
             metrics = self.eval_step(images, input_ids, attention_mask)
             for k in metrics_sum:
                 metrics_sum[k] += metrics[k]
@@ -298,14 +309,27 @@ class VL_JEPA_Trainer:
         torch.save(state, str(path))
 
     def load_checkpoint(self, path: str, load_optimizer: bool = True):
-        """Load training state."""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        """Load training state (tolerant of missing/extra keys in older checkpoints)."""
+        try:
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         if load_optimizer and 'optimizer_state_dict' in checkpoint:
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except (ValueError, KeyError):
+                pass
+            if 'scheduler_state_dict' in checkpoint:
+                try:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except (ValueError, KeyError):
+                    pass
             if self.scaler and checkpoint.get('scaler_state_dict'):
-                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                try:
+                    self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                except (ValueError, KeyError):
+                    pass
             self._step = checkpoint.get('step', 0)
             self.running_loss = checkpoint.get('running_loss', 0.0)
             self.running_steps = checkpoint.get('running_steps', 0)

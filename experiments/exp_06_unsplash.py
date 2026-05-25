@@ -3,6 +3,8 @@ Experiment 06: Real Data Training with Unsplash Lite
 50 epochs on 25K diverse real images with auto-generated captions.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import json
@@ -143,6 +145,12 @@ class UnsplashLiteDataset:
 
 
 def main():
+    warnings.warn(
+        "experiments/exp_06_unsplash.py is deprecated and uses an outdated API. "
+        "Use experiments/exp_jepa_training.py instead.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
     print("=" * 70)
     print("VL-JEPA Experiment 06: Real Data Training (Unsplash Lite)")
     print("=" * 70)

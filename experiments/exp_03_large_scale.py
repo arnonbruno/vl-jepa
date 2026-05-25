@@ -3,6 +3,8 @@ Experiment 03: Large-Scale Training
 Increased batch size, dataset size, and epochs to stress-test GPU and track convergence.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import json
@@ -36,6 +38,12 @@ class SyntheticDataset:
 
 
 def main():
+    warnings.warn(
+        "experiments/exp_03_large_scale.py is deprecated and uses an outdated API. "
+        "Use experiments/exp_jepa_training.py instead.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
     print("=" * 70)
     print("VL-JEPA Experiment 03: Large-Scale Training")
     print("=" * 70)

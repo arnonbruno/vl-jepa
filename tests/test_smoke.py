@@ -10,7 +10,14 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.model import VL_JEPA, VisionEncoder, LanguageEncoder, Predictor, compute_jepa_loss
+import tempfile
+import os
+
+from src.model import (
+    VL_JEPA, VisionEncoder, LanguageEncoder, Predictor,
+    compute_jepa_loss,
+)
+from src.trainer import VL_JEPA_Trainer
 
 
 def test_vision_encoder_with_mask():
@@ -157,6 +164,99 @@ def test_gpu_forward():
     print(f"  ✓ Gradients flowing: {grad_count}/{sum(1 for p in model2.parameters() if p.requires_grad)} params")
 
 
+def test_loss_decreases_over_steps():
+    """Sanity check: moving-average loss trends down over training steps."""
+    print("Testing loss decreases over training steps...")
+    model = VL_JEPA(hidden_dim=768, patch_size=16, image_size=224)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trainer = VL_JEPA_Trainer(model, device, learning_rate=1e-3, warmup_steps=0, max_steps=1000)
+
+    images = torch.randn(8, 3, 224, 224)
+    input_ids = torch.randint(0, 30522, (8, 128))
+
+    losses = []
+    for _ in range(50):
+        metrics = trainer.train_step(images, input_ids)
+        losses.append(metrics['total_loss'])
+
+    avg_first = sum(losses[:5]) / 5
+    avg_last = sum(losses[-5:]) / 5
+    assert avg_last < avg_first, (
+        f"Expected moving-average loss to decrease: "
+        f"first5={avg_first:.4f}, last5={avg_last:.4f}"
+    )
+    print(f"  ✓ Loss decreased (avg first 5 vs last 5): {avg_first:.4f} → {avg_last:.4f}")
+
+
+def test_checkpoint_roundtrip():
+    """Save and reload checkpoint; forward pass should match."""
+    print("Testing checkpoint save/load round-trip...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = VL_JEPA(hidden_dim=768).to(device)
+    trainer = VL_JEPA_Trainer(model, device, warmup_steps=0, max_steps=100)
+
+    images = torch.randn(2, 3, 224, 224).to(device)
+    input_ids = torch.randint(0, 30522, (2, 128)).to(device)
+
+    trainer.train_step(images, input_ids)
+
+    # Fixed masks so forward() is deterministic (model randomizes masks when None)
+    num_patches = 196
+    patch_mask = torch.zeros(2, num_patches, dtype=torch.bool, device=device)
+    patch_mask[:, :147] = True  # 75% masked, same pattern every call
+    token_mask = torch.zeros(2, input_ids.size(1), dtype=torch.bool, device=device)
+
+    model.eval()
+    with torch.no_grad():
+        out_before = model(images, input_ids, patch_mask=patch_mask, token_mask=token_mask)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = os.path.join(tmpdir, 'test_ckpt.pt')
+        trainer.save_checkpoint(ckpt_path)
+
+        model2 = VL_JEPA(hidden_dim=768).to(device)
+        trainer2 = VL_JEPA_Trainer(model2, device, warmup_steps=0, max_steps=100)
+        trainer2.load_checkpoint(ckpt_path)
+
+        model2.eval()
+        with torch.no_grad():
+            out_after = model2(
+                images, input_ids, patch_mask=patch_mask, token_mask=token_mask,
+            )
+
+    for key in ('predicted_patches', 'vision_proj', 'language_proj'):
+        assert torch.allclose(out_before[key], out_after[key], atol=1e-5), f"Mismatch on {key}"
+    print("  ✓ Checkpoint round-trip preserves model outputs")
+
+
+def test_masked_patches_contribute_to_loss():
+    """MSE loss uses masked patches only; unmasked-only mask yields ~zero MSE."""
+    print("Testing masked vs unmasked patch loss contribution...")
+    model = VL_JEPA(hidden_dim=768, patch_size=16, image_size=224)
+    model.eval()
+
+    images = torch.randn(2, 3, 224, 224)
+    input_ids = torch.randint(0, 30522, (2, 128))
+    num_patches = 196
+
+    # All patches masked — MSE should be positive
+    mask_all = torch.ones(2, num_patches, dtype=torch.bool)
+    with torch.no_grad():
+        out_masked = model(images, input_ids, patch_mask=mask_all)
+    loss_masked = compute_jepa_loss(out_masked)['mse_loss']
+
+    # No patches masked — MSE should be ~0
+    mask_none = torch.zeros(2, num_patches, dtype=torch.bool)
+    with torch.no_grad():
+        out_unmasked = model(images, input_ids, patch_mask=mask_none)
+    loss_unmasked = compute_jepa_loss(out_unmasked)['mse_loss']
+
+    assert loss_masked > 0.01, f"Masked MSE should be > 0, got {loss_masked}"
+    assert loss_unmasked < 1e-6, f"Unmasked MSE should be ~0, got {loss_unmasked}"
+    print(f"  ✓ MSE (all masked): {loss_masked:.4f}")
+    print(f"  ✓ MSE (none masked): {loss_unmasked:.6f}")
+
+
 def test_joint_embedding():
     """Test inference-time joint embedding extraction."""
     print("Testing joint embedding extraction...")
@@ -193,6 +293,9 @@ if __name__ == '__main__':
         ("Momentum Update", test_momentum_update),
         ("GPU Forward + Backward", test_gpu_forward),
         ("Joint Embedding", test_joint_embedding),
+        ("Loss Decreases", test_loss_decreases_over_steps),
+        ("Checkpoint Round-trip", test_checkpoint_roundtrip),
+        ("Masked Patch Loss", test_masked_patches_contribute_to_loss),
     ]
 
     passed = 0

@@ -3,6 +3,8 @@ Experiment 04: Real Data Training with Flickr30K
 50 epochs on real image-text pairs for production-grade validation.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import json
@@ -140,6 +142,12 @@ class Flickr30KDataset:
 
 
 def main():
+    warnings.warn(
+        "experiments/exp_04_flickr30k.py is deprecated and uses an outdated API. "
+        "Use experiments/exp_jepa_training.py instead.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
     print("=" * 70)
     print("VL-JEPA Experiment 04: Real Data Training (Flickr30K)")
     print("=" * 70)

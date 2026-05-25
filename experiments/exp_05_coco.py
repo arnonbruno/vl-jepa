@@ -3,6 +3,8 @@ Experiment 05: Real Data Training with COCO 2014
 50 epochs on 330K real image-text pairs from Microsoft COCO dataset.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import json
@@ -129,6 +131,12 @@ class COCODataset:
 
 
 def main():
+    warnings.warn(
+        "experiments/exp_05_coco.py is deprecated and uses an outdated API. "
+        "Use experiments/exp_jepa_training.py instead.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
     print("=" * 70)
     print("VL-JEPA Experiment 05: Real Data Training (COCO 2014)")
     print("=" * 70)
