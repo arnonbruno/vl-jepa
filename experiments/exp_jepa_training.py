@@ -22,12 +22,36 @@ import math
 import sys
 from pathlib import Path
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    _HAS_TENSORBOARD = True
+except ImportError:
+    SummaryWriter = None  # type: ignore[misc, assignment]
+    _HAS_TENSORBOARD = False
+
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.model import VL_JEPA
 from src.trainer import VL_JEPA_Trainer
 from src.config import load_config, overrides_from_cli, print_config
+
+
+class _GraphTraceWrapper(torch.nn.Module):
+    """Adapter so TensorBoard add_graph can trace VL-JEPA (dict outputs -> tensor)."""
+
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs = self.model(images, input_ids, attention_mask)
+        return outputs['predicted_patches'].sum()
 
 
 class SyntheticDataset:
@@ -202,6 +226,10 @@ def _build_parser(base_cfg: dict) -> "argparse.ArgumentParser":
     parser.add_argument('--checkpoint-interval', type=int,
                         default=output.get('checkpoint_interval', 5),
                         help='Save periodic checkpoint every N epochs')
+    parser.add_argument('--tensorboard', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable TensorBoard logging (default: on)')
+    parser.add_argument('--tensorboard-dir', type=str, default=None,
+                        help='TensorBoard log directory (default: <exp_dir>/tensorboard)')
     return parser
 
 
@@ -314,6 +342,15 @@ def main():
     exp_dir = output_dir / exp_name
     exp_dir.mkdir(parents=True, exist_ok=True)
 
+    writer = None
+    if args.tensorboard and _HAS_TENSORBOARD:
+        tb_dir = Path(args.tensorboard_dir) if args.tensorboard_dir else exp_dir / 'tensorboard'
+        tb_dir.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=str(tb_dir))
+        print(f"\nTensorBoard: {tb_dir}")
+    elif args.tensorboard and not _HAS_TENSORBOARD:
+        print("\n  ⚠️  TensorBoard requested but torch.utils.tensorboard is unavailable")
+
     # Training loop
     print(f"\n{'=' * 70}")
     print(f"Training for {train_cfg['epochs']} epochs...")
@@ -322,101 +359,132 @@ def main():
     all_metrics = []
     best_val_loss = float('inf')
     total_start = time.time()
+    graph_logged = False
 
-    for epoch in range(train_cfg["epochs"]):
-        epoch_start = time.time()
-        epoch_metrics = {'mse_loss': [], 'nce_loss': [], 'total_loss': []}
+    try:
+        for epoch in range(train_cfg["epochs"]):
+            epoch_start = time.time()
+            epoch_metrics = {'mse_loss': [], 'nce_loss': [], 'total_loss': []}
 
-        for batch_idx, batch in enumerate(dataset):
-            if batch_idx >= train_batches:
-                # Switch to validation
-                break
-
-            images, input_ids, attention_mask = batch
-            metrics = trainer.train_step(images, input_ids, attention_mask)
-
-            for key in epoch_metrics:
-                epoch_metrics[key].append(metrics[key])
-
-            if (batch_idx + 1) % out_cfg["log_interval"] == 0:
-                avg_loss = sum(epoch_metrics['total_loss'][-out_cfg["log_interval"]:]) / out_cfg["log_interval"]
-                lr = metrics['lr']
-                gn = metrics['grad_norm']
-                print(f"  E{epoch+1:2d} B{batch_idx+1:4d}/{train_batches} | "
-                      f"Loss: {avg_loss:.4f} | MSE: {metrics['mse_loss']:.4f} | "
-                      f"NCE: {metrics['nce_loss']:.4f} | GN: {gn:.2f} | LR: {lr:.2e}",
-                      end='\r')
-
-        # Epoch summary (training)
-        avg_mse = sum(epoch_metrics['mse_loss']) / len(epoch_metrics['mse_loss'])
-        avg_nce = sum(epoch_metrics['nce_loss']) / len(epoch_metrics['nce_loss'])
-        avg_loss = sum(epoch_metrics['total_loss']) / len(epoch_metrics['total_loss'])
-        epoch_time = time.time() - epoch_start
-
-        # Validation
-        model.eval()
-        val_mse, val_nce, val_loss = 0.0, 0.0, 0.0
-        val_count = 0
-        with torch.no_grad():
             for batch_idx, batch in enumerate(dataset):
-                if batch_idx < train_batches:
-                    continue
-                if batch_idx - train_batches >= val_batches:
+                if batch_idx >= train_batches:
+                    # Switch to validation
                     break
+
                 images, input_ids, attention_mask = batch
-                val_metrics = trainer.eval_step(images, input_ids, attention_mask)
-                val_mse += val_metrics['mse_loss']
-                val_nce += val_metrics['nce_loss']
-                val_loss += val_metrics['total_loss']
-                val_count += 1
+                if writer is not None and not graph_logged:
+                    try:
+                        trace_model = _GraphTraceWrapper(model).to(device)
+                        trace_images = images.to(device)
+                        trace_ids = input_ids.to(device)
+                        trace_mask = attention_mask.to(device)
+                        writer.add_graph(trace_model, (trace_images, trace_ids, trace_mask))
+                        graph_logged = True
+                    except Exception as graph_err:
+                        print(f"\n  ⚠️  TensorBoard graph trace skipped: {graph_err}")
+                        graph_logged = True
 
-        if val_count > 0:
-            val_mse /= val_count
-            val_nce /= val_count
-            val_loss /= val_count
+                metrics = trainer.train_step(images, input_ids, attention_mask)
+                last_train_metrics = metrics
 
-        # Log
-        gpu_mem = torch.cuda.max_memory_allocated() / 1e9 if device.type == 'cuda' else 0
-        torch.cuda.reset_peak_memory_stats() if device.type == 'cuda' else None
+                for key in epoch_metrics:
+                    epoch_metrics[key].append(metrics[key])
 
-        print(f"\nEpoch {epoch+1:2d}/{train_cfg['epochs']} | "
-              f"Train: {avg_loss:.4f} (MSE: {avg_mse:.4f}, NCE: {avg_nce:.4f}) | "
-              f"Val: {val_loss:.4f} (MSE: {val_mse:.4f}, NCE: {val_nce:.4f}) | "
-              f"{epoch_time:.1f}s | GPU: {gpu_mem:.2f}GB | "
-              f"τ: {trainer.model.momentum_tau:.3f}")
+                if (batch_idx + 1) % out_cfg["log_interval"] == 0:
+                    avg_loss = sum(epoch_metrics['total_loss'][-out_cfg["log_interval"]:]) / out_cfg["log_interval"]
+                    lr = metrics['lr']
+                    gn = metrics['grad_norm']
+                    print(f"  E{epoch+1:2d} B{batch_idx+1:4d}/{train_batches} | "
+                          f"Loss: {avg_loss:.4f} | MSE: {metrics['mse_loss']:.4f} | "
+                          f"NCE: {metrics['nce_loss']:.4f} | GN: {gn:.2f} | LR: {lr:.2e}",
+                          end='\r')
 
-        epoch_record = {
-            'epoch': epoch + 1,
-            'train_mse': avg_mse,
-            'train_nce': avg_nce,
-            'train_loss': avg_loss,
-            'val_mse': val_mse,
-            'val_nce': val_nce,
-            'val_loss': val_loss,
-            'time': epoch_time,
-            'gpu_mem_gb': gpu_mem,
-        }
-        all_metrics.append(epoch_record)
+            # Epoch summary (training)
+            avg_mse = sum(epoch_metrics['mse_loss']) / len(epoch_metrics['mse_loss'])
+            avg_nce = sum(epoch_metrics['nce_loss']) / len(epoch_metrics['nce_loss'])
+            avg_loss = sum(epoch_metrics['total_loss']) / len(epoch_metrics['total_loss'])
+            epoch_time = time.time() - epoch_start
 
-        # Save checkpoint if best validation loss
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            ckpt_path = exp_dir / 'checkpoint_best.pt'
-            trainer.save_checkpoint(str(ckpt_path), {
+            # Validation
+            model.eval()
+            val_mse, val_nce, val_loss = 0.0, 0.0, 0.0
+            val_count = 0
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(dataset):
+                    if batch_idx < train_batches:
+                        continue
+                    if batch_idx - train_batches >= val_batches:
+                        break
+                    images, input_ids, attention_mask = batch
+                    val_metrics = trainer.eval_step(images, input_ids, attention_mask)
+                    val_mse += val_metrics['mse_loss']
+                    val_nce += val_metrics['nce_loss']
+                    val_loss += val_metrics['total_loss']
+                    val_count += 1
+
+            if val_count > 0:
+                val_mse /= val_count
+                val_nce /= val_count
+                val_loss /= val_count
+
+            # Log
+            gpu_mem = torch.cuda.max_memory_allocated() / 1e9 if device.type == 'cuda' else 0
+            torch.cuda.reset_peak_memory_stats() if device.type == 'cuda' else None
+
+            print(f"\nEpoch {epoch+1:2d}/{train_cfg['epochs']} | "
+                  f"Train: {avg_loss:.4f} (MSE: {avg_mse:.4f}, NCE: {avg_nce:.4f}) | "
+                  f"Val: {val_loss:.4f} (MSE: {val_mse:.4f}, NCE: {val_nce:.4f}) | "
+                  f"{epoch_time:.1f}s | GPU: {gpu_mem:.2f}GB | "
+                  f"τ: {trainer.model.momentum_tau:.3f}")
+
+            epoch_record = {
                 'epoch': epoch + 1,
+                'train_mse': avg_mse,
+                'train_nce': avg_nce,
+                'train_loss': avg_loss,
+                'val_mse': val_mse,
+                'val_nce': val_nce,
                 'val_loss': val_loss,
-                'config': cfg,
-            })
-            print(f"  → Best model saved ({val_loss:.4f})")
+                'time': epoch_time,
+                'gpu_mem_gb': gpu_mem,
+            }
+            all_metrics.append(epoch_record)
 
-        if (epoch + 1) % out_cfg["checkpoint_interval"] == 0:
-            ckpt_path = exp_dir / f'checkpoint_epoch{epoch+1}.pt'
-            trainer.save_checkpoint(str(ckpt_path), {'epoch': epoch + 1})
-            print(f"  → Checkpoint saved: epoch {epoch+1}")
+            if writer is not None:
+                step = epoch + 1
+                writer.add_scalar('train/loss', avg_loss, step)
+                writer.add_scalar('train/mse', avg_mse, step)
+                writer.add_scalar('train/nce', avg_nce, step)
+                writer.add_scalar('val/loss', val_loss, step)
+                writer.add_scalar('val/mse', val_mse, step)
+                writer.add_scalar('val/nce', val_nce, step)
+                writer.add_scalar('train/lr', last_train_metrics['lr'], step)
+                writer.add_scalar('train/grad_norm', last_train_metrics['grad_norm'], step)
+                writer.add_scalar('train/momentum_tau', last_train_metrics['momentum_tau'], step)
 
-        # Save metrics
-        with open(exp_dir / 'metrics.json', 'w') as f:
-            json.dump(all_metrics, f, indent=2)
+            # Save checkpoint if best validation loss
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                ckpt_path = exp_dir / 'checkpoint_best.pt'
+                trainer.save_checkpoint(str(ckpt_path), {
+                    'epoch': epoch + 1,
+                    'val_loss': val_loss,
+                    'config': cfg,
+                })
+                print(f"  → Best model saved ({val_loss:.4f})")
+
+            if (epoch + 1) % out_cfg["checkpoint_interval"] == 0:
+                ckpt_path = exp_dir / f'checkpoint_epoch{epoch+1}.pt'
+                trainer.save_checkpoint(str(ckpt_path), {'epoch': epoch + 1})
+                print(f"  → Checkpoint saved: epoch {epoch+1}")
+
+            # Save metrics
+            with open(exp_dir / 'metrics.json', 'w') as f:
+                json.dump(all_metrics, f, indent=2)
+
+    finally:
+        if writer is not None:
+            writer.close()
 
     total_time = time.time() - total_start
     print(f"\n{'=' * 70}")
