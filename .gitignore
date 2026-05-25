@@ -49,4 +49,5 @@ logs/
 .DS_Store
 .env
 experiments/exp_jepa_768d_15ep/
-experiments/
+experiments/exp_*.json
+experiments/exp_*.png
