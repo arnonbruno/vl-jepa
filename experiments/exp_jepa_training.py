@@ -10,17 +10,21 @@ Features:
   - EMA target encoder (τ = 0.996 → 1.0 cosine schedule)
   - Predictor (6-layer transformer)
   - AMP + gradient clipping for GPU efficiency
-  - Validation split
+  - COCO 2017 train/val caption dataloaders
   - Checkpointing + TensorBoard logging
-  - No hardcoded paths
 """
 
-import torch
+from __future__ import annotations
+
+import argparse
 import json
-import time
-import math
+import os
 import sys
+import time
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+import torch
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -35,12 +39,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.model import VL_JEPA
 from src.trainer import VL_JEPA_Trainer
 from src.config import load_config, overrides_from_cli, print_config
+from src.dataset import (
+    COCOCaptionDataset,
+    create_dataloaders,
+    expected_split_length,
+)
 
 
 class _GraphTraceWrapper(torch.nn.Module):
     """Adapter so TensorBoard add_graph can trace VL-JEPA (dict outputs -> tensor)."""
 
-    def __init__(self, model: torch.nn.Module):
+    def __init__(self, model: torch.nn.Module) -> None:
         super().__init__()
         self.model = model
 
@@ -54,124 +63,25 @@ class _GraphTraceWrapper(torch.nn.Module):
         return outputs['predicted_patches'].sum()
 
 
-class SyntheticDataset:
-    """Synthetic dataset for testing the JEPA training loop.
-
-    Uses random images and text — the model won't learn meaningful
-    representations from this data, but it validates that:
-      - Gradients flow through the entire computation graph
-      - Loss decreases over time (even if just memorizing noise)
-      - GPU is properly utilized
-    """
-
-    def __init__(self, num_samples=5000, batch_size=32, seq_len=128):
-        self.num_samples = num_samples
-        self.batch_size = batch_size
-        self.seq_len = seq_len
-        self.num_batches = max(1, num_samples // batch_size)
-
-    def __iter__(self):
-        for _ in range(self.num_batches):
-            images = torch.randn(self.batch_size, 3, 224, 224)
-            input_ids = torch.randint(0, 30522, (self.batch_size, self.seq_len))
-            attention_mask = torch.ones(self.batch_size, self.seq_len, dtype=torch.long)
-            yield images, input_ids, attention_mask
+def _expand_coco_root(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    return os.path.expanduser(path)
 
 
-class RealisticDataset:
-    """Simple dataset from real images and tokenized captions.
-
-    Falls back to synthetic data if no real data directory is provided.
-    """
-
-    def __init__(self, data_dir=None, batch_size=32, seq_len=128,
-                 image_size=224, num_samples=5000):
-        self.batch_size = batch_size
-        self.seq_len = seq_len
-        self.image_size = image_size
-        self.data_dir = Path(data_dir) if data_dir else None
-
-        if self.data_dir and self.data_dir.exists():
-            self._load_real_data()
-        else:
-            print(f"  ⚠️  No real data at {data_dir}")
-            print(f"  → Using synthetic data ({num_samples} samples)")
-            self._synthetic = True
-            self.num_samples = num_samples
-            self.num_batches = max(1, num_samples // batch_size)
-
-    def _load_real_data(self):
-        """Scan data directory for image files."""
-        from torchvision import transforms
-        from PIL import Image
-
-        extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-        self.image_paths = []
-        for ext in extensions:
-            self.image_paths.extend(list(self.data_dir.rglob(f'*{ext}')))
-
-        if not self.image_paths:
-            raise FileNotFoundError(f"No images found in {self.data_dir}")
-
-        self.transform = transforms.Compose([
-            transforms.Resize((self.image_size, self.image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
-        ])
-        self.num_samples = len(self.image_paths)
-        self.num_batches = max(1, self.num_samples // self.batch_size)
-        self._synthetic = False
-        print(f"  ✓ Loaded {self.num_samples} images from {self.data_dir}")
-
-    def __iter__(self):
-        if self._synthetic:
-            for _ in range(self.num_batches):
-                images = torch.randn(self.batch_size, 3, self.image_size, self.image_size)
-                input_ids = torch.randint(0, 30522, (self.batch_size, self.seq_len))
-                attention_mask = torch.ones(self.batch_size, self.seq_len, dtype=torch.long)
-                yield images, input_ids, attention_mask
-        else:
-            from PIL import Image
-            import random
-            indices = list(range(self.num_samples))
-            random.shuffle(indices)
-
-            for batch_idx in range(self.num_batches):
-                batch_images = []
-                batch_text = []
-
-                for i in range(self.batch_size):
-                    idx = batch_idx * self.batch_size + i
-                    if idx >= self.num_samples:
-                        break
-
-                    img_path = self.image_paths[indices[idx]]
-                    try:
-                        img = Image.open(img_path).convert('RGB')
-                        img_tensor = self.transform(img)
-                        batch_images.append(img_tensor)
-
-                        # Simple caption from filename (or placeholder)
-                        caption = img_path.stem.replace('_', ' ').replace('-', ' ')[:self.seq_len]
-                        tokens = [hash(w) % 30522 for w in caption.lower().split()]
-                        while len(tokens) < self.seq_len:
-                            tokens.append(0)
-                        batch_text.append(torch.tensor(tokens[:self.seq_len]))
-
-                    except Exception as e:
-                        continue
-
-                if batch_images:
-                    images = torch.stack(batch_images)
-                    input_ids = torch.stack(batch_text)
-                    attention_mask = torch.ones_like(input_ids)
-                    yield images, input_ids, attention_mask
+def _resolve_max_steps(
+    train_cfg: Dict[str, Any],
+    train_batches: int,
+) -> int:
+    """Derive total optimizer steps from epochs × train batches when unset."""
+    max_steps = train_cfg.get("max_steps")
+    if max_steps is not None:
+        return int(max_steps)
+    epochs = int(train_cfg.get("epochs", 1))
+    return epochs * max(1, train_batches)
 
 
-def _build_parser(base_cfg: dict) -> "argparse.ArgumentParser":
-    import argparse
-
+def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
     model = base_cfg.get("model", {})
     training = base_cfg.get("training", {})
     loss = base_cfg.get("loss", {})
@@ -196,11 +106,7 @@ def _build_parser(base_cfg: dict) -> "argparse.ArgumentParser":
     parser.add_argument('--warmup', type=int, default=training.get('warmup_steps', 500),
                         help='Warmup steps')
     parser.add_argument('--max-steps', type=int, default=None,
-                        help='Total training steps (default: derived from epochs/samples/batch)')
-    parser.add_argument('--samples', type=int, default=data.get('samples', 5000),
-                        help='Number of training samples')
-    parser.add_argument('--seq-len', type=int, default=data.get('seq_len', 128),
-                        help='Text sequence length')
+                        help='Total training steps (default: epochs × train batches)')
     parser.add_argument('--hidden-dim', type=int, default=model.get('hidden_dim', 768),
                         help='Hidden dimension')
     parser.add_argument('--patch-size', type=int, default=model.get('patch_size', 16),
@@ -213,8 +119,30 @@ def _build_parser(base_cfg: dict) -> "argparse.ArgumentParser":
                         help='Number of predictor transformer layers')
     parser.add_argument('--momentum-tau', type=float, default=model.get('momentum_tau', 0.996),
                         help='EMA momentum coefficient (start)')
-    parser.add_argument('--data-dir', type=str, default=data.get('data_dir'),
-                        help='Real image directory (optional)')
+    parser.add_argument(
+        '--coco-root',
+        type=str,
+        default=data.get('coco_root', '~/.cache/torch/hub/checkpoints'),
+        help='COCO 2017 root (train2017/, val2017/, annotations/)',
+    )
+    parser.add_argument(
+        '--download',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Download missing COCO archives (default: on)',
+    )
+    parser.add_argument(
+        '--max-caption-length',
+        type=int,
+        default=data.get('max_caption_length', 64),
+        help='Max tokenized caption length',
+    )
+    parser.add_argument(
+        '--num-workers',
+        type=int,
+        default=data.get('num_workers', 4),
+        help='DataLoader worker processes',
+    )
     parser.add_argument('--output-dir', type=str, default=output.get('output_dir', 'experiments'),
                         help='Output directory for metrics/checkpoints')
     parser.add_argument('--alpha', type=float, default=loss.get('alpha', 1.0),
@@ -233,9 +161,7 @@ def _build_parser(base_cfg: dict) -> "argparse.ArgumentParser":
     return parser
 
 
-def main():
-    import argparse
-
+def main() -> None:
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument(
         '--config',
@@ -266,9 +192,6 @@ def main():
             max_steps=args.max_steps,
             alpha=args.alpha,
             beta=args.beta,
-            samples=args.samples,
-            seq_len=args.seq_len,
-            data_dir=args.data_dir,
             output_dir=args.output_dir,
             log_interval=args.log_interval,
             checkpoint_interval=args.checkpoint_interval,
@@ -281,20 +204,24 @@ def main():
     data_cfg = cfg["data"]
     out_cfg = cfg["output"]
 
+    coco_root = _expand_coco_root(args.coco_root)
+    image_size = model_cfg["image_size"]
+    batch_size = train_cfg["batch_size"]
+
     print("=" * 70)
     print("VL-JEPA v2 — Proper JEPA Training")
     print("=" * 70)
     print(f"\nConfiguration (config: {args.config}):")
     print_config(cfg)
+    print(f"  COCO root: {coco_root}")
+    print(f"  Download missing archives: {args.download}")
 
-    # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nDevice: {device}")
     if device.type == 'cuda':
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
 
-    # Model
     model = VL_JEPA(
         hidden_dim=model_cfg["hidden_dim"],
         patch_size=model_cfg["patch_size"],
@@ -307,35 +234,44 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel: {total_params/1e6:.1f}M params ({trainable_params/1e6:.1f}M trainable)")
 
-    # Trainer
+    print("\nLoading COCO 2017 caption dataloaders...")
+    train_loader, val_loader = create_dataloaders(
+        batch_size=batch_size,
+        num_workers=args.num_workers,
+        coco_root=coco_root,
+        image_size=image_size,
+        max_caption_length=args.max_caption_length,
+        download=args.download,
+    )
+
+    train_batches = len(train_loader)
+    val_batches = len(val_loader)
+    train_samples = len(train_loader.dataset)
+    val_samples = len(val_loader.dataset)
+
+    max_steps = _resolve_max_steps(train_cfg, train_batches)
+    train_cfg["max_steps"] = max_steps
+
+    print(f"\nData: COCO 2017 captions")
+    print(f"  Train: {train_samples} images "
+          f"(expected {expected_split_length('train')}), "
+          f"{train_batches} batches (shuffle=True)")
+    print(f"  Val:   {val_samples} images "
+          f"(expected {expected_split_length('val')}), "
+          f"{val_batches} batches (shuffle=False)")
+    print(f"  Max steps: {max_steps}")
+
     trainer = VL_JEPA_Trainer(
         model=model,
         device=device,
         learning_rate=train_cfg["learning_rate"],
         weight_decay=train_cfg["weight_decay"],
         warmup_steps=train_cfg["warmup_steps"],
-        max_steps=train_cfg["max_steps"],
+        max_steps=max_steps,
         alpha=loss_cfg["alpha"],
         beta=loss_cfg["beta"],
     )
 
-    # Dataset
-    dataset = RealisticDataset(
-        data_dir=data_cfg.get("data_dir"),
-        batch_size=train_cfg["batch_size"],
-        seq_len=data_cfg["seq_len"],
-        image_size=model_cfg["image_size"],
-        num_samples=data_cfg["samples"],
-    )
-
-    # Split into train/val (90/10)
-    val_batches = max(1, dataset.num_batches // 10)
-    train_batches = dataset.num_batches - val_batches
-    print(f"\nData: {dataset.num_samples} samples")
-    print(f"  Train batches: {train_batches}")
-    print(f"  Val batches: {val_batches}")
-
-    # Output directory
     output_dir = Path(out_cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     exp_name = f"exp_jepa_{model_cfg['hidden_dim']}d_{train_cfg['epochs']}ep"
@@ -351,26 +287,28 @@ def main():
     elif args.tensorboard and not _HAS_TENSORBOARD:
         print("\n  ⚠️  TensorBoard requested but torch.utils.tensorboard is unavailable")
 
-    # Training loop
     print(f"\n{'=' * 70}")
     print(f"Training for {train_cfg['epochs']} epochs...")
     print(f"{'=' * 70}")
 
-    all_metrics = []
+    all_metrics: list[Dict[str, Any]] = []
     best_val_loss = float('inf')
     total_start = time.time()
     graph_logged = False
+    last_train_metrics: Dict[str, float] = {}
 
     try:
         for epoch in range(train_cfg["epochs"]):
+            train_ds = train_loader.dataset
+            if isinstance(train_ds, COCOCaptionDataset):
+                train_ds.set_epoch(epoch)
+
             epoch_start = time.time()
-            epoch_metrics = {'mse_loss': [], 'nce_loss': [], 'total_loss': []}
+            epoch_metrics: Dict[str, list[float]] = {
+                'mse_loss': [], 'nce_loss': [], 'total_loss': [],
+            }
 
-            for batch_idx, batch in enumerate(dataset):
-                if batch_idx >= train_batches:
-                    # Switch to validation
-                    break
-
+            for batch_idx, batch in enumerate(train_loader):
                 images, input_ids, attention_mask = batch
                 if writer is not None and not graph_logged:
                     try:
@@ -391,30 +329,25 @@ def main():
                     epoch_metrics[key].append(metrics[key])
 
                 if (batch_idx + 1) % out_cfg["log_interval"] == 0:
-                    avg_loss = sum(epoch_metrics['total_loss'][-out_cfg["log_interval"]:]) / out_cfg["log_interval"]
+                    window = epoch_metrics['total_loss'][-out_cfg["log_interval"]:]
+                    avg_loss = sum(window) / len(window)
                     lr = metrics['lr']
                     gn = metrics['grad_norm']
-                    print(f"  E{epoch+1:2d} B{batch_idx+1:4d}/{train_batches} | "
+                    print(f"  E{epoch+1:2d} B{batch_idx+1:5d}/{train_batches} | "
                           f"Loss: {avg_loss:.4f} | MSE: {metrics['mse_loss']:.4f} | "
                           f"NCE: {metrics['nce_loss']:.4f} | GN: {gn:.2f} | LR: {lr:.2e}",
                           end='\r')
 
-            # Epoch summary (training)
             avg_mse = sum(epoch_metrics['mse_loss']) / len(epoch_metrics['mse_loss'])
             avg_nce = sum(epoch_metrics['nce_loss']) / len(epoch_metrics['nce_loss'])
             avg_loss = sum(epoch_metrics['total_loss']) / len(epoch_metrics['total_loss'])
             epoch_time = time.time() - epoch_start
 
-            # Validation
             model.eval()
             val_mse, val_nce, val_loss = 0.0, 0.0, 0.0
             val_count = 0
             with torch.no_grad():
-                for batch_idx, batch in enumerate(dataset):
-                    if batch_idx < train_batches:
-                        continue
-                    if batch_idx - train_batches >= val_batches:
-                        break
+                for batch in val_loader:
                     images, input_ids, attention_mask = batch
                     val_metrics = trainer.eval_step(images, input_ids, attention_mask)
                     val_mse += val_metrics['mse_loss']
@@ -427,9 +360,9 @@ def main():
                 val_nce /= val_count
                 val_loss /= val_count
 
-            # Log
             gpu_mem = torch.cuda.max_memory_allocated() / 1e9 if device.type == 'cuda' else 0
-            torch.cuda.reset_peak_memory_stats() if device.type == 'cuda' else None
+            if device.type == 'cuda':
+                torch.cuda.reset_peak_memory_stats()
 
             print(f"\nEpoch {epoch+1:2d}/{train_cfg['epochs']} | "
                   f"Train: {avg_loss:.4f} (MSE: {avg_mse:.4f}, NCE: {avg_nce:.4f}) | "
@@ -458,11 +391,13 @@ def main():
                 writer.add_scalar('val/loss', val_loss, step)
                 writer.add_scalar('val/mse', val_mse, step)
                 writer.add_scalar('val/nce', val_nce, step)
-                writer.add_scalar('train/lr', last_train_metrics['lr'], step)
-                writer.add_scalar('train/grad_norm', last_train_metrics['grad_norm'], step)
-                writer.add_scalar('train/momentum_tau', last_train_metrics['momentum_tau'], step)
+                if last_train_metrics:
+                    writer.add_scalar('train/lr', last_train_metrics['lr'], step)
+                    writer.add_scalar('train/grad_norm', last_train_metrics['grad_norm'], step)
+                    writer.add_scalar(
+                        'train/momentum_tau', last_train_metrics['momentum_tau'], step,
+                    )
 
-            # Save checkpoint if best validation loss
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 ckpt_path = exp_dir / 'checkpoint_best.pt'
@@ -478,7 +413,6 @@ def main():
                 trainer.save_checkpoint(str(ckpt_path), {'epoch': epoch + 1})
                 print(f"  → Checkpoint saved: epoch {epoch+1}")
 
-            # Save metrics
             with open(exp_dir / 'metrics.json', 'w') as f:
                 json.dump(all_metrics, f, indent=2)
 
@@ -492,7 +426,6 @@ def main():
     print(f"Results saved to: {exp_dir}")
     print(f"{'=' * 70}")
 
-    # Summary
     if len(all_metrics) > 1:
         first, last = all_metrics[0], all_metrics[-1]
         print(f"\nTraining Summary:")
