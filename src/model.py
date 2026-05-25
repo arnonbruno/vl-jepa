@@ -11,6 +11,7 @@ Fixed implementation with proper JEPA principles:
 """
 
 import copy
+import contextlib
 import math
 from typing import Dict, Optional, Tuple
 
@@ -19,15 +20,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+LOGIT_SCALE_MIN = math.log(1.0 / 100.0)
+LOGIT_SCALE_MAX = math.log(100.0)
+
+
 # ---------------------------------------------------------------------------
 # Masking utilities
 # ---------------------------------------------------------------------------
 
 def _infer_patch_grid(num_patches: int) -> Tuple[int, int]:
+    if num_patches <= 0:
+        raise ValueError(f"num_patches must be positive, got {num_patches}")
     grid = int(math.sqrt(num_patches))
     if grid * grid != num_patches:
         raise ValueError(f"num_patches must be a square grid, got {num_patches}")
     return grid, grid
+
+
+@contextlib.contextmanager
+def _temporarily_eval(*modules: nn.Module):
+    """Run teacher modules deterministically without leaking mode changes."""
+    modes = [module.training for module in modules]
+    try:
+        for module in modules:
+            module.eval()
+        yield
+    finally:
+        for module, was_training in zip(modules, modes):
+            module.train(was_training)
 
 
 @torch.no_grad()
@@ -40,18 +60,28 @@ def block_patch_mask(
     max_block_ratio: float = 0.50,
     aspect_ratio: Tuple[float, float] = (0.3, 3.0),
     generator: Optional[torch.Generator] = None,
+    min_visible_patches: Optional[int] = None,
 ) -> torch.Tensor:
     """I-JEPA-style rectangular block mask (True = masked).
 
     The function samples random aspect-ratio blocks until the requested mask
     budget is reached, then trims/fills to keep the exact masked patch count.
+    On very small grids, the mask budget is capped so every sample keeps at
+    least a minimal visible context.
     """
     grid_h, grid_w = _infer_patch_grid(num_patches)
-    target = max(1, int(num_patches * mask_ratio))
+    if min_visible_patches is None:
+        min_visible_patches = max(1, min(num_patches, math.ceil(num_patches * 0.25)))
+    min_visible_patches = max(0, min(num_patches, int(min_visible_patches)))
+    max_masked = max(0, num_patches - min_visible_patches)
+    raw_target = int(num_patches * mask_ratio)
+    target = min(max(1, raw_target), max_masked) if max_masked > 0 else 0
     min_area = max(1, int(num_patches * min_block_ratio))
     max_area = max(min_area, int(num_patches * max_block_ratio))
     log_ar_min, log_ar_max = math.log(aspect_ratio[0]), math.log(aspect_ratio[1])
     mask = torch.zeros(batch_size, num_patches, dtype=torch.bool, device=device)
+    if target == 0:
+        return mask
 
     for i in range(batch_size):
         attempts = 0
@@ -240,6 +270,8 @@ class VisionEncoder(nn.Module):
 
     def _pos_embed_for_grid(self, grid_h: int, grid_w: int) -> torch.Tensor:
         """Interpolate positional embeddings for multi-crop/local resolutions."""
+        if grid_h <= 0 or grid_w <= 0:
+            raise ValueError(f"Patch grid must be positive, got {(grid_h, grid_w)}")
         if grid_h == self.grid_size and grid_w == self.grid_size:
             return self.pos_embed[:, :grid_h * grid_w + 1, :]
 
@@ -248,8 +280,10 @@ class VisionEncoder(nn.Module):
         patch_pos = patch_pos.reshape(1, self.grid_size, self.grid_size, self.hidden_dim)
         patch_pos = patch_pos.permute(0, 3, 1, 2)
         patch_pos = F.interpolate(
-            patch_pos, size=(grid_h, grid_w), mode='bicubic', align_corners=False,
+            patch_pos.float(), size=(grid_h, grid_w), mode='bicubic', align_corners=False,
         )
+        patch_pos = torch.nan_to_num(patch_pos, nan=0.0, posinf=0.0, neginf=0.0)
+        patch_pos = patch_pos.to(dtype=cls_pos.dtype)
         patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, grid_h * grid_w, self.hidden_dim)
         return torch.cat([cls_pos, patch_pos], dim=1)
 
@@ -269,13 +303,17 @@ class VisionEncoder(nn.Module):
             (B, num_patches+1, hidden_dim) patch + [CLS] embeddings
         """
         B, C, H, W = x.shape
-        if H % self.patch_size != 0 or W % self.patch_size != 0:
-            raise ValueError(
-                f"Image size {(H, W)} must be divisible by patch_size={self.patch_size}"
-            )
+        if H <= 0 or W <= 0:
+            raise ValueError(f"Image size must be positive, got {(H, W)}")
 
         # Patchify
         p = self.patch_size
+        pad_h = (p - H % p) % p
+        pad_w = (p - W % p) % p
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
+            H += pad_h
+            W += pad_w
         grid_h, grid_w = H // p, W // p
         x = x.reshape(B, C, H // p, p, W // p, p)
         x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
@@ -456,10 +494,9 @@ class VL_JEPA(nn.Module):
         self.vision_proj = nn.Linear(hidden_dim, hidden_dim)
         self.language_proj = nn.Linear(hidden_dim, hidden_dim)
 
-        # Kept for old checkpoints; I-JEPA now predicts target encoder space directly.
+        # Student prediction head and EMA teacher head define the MSE loss space.
+        # Applying a head on only one side makes the predictor/teacher spaces asymmetric.
         self.vision_pred_head = nn.Linear(hidden_dim, hidden_dim)
-        for p in self.vision_pred_head.parameters():
-            p.requires_grad = False
 
         # Learnable temperature for InfoNCE
         self.logit_scale = nn.Parameter(torch.ones([]) * 2.659)  # ~ln(1/0.07)
@@ -470,10 +507,12 @@ class VL_JEPA(nn.Module):
         self.target_language_encoder = copy.deepcopy(self.language_encoder)
         self.target_vision_proj = copy.deepcopy(self.vision_proj)
         self.target_language_proj = copy.deepcopy(self.language_proj)
+        self.target_vision_pred_head = copy.deepcopy(self.vision_pred_head)
         for module in (
             self.target_language_encoder,
             self.target_vision_proj,
             self.target_language_proj,
+            self.target_vision_pred_head,
         ):
             for p in module.parameters():
                 p.requires_grad = False
@@ -493,6 +532,7 @@ class VL_JEPA(nn.Module):
             (self.language_encoder, self.target_language_encoder),
             (self.vision_proj, self.target_vision_proj),
             (self.language_proj, self.target_language_proj),
+            (self.vision_pred_head, self.target_vision_pred_head),
         )
         for student, teacher in pairs:
             for student_p, teacher_p in zip(student.parameters(), teacher.parameters()):
@@ -525,12 +565,10 @@ class VL_JEPA(nn.Module):
         device = images.device
         context_images = images if context_images is None else context_images
         target_images = images if target_images is None else target_images
-        # EMA teachers kept in eval mode (no dropout/batch-norm noise)
-        self.target_encoder.eval()
-        self.target_language_encoder.eval()
+        p = self.context_encoder.patch_size
         num_patches = (
-            (context_images.size(2) // self.context_encoder.patch_size)
-            * (context_images.size(3) // self.context_encoder.patch_size)
+            math.ceil(context_images.size(2) / p)
+            * math.ceil(context_images.size(3) / p)
         )
         generator = None
         if mask_seed is not None:
@@ -547,7 +585,14 @@ class VL_JEPA(nn.Module):
         context_emb = self.context_encoder(context_images, patch_mask)  # (B, N+1, D)
 
         # ---- 2. Target encoders (full local target for MSE, global target for NCE) ----
-        with torch.no_grad():
+        teacher_modules = (
+            self.target_encoder,
+            self.target_language_encoder,
+            self.target_vision_proj,
+            self.target_language_proj,
+            self.target_vision_pred_head,
+        )
+        with torch.no_grad(), _temporarily_eval(*teacher_modules):
             target_emb = self.target_encoder(context_images, mask=None)  # (B, N+1, D)
             target_global_emb = self.target_encoder(target_images, mask=None)
 
@@ -564,7 +609,7 @@ class VL_JEPA(nn.Module):
             input_ids = apply_bert_token_mask(input_ids, token_mask)
 
         language_emb = self.language_encoder(input_ids, attention_mask)  # (B, S, D)
-        with torch.no_grad():
+        with torch.no_grad(), _temporarily_eval(*teacher_modules):
             target_language_emb = self.target_language_encoder(clean_input_ids, attention_mask)
 
         # ---- 5. Joint projections ----
@@ -572,21 +617,19 @@ class VL_JEPA(nn.Module):
         vision_cls = predicted[:, 0, :]            # (B, D)
         language_cls = language_emb[:, 0, :]        # (B, D) — use [CLS] equivalent (first token)
 
-        vision_proj = F.normalize(self.vision_proj(vision_cls), p=2, dim=-1)
-        language_proj = F.normalize(self.language_proj(language_cls), p=2, dim=-1)
-        with torch.no_grad():
+        vision_proj = F.normalize(self.vision_proj(vision_cls), p=2, dim=-1, eps=1e-6)
+        language_proj = F.normalize(self.language_proj(language_cls), p=2, dim=-1, eps=1e-6)
+        with torch.no_grad(), _temporarily_eval(*teacher_modules):
             target_vision_proj = F.normalize(
-                self.target_vision_proj(target_global_emb[:, 0, :]), p=2, dim=-1,
+                self.target_vision_proj(target_global_emb[:, 0, :]), p=2, dim=-1, eps=1e-6,
             )
             target_language_proj = F.normalize(
-                self.target_language_proj(target_language_emb[:, 0, :]), p=2, dim=-1,
+                self.target_language_proj(target_language_emb[:, 0, :]), p=2, dim=-1, eps=1e-6,
             )
+            target_patches = self.target_vision_pred_head(target_emb).detach()
 
-        # Predictor output mapped to target space via learned prediction head.
-        # Both sides go through vision_pred_head so MSE is in the same space.
-        # Target side is detached (stop-gradient).
+        # Predictor output mapped to the EMA teacher-head space.
         predicted_patches = self.vision_pred_head(predicted)
-        target_patches = self.vision_pred_head(target_emb).detach()
 
         return {
             'predicted_patches': predicted_patches,   # (B, N+1, D)
@@ -611,8 +654,8 @@ class VL_JEPA(nn.Module):
         vision_cls = vision_emb[:, 0, :]
         language_cls = language_emb[:, 0, :]
 
-        vision_proj = F.normalize(self.vision_proj(vision_cls), p=2, dim=-1)
-        language_proj = F.normalize(self.language_proj(language_cls), p=2, dim=-1)
+        vision_proj = F.normalize(self.vision_proj(vision_cls), p=2, dim=-1, eps=1e-6)
+        language_proj = F.normalize(self.language_proj(language_cls), p=2, dim=-1, eps=1e-6)
 
         return vision_proj, language_proj
 
@@ -650,14 +693,22 @@ def compute_jepa_loss(
     mse_all = F.mse_loss(pred_patches, tgt_patches, reduction='none')  # (B, N, D)
     mse_all = mse_all.mean(dim=-1)  # (B, N) — average over feature dim
 
-    # Mask out unmasked positions
-    patch_mask_expanded = patch_mask.float()  # (B, N) — 1 = masked
-    mse_masked = (mse_all * patch_mask_expanded).sum() / patch_mask_expanded.sum().clamp(min=1)
+    # Mask out unmasked positions. Average per sample first so a zero-mask
+    # sample contributes 0 instead of changing the whole-batch denominator.
+    patch_mask_expanded = patch_mask.to(dtype=mse_all.dtype)  # (B, N) — 1 = masked
+    masked_counts = patch_mask_expanded.sum(dim=1)
+    masked_sums = (mse_all * patch_mask_expanded).sum(dim=1)
+    mse_per_sample = torch.where(
+        masked_counts > 0,
+        masked_sums / masked_counts.clamp(min=1),
+        torch.zeros_like(masked_sums),
+    )
+    mse_masked = mse_per_sample.mean()
 
     # ---- InfoNCE contrastive loss ----
     batch_size = vision_proj.size(0)
     logit_scale = outputs.get('logit_scale', torch.tensor(2.659, device=vision_proj.device))
-    scale = logit_scale.exp().clamp(max=100.0)
+    scale = logit_scale.clamp(LOGIT_SCALE_MIN, LOGIT_SCALE_MAX).exp()
 
     target_language_proj = outputs.get('target_language_proj')
     target_vision_proj = outputs.get('target_vision_proj')

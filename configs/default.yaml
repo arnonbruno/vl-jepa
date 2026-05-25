@@ -16,7 +16,7 @@ training:
   weight_decay: 0.05
   warmup_steps: 2000
   max_steps: null  # auto: epochs * (samples // batch_size)
-  use_multi_crop: false
+  use_multi_crop: true
   global_crop_size: 224
   local_crop_size: 96
 

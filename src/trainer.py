@@ -17,7 +17,13 @@ import math
 from typing import Dict, Tuple, Optional, Iterator, Any
 from pathlib import Path
 
-from .model import VL_JEPA, compute_jepa_loss, make_multicrop_views
+from .model import (
+    LOGIT_SCALE_MAX,
+    LOGIT_SCALE_MIN,
+    VL_JEPA,
+    compute_jepa_loss,
+    make_multicrop_views,
+)
 
 
 def _amp_autocast(device: torch.device):
@@ -34,8 +40,8 @@ def _make_grad_scaler(device: torch.device):
     if device.type != 'cuda':
         return None
     if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
-        return torch.amp.GradScaler('cuda')
-    return torch.cuda.amp.GradScaler()
+        return torch.amp.GradScaler('cuda', init_scale=1024.0, growth_interval=2000)
+    return torch.cuda.amp.GradScaler(init_scale=1024.0, growth_interval=2000)
 
 
 def _unpack_batch(batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -127,6 +133,22 @@ class VL_JEPA_Trainer:
         self.running_loss = 0.0
         self.running_steps = 0
 
+    @torch.no_grad()
+    def _clamp_stability_params(self) -> None:
+        """Keep scalar stability parameters inside their valid training range."""
+        self.model.logit_scale.clamp_(LOGIT_SCALE_MIN, LOGIT_SCALE_MAX)
+
+    @staticmethod
+    def _assert_finite_loss(loss: torch.Tensor, loss_dict: Dict[str, torch.Tensor]) -> None:
+        if torch.isfinite(loss):
+            return
+        parts = []
+        for key in ('mse_loss', 'nce_loss', 'total_loss'):
+            value = loss_dict.get(key)
+            if isinstance(value, torch.Tensor):
+                parts.append(f"{key}={value.detach().float().item()}")
+        raise FloatingPointError(f"Non-finite JEPA loss detected ({', '.join(parts)})")
+
     def _forward_model(
         self,
         images: torch.Tensor,
@@ -186,14 +208,18 @@ class VL_JEPA_Trainer:
                 outputs = self._forward_model(images, input_ids, attention_mask, training=True)
                 loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
                 loss = loss_dict['total_loss']
+                self._assert_finite_loss(loss, loss_dict)
 
             # Backward with AMP
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 3.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), 3.0, error_if_nonfinite=True,
+            )
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            self._clamp_stability_params()
             # GradScaler does not set _opt_called on LambdaLR-wrapped optimizers
             self.optimizer._opt_called = True
             self.scheduler.step()
@@ -202,11 +228,15 @@ class VL_JEPA_Trainer:
             outputs = self._forward_model(images, input_ids, attention_mask, training=True)
             loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
             loss = loss_dict['total_loss']
+            self._assert_finite_loss(loss, loss_dict)
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 3.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), 3.0, error_if_nonfinite=True,
+            )
             self.optimizer.step()
+            self._clamp_stability_params()
             self.scheduler.step()
             self._step += 1
 
@@ -253,6 +283,7 @@ class VL_JEPA_Trainer:
                 images, input_ids, attention_mask, training=False, mask_seed=mask_seed,
             )
             loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
+            self._assert_finite_loss(loss_dict['total_loss'], loss_dict)
 
         return {
             'mse_loss': loss_dict['mse_loss'].item(),

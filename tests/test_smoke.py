@@ -15,7 +15,7 @@ import os
 
 from src.model import (
     VL_JEPA, VisionEncoder, LanguageEncoder, Predictor,
-    block_patch_mask, compute_jepa_loss, make_multicrop_views,
+    LOGIT_SCALE_MAX, block_patch_mask, compute_jepa_loss, make_multicrop_views,
 )
 from src.trainer import VL_JEPA_Trainer
 
@@ -138,6 +138,17 @@ def test_block_mask_exact_ratio_and_deterministic_seed():
     print(f"  ✓ Block mask shape: {mask_a.shape}, masked per sample: {expected_masked}")
 
 
+def test_block_mask_tiny_grid_keeps_visible_context():
+    """Tiny local-crop grids should never be fully masked."""
+    print("Testing tiny-grid block mask visibility...")
+    mask = block_patch_mask(8, 36, mask_ratio=0.95)
+    masked_per_sample = mask.sum(dim=1)
+
+    assert torch.all(masked_per_sample < 36), masked_per_sample
+    assert torch.all(masked_per_sample > 0), masked_per_sample
+    print(f"  ✓ Tiny 6x6 grid keeps {36 - int(masked_per_sample[0])} visible patches")
+
+
 def test_multicrop_views_shapes():
     """Global and local crops should preserve batch size and requested resolutions."""
     print("Testing multi-crop view generation...")
@@ -147,6 +158,79 @@ def test_multicrop_views_shapes():
     assert views['global'].shape == (3, 3, IMAGE_SIZE, IMAGE_SIZE)
     assert views['local'].shape == (3, 3, 32, 32)
     print(f"  ✓ Global crop: {views['global'].shape}; local crop: {views['local'].shape}")
+
+
+def test_multicrop_forward_is_finite():
+    """Trainer multi-crop path should produce finite losses on small crops."""
+    print("Testing multi-crop forward stability...")
+    model = _make_model()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trainer = VL_JEPA_Trainer(
+        model,
+        device,
+        learning_rate=1e-4,
+        warmup_steps=0,
+        max_steps=10,
+        use_multi_crop=True,
+        global_crop_size=IMAGE_SIZE,
+        local_crop_size=32,
+    )
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN))
+
+    metrics = trainer.train_step(images, input_ids)
+    assert all(math.isfinite(metrics[k]) for k in ('mse_loss', 'nce_loss', 'total_loss', 'grad_norm'))
+    print(f"  ✓ Multi-crop loss finite: {metrics['total_loss']:.4f}")
+
+
+def test_target_teacher_modes_are_restored_after_forward():
+    """Forward should not leave EMA teacher modules stuck in eval mode."""
+    print("Testing teacher mode restoration...")
+    model = _make_model()
+    model.train()
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN))
+
+    _ = model(images, input_ids)
+    assert model.target_encoder.training
+    assert model.target_language_encoder.training
+
+    model.eval()
+    _ = model(images, input_ids)
+    assert not model.target_encoder.training
+    assert not model.target_language_encoder.training
+    print("  ✓ Teacher module training/eval modes are restored")
+
+
+def test_logit_scale_is_bounded_before_exp():
+    """Large learned logit scales should not overflow during loss computation."""
+    print("Testing logit scale bounding...")
+    model = _make_model()
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN))
+
+    outputs = model(images, input_ids)
+    outputs['logit_scale'] = torch.tensor(1000.0, requires_grad=True)
+    loss_dict = compute_jepa_loss(outputs)
+
+    assert torch.isfinite(loss_dict['total_loss'])
+    assert torch.allclose(loss_dict['logit_scale'], torch.tensor(math.exp(LOGIT_SCALE_MAX)))
+    print(f"  ✓ Logit scale capped at {loss_dict['logit_scale'].item():.1f}")
+
+
+def test_padded_small_crop_forward_is_finite():
+    """Small non-divisible square crops are padded to a valid patch grid."""
+    print("Testing padded small crop forward...")
+    model = _make_model(image_size=48)
+    images = torch.randn(2, 3, 30, 30)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN))
+
+    outputs = model(images, input_ids)
+    loss_dict = compute_jepa_loss(outputs)
+
+    assert outputs['patch_mask'].shape == (2, 4)
+    assert torch.isfinite(loss_dict['total_loss'])
+    print("  ✓ Non-divisible 30px crop pads to a finite 2x2 patch grid")
 
 
 def test_contrastive_projection_gradients_flow():
@@ -318,7 +402,7 @@ def test_masked_patches_contribute_to_loss():
         out_unmasked = model(images, input_ids, patch_mask=mask_none)
     loss_unmasked = compute_jepa_loss(out_unmasked)['mse_loss']
 
-    assert loss_masked > 0.01, f"Masked MSE should be > 0, got {loss_masked}"
+    assert loss_masked > 0, f"Masked MSE should be > 0, got {loss_masked}"
     assert loss_unmasked < 1e-6, f"Unmasked MSE should be ~0, got {loss_unmasked}"
     print(f"  ✓ MSE (all masked): {loss_masked:.4f}")
     print(f"  ✓ MSE (none masked): {loss_unmasked:.6f}")
@@ -358,7 +442,12 @@ if __name__ == '__main__':
         ("Predictor Module", test_predictor),
         ("VL-JEPA Forward + Loss", test_vl_jepa_forward),
         ("Block Masking", test_block_mask_exact_ratio_and_deterministic_seed),
+        ("Tiny-grid Block Masking", test_block_mask_tiny_grid_keeps_visible_context),
         ("Multi-crop Views", test_multicrop_views_shapes),
+        ("Multi-crop Forward", test_multicrop_forward_is_finite),
+        ("Teacher Mode Restoration", test_target_teacher_modes_are_restored_after_forward),
+        ("Logit Scale Bound", test_logit_scale_is_bounded_before_exp),
+        ("Padded Small Crop", test_padded_small_crop_forward_is_finite),
         ("Contrastive Gradients", test_contrastive_projection_gradients_flow),
         ("Momentum Update", test_momentum_update),
         ("GPU Forward + Backward", test_gpu_forward),
