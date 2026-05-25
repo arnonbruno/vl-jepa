@@ -4,8 +4,9 @@ Tests end-to-end training with synthetic data.
 """
 
 import torch
+from pathlib import Path
 import sys
-sys.path.insert(0, '/home/ulluboz/.openclaw/workspace/vl-jepa')
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.model import VL_JEPA
 from src.trainer import VL_JEPA_Trainer

@@ -1,0 +1,369 @@
+"""
+VL-JEPA Experiment: Proper JEPA Training
+-----------------------------------------
+Trains the fixed VL-JEPA model with:
+
+  L = α * MSE(predicted_patches, target_patches) + β * InfoNCE(visual_cls, text_cls)
+
+Features:
+  - Real masking (75% vision patches, 15% language tokens)
+  - EMA target encoder (τ = 0.996 → 1.0 cosine schedule)
+  - Predictor (6-layer transformer)
+  - AMP + gradient clipping for GPU efficiency
+  - Validation split
+  - Checkpointing + TensorBoard logging
+  - No hardcoded paths
+"""
+
+import torch
+import json
+import time
+import math
+import sys
+from pathlib import Path
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.model import VL_JEPA
+from src.trainer import VL_JEPA_Trainer
+
+
+class SyntheticDataset:
+    """Synthetic dataset for testing the JEPA training loop.
+
+    Uses random images and text — the model won't learn meaningful
+    representations from this data, but it validates that:
+      - Gradients flow through the entire computation graph
+      - Loss decreases over time (even if just memorizing noise)
+      - GPU is properly utilized
+    """
+
+    def __init__(self, num_samples=5000, batch_size=32, seq_len=128):
+        self.num_samples = num_samples
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.num_batches = max(1, num_samples // batch_size)
+
+    def __iter__(self):
+        for _ in range(self.num_batches):
+            images = torch.randn(self.batch_size, 3, 224, 224)
+            input_ids = torch.randint(0, 30522, (self.batch_size, self.seq_len))
+            attention_mask = torch.ones(self.batch_size, self.seq_len, dtype=torch.long)
+            yield images, input_ids, attention_mask
+
+
+class RealisticDataset:
+    """Simple dataset from real images and tokenized captions.
+
+    Falls back to synthetic data if no real data directory is provided.
+    """
+
+    def __init__(self, data_dir=None, batch_size=32, seq_len=128,
+                 image_size=224, num_samples=5000):
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.image_size = image_size
+        self.data_dir = Path(data_dir) if data_dir else None
+
+        if self.data_dir and self.data_dir.exists():
+            self._load_real_data()
+        else:
+            print(f"  ⚠️  No real data at {data_dir}")
+            print(f"  → Using synthetic data ({num_samples} samples)")
+            self._synthetic = True
+            self.num_samples = num_samples
+            self.num_batches = max(1, num_samples // batch_size)
+
+    def _load_real_data(self):
+        """Scan data directory for image files."""
+        from torchvision import transforms
+        from PIL import Image
+
+        extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+        self.image_paths = []
+        for ext in extensions:
+            self.image_paths.extend(list(self.data_dir.rglob(f'*{ext}')))
+
+        if not self.image_paths:
+            raise FileNotFoundError(f"No images found in {self.data_dir}")
+
+        self.transform = transforms.Compose([
+            transforms.Resize((self.image_size, self.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
+        ])
+        self.num_samples = len(self.image_paths)
+        self.num_batches = max(1, self.num_samples // self.batch_size)
+        self._synthetic = False
+        print(f"  ✓ Loaded {self.num_samples} images from {self.data_dir}")
+
+    def __iter__(self):
+        if self._synthetic:
+            for _ in range(self.num_batches):
+                images = torch.randn(self.batch_size, 3, self.image_size, self.image_size)
+                input_ids = torch.randint(0, 30522, (self.batch_size, self.seq_len))
+                attention_mask = torch.ones(self.batch_size, self.seq_len, dtype=torch.long)
+                yield images, input_ids, attention_mask
+        else:
+            from PIL import Image
+            import random
+            indices = list(range(self.num_samples))
+            random.shuffle(indices)
+
+            for batch_idx in range(self.num_batches):
+                batch_images = []
+                batch_text = []
+
+                for i in range(self.batch_size):
+                    idx = batch_idx * self.batch_size + i
+                    if idx >= self.num_samples:
+                        break
+
+                    img_path = self.image_paths[indices[idx]]
+                    try:
+                        img = Image.open(img_path).convert('RGB')
+                        img_tensor = self.transform(img)
+                        batch_images.append(img_tensor)
+
+                        # Simple caption from filename (or placeholder)
+                        caption = img_path.stem.replace('_', ' ').replace('-', ' ')[:self.seq_len]
+                        tokens = [hash(w) % 30522 for w in caption.lower().split()]
+                        while len(tokens) < self.seq_len:
+                            tokens.append(0)
+                        batch_text.append(torch.tensor(tokens[:self.seq_len]))
+
+                    except Exception as e:
+                        continue
+
+                if batch_images:
+                    images = torch.stack(batch_images)
+                    input_ids = torch.stack(batch_text)
+                    attention_mask = torch.ones_like(input_ids)
+                    yield images, input_ids, attention_mask
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='VL-JEPA Training')
+    parser.add_argument('--epochs', type=int, default=15,
+                        help='Number of training epochs')
+    parser.add_argument('--batch-size', type=int, default=32,
+                        help='Batch size')
+    parser.add_argument('--lr', type=float, default=3e-4,
+                        help='Peak learning rate')
+    parser.add_argument('--samples', type=int, default=5000,
+                        help='Number of training samples')
+    parser.add_argument('--hidden-dim', type=int, default=768,
+                        help='Hidden dimension')
+    parser.add_argument('--data-dir', type=str, default=None,
+                        help='Real image directory (optional)')
+    parser.add_argument('--output-dir', type=str, default='experiments',
+                        help='Output directory for metrics/checkpoints')
+    parser.add_argument('--alpha', type=float, default=1.0,
+                        help='MSE loss weight')
+    parser.add_argument('--beta', type=float, default=0.5,
+                        help='InfoNCE loss weight')
+    parser.add_argument('--log-interval', type=int, default=10,
+                        help='Log every N batches')
+    parser.add_argument('--warmup', type=int, default=500,
+                        help='Warmup steps')
+    parser.add_argument('--predictor-layers', type=int, default=6,
+                        help='Number of predictor transformer layers')
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("VL-JEPA v2 — Proper JEPA Training")
+    print("=" * 70)
+    print(f"\nConfiguration:")
+    for key, val in vars(args).items():
+        print(f"  {key}: {val}")
+
+    # Setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\nDevice: {device}")
+    if device.type == 'cuda':
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
+
+    # Model
+    model = VL_JEPA(
+        hidden_dim=args.hidden_dim,
+        patch_size=16,
+        image_size=224,
+        mask_ratio=0.75,
+        predictor_layers=args.predictor_layers,
+        momentum_tau=0.996,
+    )
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nModel: {total_params/1e6:.1f}M params ({trainable_params/1e6:.1f}M trainable)")
+
+    # Trainer
+    trainer = VL_JEPA_Trainer(
+        model=model,
+        device=device,
+        learning_rate=args.lr,
+        warmup_steps=args.warmup,
+        max_steps=args.epochs * (args.samples // args.batch_size),
+        alpha=args.alpha,
+        beta=args.beta,
+    )
+
+    # Dataset
+    dataset = RealisticDataset(
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        num_samples=args.samples,
+    )
+
+    # Split into train/val (90/10)
+    val_batches = max(1, dataset.num_batches // 10)
+    train_batches = dataset.num_batches - val_batches
+    print(f"\nData: {dataset.num_samples} samples")
+    print(f"  Train batches: {train_batches}")
+    print(f"  Val batches: {val_batches}")
+
+    # Output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    exp_name = f"exp_jepa_{args.hidden_dim}d_{args.epochs}ep"
+    exp_dir = output_dir / exp_name
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Training loop
+    print(f"\n{'=' * 70}")
+    print(f"Training for {args.epochs} epochs...")
+    print(f"{'=' * 70}")
+
+    all_metrics = []
+    best_val_loss = float('inf')
+    total_start = time.time()
+
+    for epoch in range(args.epochs):
+        epoch_start = time.time()
+        epoch_metrics = {'mse_loss': [], 'nce_loss': [], 'total_loss': []}
+
+        for batch_idx, batch in enumerate(dataset):
+            if batch_idx >= train_batches:
+                # Switch to validation
+                break
+
+            images, input_ids, attention_mask = batch
+            metrics = trainer.train_step(images, input_ids, attention_mask)
+
+            for key in epoch_metrics:
+                epoch_metrics[key].append(metrics[key])
+
+            if (batch_idx + 1) % args.log_interval == 0:
+                avg_loss = sum(epoch_metrics['total_loss'][-args.log_interval:]) / args.log_interval
+                lr = metrics['lr']
+                gn = metrics['grad_norm']
+                print(f"  E{epoch+1:2d} B{batch_idx+1:4d}/{train_batches} | "
+                      f"Loss: {avg_loss:.4f} | MSE: {metrics['mse_loss']:.4f} | "
+                      f"NCE: {metrics['nce_loss']:.4f} | GN: {gn:.2f} | LR: {lr:.2e}",
+                      end='\r')
+
+        # Epoch summary (training)
+        avg_mse = sum(epoch_metrics['mse_loss']) / len(epoch_metrics['mse_loss'])
+        avg_nce = sum(epoch_metrics['nce_loss']) / len(epoch_metrics['nce_loss'])
+        avg_loss = sum(epoch_metrics['total_loss']) / len(epoch_metrics['total_loss'])
+        epoch_time = time.time() - epoch_start
+
+        # Validation
+        model.eval()
+        val_mse, val_nce, val_loss = 0.0, 0.0, 0.0
+        val_count = 0
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataset):
+                if batch_idx < train_batches:
+                    continue
+                if batch_idx - train_batches >= val_batches:
+                    break
+                images, input_ids, attention_mask = batch
+                val_metrics = trainer.eval_step(images, input_ids, attention_mask)
+                val_mse += val_metrics['mse_loss']
+                val_nce += val_metrics['nce_loss']
+                val_loss += val_metrics['total_loss']
+                val_count += 1
+
+        if val_count > 0:
+            val_mse /= val_count
+            val_nce /= val_count
+            val_loss /= val_count
+
+        # Log
+        gpu_mem = torch.cuda.max_memory_allocated() / 1e9 if device.type == 'cuda' else 0
+        torch.cuda.reset_peak_memory_stats() if device.type == 'cuda' else None
+
+        print(f"\nEpoch {epoch+1:2d}/{args.epochs} | "
+              f"Train: {avg_loss:.4f} (MSE: {avg_mse:.4f}, NCE: {avg_nce:.4f}) | "
+              f"Val: {val_loss:.4f} (MSE: {val_mse:.4f}, NCE: {val_nce:.4f}) | "
+              f"{epoch_time:.1f}s | GPU: {gpu_mem:.2f}GB | "
+              f"τ: {trainer.model.momentum_tau:.3f}")
+
+        epoch_record = {
+            'epoch': epoch + 1,
+            'train_mse': avg_mse,
+            'train_nce': avg_nce,
+            'train_loss': avg_loss,
+            'val_mse': val_mse,
+            'val_nce': val_nce,
+            'val_loss': val_loss,
+            'time': epoch_time,
+            'gpu_mem_gb': gpu_mem,
+        }
+        all_metrics.append(epoch_record)
+
+        # Save checkpoint if best validation loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            ckpt_path = exp_dir / 'checkpoint_best.pt'
+            trainer.save_checkpoint(str(ckpt_path), {
+                'epoch': epoch + 1,
+                'val_loss': val_loss,
+                'config': vars(args),
+            })
+            print(f"  → Best model saved ({val_loss:.4f})")
+
+        # Save checkpoint every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            ckpt_path = exp_dir / f'checkpoint_epoch{epoch+1}.pt'
+            trainer.save_checkpoint(str(ckpt_path), {'epoch': epoch + 1})
+            print(f"  → Checkpoint saved: epoch {epoch+1}")
+
+        # Save metrics
+        with open(exp_dir / 'metrics.json', 'w') as f:
+            json.dump(all_metrics, f, indent=2)
+
+    total_time = time.time() - total_start
+    print(f"\n{'=' * 70}")
+    print(f"Training completed in {total_time:.1f}s")
+    print(f"Results saved to: {exp_dir}")
+    print(f"{'=' * 70}")
+
+    # Summary
+    if len(all_metrics) > 1:
+        first, last = all_metrics[0], all_metrics[-1]
+        print(f"\nTraining Summary:")
+        print(f"  Initial loss: {first['train_loss']:.4f}")
+        print(f"  Final loss:   {last['train_loss']:.4f}")
+        print(f"  Improvement:  {first['train_loss'] - last['train_loss']:.4f} "
+              f"({(1 - last['train_loss']/first['train_loss'])*100:.1f}%)")
+        print(f"  Best val loss: {best_val_loss:.4f}")
+        avg_gpu = sum(m.get('gpu_mem_gb', 0) for m in all_metrics) / len(all_metrics)
+        print(f"  Avg GPU mem:  {avg_gpu:.2f}GB")
+        avg_speed = sum(m.get('time', 0) for m in all_metrics) / len(all_metrics)
+        print(f"  Avg epoch:    {avg_speed:.1f}s")
+        print(f"  Steps/sec:    {train_batches / (total_time/args.epochs):.1f}")
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
