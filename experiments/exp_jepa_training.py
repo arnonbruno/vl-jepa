@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.model import VL_JEPA
 from src.trainer import VL_JEPA_Trainer
+from src.config import load_config, overrides_from_cli, print_config
 
 
 class SyntheticDataset:
@@ -144,41 +145,119 @@ class RealisticDataset:
                     yield images, input_ids, attention_mask
 
 
+def _build_parser(base_cfg: dict) -> "argparse.ArgumentParser":
+    import argparse
+
+    model = base_cfg.get("model", {})
+    training = base_cfg.get("training", {})
+    loss = base_cfg.get("loss", {})
+    data = base_cfg.get("data", {})
+    output = base_cfg.get("output", {})
+
+    parser = argparse.ArgumentParser(description='VL-JEPA Training')
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='configs/default.yaml',
+        help='Path to YAML config (default: configs/default.yaml)',
+    )
+    parser.add_argument('--epochs', type=int, default=training.get('epochs', 15),
+                        help='Number of training epochs')
+    parser.add_argument('--batch-size', type=int, default=training.get('batch_size', 32),
+                        help='Batch size')
+    parser.add_argument('--lr', type=float, default=training.get('learning_rate', 3e-4),
+                        help='Peak learning rate')
+    parser.add_argument('--weight-decay', type=float, default=training.get('weight_decay', 0.05),
+                        help='AdamW weight decay')
+    parser.add_argument('--warmup', type=int, default=training.get('warmup_steps', 500),
+                        help='Warmup steps')
+    parser.add_argument('--max-steps', type=int, default=None,
+                        help='Total training steps (default: derived from epochs/samples/batch)')
+    parser.add_argument('--samples', type=int, default=data.get('samples', 5000),
+                        help='Number of training samples')
+    parser.add_argument('--seq-len', type=int, default=data.get('seq_len', 128),
+                        help='Text sequence length')
+    parser.add_argument('--hidden-dim', type=int, default=model.get('hidden_dim', 768),
+                        help='Hidden dimension')
+    parser.add_argument('--patch-size', type=int, default=model.get('patch_size', 16),
+                        help='Vision patch size')
+    parser.add_argument('--image-size', type=int, default=model.get('image_size', 224),
+                        help='Input image size')
+    parser.add_argument('--mask-ratio', type=float, default=model.get('mask_ratio', 0.75),
+                        help='Fraction of vision patches to mask')
+    parser.add_argument('--predictor-layers', type=int, default=model.get('predictor_layers', 6),
+                        help='Number of predictor transformer layers')
+    parser.add_argument('--momentum-tau', type=float, default=model.get('momentum_tau', 0.996),
+                        help='EMA momentum coefficient (start)')
+    parser.add_argument('--data-dir', type=str, default=data.get('data_dir'),
+                        help='Real image directory (optional)')
+    parser.add_argument('--output-dir', type=str, default=output.get('output_dir', 'experiments'),
+                        help='Output directory for metrics/checkpoints')
+    parser.add_argument('--alpha', type=float, default=loss.get('alpha', 1.0),
+                        help='MSE loss weight')
+    parser.add_argument('--beta', type=float, default=loss.get('beta', 0.5),
+                        help='InfoNCE loss weight')
+    parser.add_argument('--log-interval', type=int, default=output.get('log_interval', 10),
+                        help='Log every N batches')
+    parser.add_argument('--checkpoint-interval', type=int,
+                        default=output.get('checkpoint_interval', 5),
+                        help='Save periodic checkpoint every N epochs')
+    return parser
+
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='VL-JEPA Training')
-    parser.add_argument('--epochs', type=int, default=15,
-                        help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=32,
-                        help='Batch size')
-    parser.add_argument('--lr', type=float, default=3e-4,
-                        help='Peak learning rate')
-    parser.add_argument('--samples', type=int, default=5000,
-                        help='Number of training samples')
-    parser.add_argument('--hidden-dim', type=int, default=768,
-                        help='Hidden dimension')
-    parser.add_argument('--data-dir', type=str, default=None,
-                        help='Real image directory (optional)')
-    parser.add_argument('--output-dir', type=str, default='experiments',
-                        help='Output directory for metrics/checkpoints')
-    parser.add_argument('--alpha', type=float, default=1.0,
-                        help='MSE loss weight')
-    parser.add_argument('--beta', type=float, default=0.5,
-                        help='InfoNCE loss weight')
-    parser.add_argument('--log-interval', type=int, default=10,
-                        help='Log every N batches')
-    parser.add_argument('--warmup', type=int, default=500,
-                        help='Warmup steps')
-    parser.add_argument('--predictor-layers', type=int, default=6,
-                        help='Number of predictor transformer layers')
-    args = parser.parse_args()
+
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument(
+        '--config',
+        type=str,
+        default='configs/default.yaml',
+        help='Path to YAML config',
+    )
+    pre_args, remaining = pre_parser.parse_known_args()
+    base_cfg = load_config(pre_args.config)
+
+    parser = _build_parser(base_cfg)
+    args = parser.parse_args(remaining)
+
+    cfg = load_config(
+        args.config,
+        overrides=overrides_from_cli(
+            hidden_dim=args.hidden_dim,
+            patch_size=args.patch_size,
+            image_size=args.image_size,
+            mask_ratio=args.mask_ratio,
+            predictor_layers=args.predictor_layers,
+            momentum_tau=args.momentum_tau,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            weight_decay=args.weight_decay,
+            warmup_steps=args.warmup,
+            max_steps=args.max_steps,
+            alpha=args.alpha,
+            beta=args.beta,
+            samples=args.samples,
+            seq_len=args.seq_len,
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            log_interval=args.log_interval,
+            checkpoint_interval=args.checkpoint_interval,
+        ),
+    )
+
+    model_cfg = cfg["model"]
+    train_cfg = cfg["training"]
+    loss_cfg = cfg["loss"]
+    data_cfg = cfg["data"]
+    out_cfg = cfg["output"]
 
     print("=" * 70)
     print("VL-JEPA v2 — Proper JEPA Training")
     print("=" * 70)
-    print(f"\nConfiguration:")
-    for key, val in vars(args).items():
-        print(f"  {key}: {val}")
+    print(f"\nConfiguration (config: {args.config}):")
+    print_config(cfg)
 
     # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -189,12 +268,12 @@ def main():
 
     # Model
     model = VL_JEPA(
-        hidden_dim=args.hidden_dim,
-        patch_size=16,
-        image_size=224,
-        mask_ratio=0.75,
-        predictor_layers=args.predictor_layers,
-        momentum_tau=0.996,
+        hidden_dim=model_cfg["hidden_dim"],
+        patch_size=model_cfg["patch_size"],
+        image_size=model_cfg["image_size"],
+        mask_ratio=model_cfg["mask_ratio"],
+        predictor_layers=model_cfg["predictor_layers"],
+        momentum_tau=model_cfg["momentum_tau"],
     )
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -204,18 +283,21 @@ def main():
     trainer = VL_JEPA_Trainer(
         model=model,
         device=device,
-        learning_rate=args.lr,
-        warmup_steps=args.warmup,
-        max_steps=args.epochs * (args.samples // args.batch_size),
-        alpha=args.alpha,
-        beta=args.beta,
+        learning_rate=train_cfg["learning_rate"],
+        weight_decay=train_cfg["weight_decay"],
+        warmup_steps=train_cfg["warmup_steps"],
+        max_steps=train_cfg["max_steps"],
+        alpha=loss_cfg["alpha"],
+        beta=loss_cfg["beta"],
     )
 
     # Dataset
     dataset = RealisticDataset(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        num_samples=args.samples,
+        data_dir=data_cfg.get("data_dir"),
+        batch_size=train_cfg["batch_size"],
+        seq_len=data_cfg["seq_len"],
+        image_size=model_cfg["image_size"],
+        num_samples=data_cfg["samples"],
     )
 
     # Split into train/val (90/10)
@@ -226,22 +308,22 @@ def main():
     print(f"  Val batches: {val_batches}")
 
     # Output directory
-    output_dir = Path(args.output_dir)
+    output_dir = Path(out_cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    exp_name = f"exp_jepa_{args.hidden_dim}d_{args.epochs}ep"
+    exp_name = f"exp_jepa_{model_cfg['hidden_dim']}d_{train_cfg['epochs']}ep"
     exp_dir = output_dir / exp_name
     exp_dir.mkdir(parents=True, exist_ok=True)
 
     # Training loop
     print(f"\n{'=' * 70}")
-    print(f"Training for {args.epochs} epochs...")
+    print(f"Training for {train_cfg['epochs']} epochs...")
     print(f"{'=' * 70}")
 
     all_metrics = []
     best_val_loss = float('inf')
     total_start = time.time()
 
-    for epoch in range(args.epochs):
+    for epoch in range(train_cfg["epochs"]):
         epoch_start = time.time()
         epoch_metrics = {'mse_loss': [], 'nce_loss': [], 'total_loss': []}
 
@@ -256,8 +338,8 @@ def main():
             for key in epoch_metrics:
                 epoch_metrics[key].append(metrics[key])
 
-            if (batch_idx + 1) % args.log_interval == 0:
-                avg_loss = sum(epoch_metrics['total_loss'][-args.log_interval:]) / args.log_interval
+            if (batch_idx + 1) % out_cfg["log_interval"] == 0:
+                avg_loss = sum(epoch_metrics['total_loss'][-out_cfg["log_interval"]:]) / out_cfg["log_interval"]
                 lr = metrics['lr']
                 gn = metrics['grad_norm']
                 print(f"  E{epoch+1:2d} B{batch_idx+1:4d}/{train_batches} | "
@@ -297,7 +379,7 @@ def main():
         gpu_mem = torch.cuda.max_memory_allocated() / 1e9 if device.type == 'cuda' else 0
         torch.cuda.reset_peak_memory_stats() if device.type == 'cuda' else None
 
-        print(f"\nEpoch {epoch+1:2d}/{args.epochs} | "
+        print(f"\nEpoch {epoch+1:2d}/{train_cfg['epochs']} | "
               f"Train: {avg_loss:.4f} (MSE: {avg_mse:.4f}, NCE: {avg_nce:.4f}) | "
               f"Val: {val_loss:.4f} (MSE: {val_mse:.4f}, NCE: {val_nce:.4f}) | "
               f"{epoch_time:.1f}s | GPU: {gpu_mem:.2f}GB | "
@@ -323,12 +405,11 @@ def main():
             trainer.save_checkpoint(str(ckpt_path), {
                 'epoch': epoch + 1,
                 'val_loss': val_loss,
-                'config': vars(args),
+                'config': cfg,
             })
             print(f"  → Best model saved ({val_loss:.4f})")
 
-        # Save checkpoint every 5 epochs
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % out_cfg["checkpoint_interval"] == 0:
             ckpt_path = exp_dir / f'checkpoint_epoch{epoch+1}.pt'
             trainer.save_checkpoint(str(ckpt_path), {'epoch': epoch + 1})
             print(f"  → Checkpoint saved: epoch {epoch+1}")
@@ -356,7 +437,7 @@ def main():
         print(f"  Avg GPU mem:  {avg_gpu:.2f}GB")
         avg_speed = sum(m.get('time', 0) for m in all_metrics) / len(all_metrics)
         print(f"  Avg epoch:    {avg_speed:.1f}s")
-        print(f"  Steps/sec:    {train_batches / (total_time/args.epochs):.1f}")
+        print(f"  Steps/sec:    {train_batches / (total_time/train_cfg['epochs']):.1f}")
 
 
 if __name__ == '__main__':
