@@ -1,1 +1,0 @@
-"""VL-JEPA experiment scripts."""

@@ -525,11 +525,9 @@ class VL_JEPA(nn.Module):
         device = images.device
         context_images = images if context_images is None else context_images
         target_images = images if target_images is None else target_images
-        # EMA teachers should not inject dropout noise during student training.
+        # EMA teachers kept in eval mode (no dropout/batch-norm noise)
         self.target_encoder.eval()
         self.target_language_encoder.eval()
-        self.target_vision_proj.eval()
-        self.target_language_proj.eval()
         num_patches = (
             (context_images.size(2) // self.context_encoder.patch_size)
             * (context_images.size(3) // self.context_encoder.patch_size)
