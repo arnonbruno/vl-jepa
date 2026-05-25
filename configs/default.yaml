@@ -21,9 +21,11 @@ loss:
   beta: 0.5
 
 data:
-  samples: 5000
-  seq_len: 128
-  data_dir: null
+  coco_root: ~/.cache/torch/hub/checkpoints
+  image_size: 224
+  batch_size: 32
+  num_workers: 4
+  max_caption_length: 64
 
 output:
   output_dir: experiments

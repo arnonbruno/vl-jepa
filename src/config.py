@@ -33,10 +33,11 @@ def _resolve_max_steps(cfg: Dict[str, Any]) -> Dict[str, Any]:
     max_steps = training.get("max_steps")
     if max_steps is None:
         data = cfg.get("data", {})
-        epochs = training.get("epochs", 1)
-        samples = data.get("samples", 1)
-        batch_size = max(1, training.get("batch_size", 1))
-        training["max_steps"] = epochs * max(1, samples // batch_size)
+        samples = data.get("samples")
+        if samples is not None:
+            epochs = training.get("epochs", 1)
+            batch_size = max(1, training.get("batch_size", data.get("batch_size", 1)))
+            training["max_steps"] = epochs * max(1, samples // batch_size)
     return cfg
 
 
