@@ -107,6 +107,15 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
                         help='Warmup steps')
     parser.add_argument('--max-steps', type=int, default=None,
                         help='Total training steps (default: epochs × train batches)')
+    parser.add_argument('--multi-crop', action=argparse.BooleanOptionalAction,
+                        default=training.get('use_multi_crop', False),
+                        help='Use global target crops and local masked context crops')
+    parser.add_argument('--global-crop-size', type=int,
+                        default=training.get('global_crop_size', 224),
+                        help='Global target crop size')
+    parser.add_argument('--local-crop-size', type=int,
+                        default=training.get('local_crop_size', 96),
+                        help='Local context crop size')
     parser.add_argument('--hidden-dim', type=int, default=model.get('hidden_dim', 768),
                         help='Hidden dimension')
     parser.add_argument('--patch-size', type=int, default=model.get('patch_size', 16),
@@ -115,6 +124,8 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
                         help='Input image size')
     parser.add_argument('--mask-ratio', type=float, default=model.get('mask_ratio', 0.75),
                         help='Fraction of vision patches to mask')
+    parser.add_argument('--text-mask-ratio', type=float, default=model.get('text_mask_ratio', 0.0),
+                        help='Fraction of language tokens to mask (default: 0, no MLM loss)')
     parser.add_argument('--predictor-layers', type=int, default=model.get('predictor_layers', 6),
                         help='Number of predictor transformer layers')
     parser.add_argument('--momentum-tau', type=float, default=model.get('momentum_tau', 0.996),
@@ -182,6 +193,7 @@ def main() -> None:
             patch_size=args.patch_size,
             image_size=args.image_size,
             mask_ratio=args.mask_ratio,
+            text_mask_ratio=args.text_mask_ratio,
             predictor_layers=args.predictor_layers,
             momentum_tau=args.momentum_tau,
             epochs=args.epochs,
@@ -190,6 +202,9 @@ def main() -> None:
             weight_decay=args.weight_decay,
             warmup_steps=args.warmup,
             max_steps=args.max_steps,
+            use_multi_crop=args.multi_crop,
+            global_crop_size=args.global_crop_size,
+            local_crop_size=args.local_crop_size,
             alpha=args.alpha,
             beta=args.beta,
             output_dir=args.output_dir,
@@ -229,6 +244,7 @@ def main() -> None:
         mask_ratio=model_cfg["mask_ratio"],
         predictor_layers=model_cfg["predictor_layers"],
         momentum_tau=model_cfg["momentum_tau"],
+        text_mask_ratio=model_cfg.get("text_mask_ratio", 0.0),
     )
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -270,6 +286,9 @@ def main() -> None:
         max_steps=max_steps,
         alpha=loss_cfg["alpha"],
         beta=loss_cfg["beta"],
+        use_multi_crop=train_cfg.get("use_multi_crop", False),
+        global_crop_size=train_cfg.get("global_crop_size", model_cfg["image_size"]),
+        local_crop_size=train_cfg.get("local_crop_size", 96),
     )
 
     output_dir = Path(out_cfg["output_dir"])
@@ -305,7 +324,7 @@ def main() -> None:
 
             epoch_start = time.time()
             epoch_metrics: Dict[str, list[float]] = {
-                'mse_loss': [], 'nce_loss': [], 'total_loss': [],
+                'mse_loss': [], 'nce_loss': [], 'total_loss': [], 'nce_acc': [],
             }
 
             for batch_idx, batch in enumerate(train_loader):
@@ -335,38 +354,31 @@ def main() -> None:
                     gn = metrics['grad_norm']
                     print(f"  E{epoch+1:2d} B{batch_idx+1:5d}/{train_batches} | "
                           f"Loss: {avg_loss:.4f} | MSE: {metrics['mse_loss']:.4f} | "
-                          f"NCE: {metrics['nce_loss']:.4f} | GN: {gn:.2f} | LR: {lr:.2e}",
+                          f"NCE: {metrics['nce_loss']:.4f} | "
+                          f"NCE@1: {metrics['nce_acc']:.2%} | GN: {gn:.2f} | LR: {lr:.2e}",
                           end='\r')
 
             avg_mse = sum(epoch_metrics['mse_loss']) / len(epoch_metrics['mse_loss'])
             avg_nce = sum(epoch_metrics['nce_loss']) / len(epoch_metrics['nce_loss'])
             avg_loss = sum(epoch_metrics['total_loss']) / len(epoch_metrics['total_loss'])
+            avg_nce_acc = sum(epoch_metrics['nce_acc']) / len(epoch_metrics['nce_acc'])
             epoch_time = time.time() - epoch_start
 
-            model.eval()
-            val_mse, val_nce, val_loss = 0.0, 0.0, 0.0
-            val_count = 0
-            with torch.no_grad():
-                for batch in val_loader:
-                    images, input_ids, attention_mask = batch
-                    val_metrics = trainer.eval_step(images, input_ids, attention_mask)
-                    val_mse += val_metrics['mse_loss']
-                    val_nce += val_metrics['nce_loss']
-                    val_loss += val_metrics['total_loss']
-                    val_count += 1
-
-            if val_count > 0:
-                val_mse /= val_count
-                val_nce /= val_count
-                val_loss /= val_count
+            val_metrics = trainer.evaluate(val_loader)
+            val_mse = val_metrics['mse_loss']
+            val_nce = val_metrics['nce_loss']
+            val_loss = val_metrics['total_loss']
+            val_nce_acc = val_metrics['nce_acc']
 
             gpu_mem = torch.cuda.max_memory_allocated() / 1e9 if device.type == 'cuda' else 0
             if device.type == 'cuda':
                 torch.cuda.reset_peak_memory_stats()
 
             print(f"\nEpoch {epoch+1:2d}/{train_cfg['epochs']} | "
-                  f"Train: {avg_loss:.4f} (MSE: {avg_mse:.4f}, NCE: {avg_nce:.4f}) | "
-                  f"Val: {val_loss:.4f} (MSE: {val_mse:.4f}, NCE: {val_nce:.4f}) | "
+                  f"Train: {avg_loss:.4f} (MSE: {avg_mse:.4f}, NCE: {avg_nce:.4f}, "
+                  f"NCE@1: {avg_nce_acc:.2%}) | "
+                  f"Val: {val_loss:.4f} (MSE: {val_mse:.4f}, NCE: {val_nce:.4f}, "
+                  f"NCE@1: {val_nce_acc:.2%}) | "
                   f"{epoch_time:.1f}s | GPU: {gpu_mem:.2f}GB | "
                   f"τ: {trainer.model.momentum_tau:.3f}")
 
@@ -374,9 +386,11 @@ def main() -> None:
                 'epoch': epoch + 1,
                 'train_mse': avg_mse,
                 'train_nce': avg_nce,
+                'train_nce_acc': avg_nce_acc,
                 'train_loss': avg_loss,
                 'val_mse': val_mse,
                 'val_nce': val_nce,
+                'val_nce_acc': val_nce_acc,
                 'val_loss': val_loss,
                 'time': epoch_time,
                 'gpu_mem_gb': gpu_mem,
@@ -388,9 +402,11 @@ def main() -> None:
                 writer.add_scalar('train/loss', avg_loss, step)
                 writer.add_scalar('train/mse', avg_mse, step)
                 writer.add_scalar('train/nce', avg_nce, step)
+                writer.add_scalar('train/nce_acc', avg_nce_acc, step)
                 writer.add_scalar('val/loss', val_loss, step)
                 writer.add_scalar('val/mse', val_mse, step)
                 writer.add_scalar('val/nce', val_nce, step)
+                writer.add_scalar('val/nce_acc', val_nce_acc, step)
                 if last_train_metrics:
                     writer.add_scalar('train/lr', last_train_metrics['lr'], step)
                     writer.add_scalar('train/grad_norm', last_train_metrics['grad_norm'], step)

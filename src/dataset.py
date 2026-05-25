@@ -128,10 +128,26 @@ def ensure_coco_2017(
     return root
 
 
-def _build_image_transform(image_size: int) -> transforms.Compose:
+def _build_image_transform(image_size: int, split: str) -> transforms.Compose:
+    if split == "train":
+        image_ops = [
+            transforms.RandomResizedCrop(
+                image_size,
+                scale=(0.50, 1.00),
+                ratio=(0.75, 1.3333),
+                antialias=True,
+            ),
+            transforms.RandomHorizontalFlip(p=0.5),
+        ]
+    else:
+        image_ops = [
+            transforms.Resize(image_size, antialias=True),
+            transforms.CenterCrop(image_size),
+        ]
+
     return transforms.Compose(
         [
-            transforms.Resize((image_size, image_size)),
+            *image_ops,
             transforms.ToTensor(),
             transforms.Normalize(mean=list(IMAGENET_MEAN), std=list(IMAGENET_STD)),
         ]
@@ -184,7 +200,7 @@ class COCOCaptionDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         self.tokenizer = tokenizer or DistilBertTokenizer.from_pretrained(
             "distilbert-base-uncased"
         )
-        transform = _build_image_transform(image_size)
+        transform = _build_image_transform(image_size, split)
         self._coco = _load_coco_captions(
             self.coco_root, split, transform, download=download
         )

@@ -17,7 +17,7 @@ import math
 from typing import Dict, Tuple, Optional, Iterator, Any
 from pathlib import Path
 
-from .model import VL_JEPA, compute_jepa_loss
+from .model import VL_JEPA, compute_jepa_loss, make_multicrop_views
 
 
 def _amp_autocast(device: torch.device):
@@ -64,11 +64,19 @@ class VL_JEPA_Trainer:
         beta: float = 0.5,         # InfoNCE weight
         momentum_tau: float = 0.996,
         momentum_tau_end: float = 1.0,
+        use_multi_crop: bool = False,
+        global_crop_size: int = 224,
+        local_crop_size: int = 96,
+        eval_mask_seed: int = 17_029,
     ):
         self.model = model.to(device)
         self.device = device
         self.alpha = alpha
         self.beta = beta
+        self.use_multi_crop = use_multi_crop
+        self.global_crop_size = global_crop_size
+        self.local_crop_size = local_crop_size
+        self.eval_mask_seed = eval_mask_seed
 
         # Set momentum schedule
         self.model.momentum_tau = momentum_tau
@@ -119,6 +127,35 @@ class VL_JEPA_Trainer:
         self.running_loss = 0.0
         self.running_steps = 0
 
+    def _forward_model(
+        self,
+        images: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        *,
+        training: bool,
+        mask_seed: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if not self.use_multi_crop:
+            return self.model(
+                images, input_ids, attention_mask, mask_seed=mask_seed,
+            )
+
+        views = make_multicrop_views(
+            images,
+            global_size=self.global_crop_size,
+            local_size=self.local_crop_size,
+            training=training,
+        )
+        return self.model(
+            views['global'],
+            input_ids,
+            attention_mask,
+            context_images=views['local'],
+            target_images=views['global'],
+            mask_seed=mask_seed,
+        )
+
     @staticmethod
     def _cosine_schedule(start: float, end: float, steps: int) -> torch.Tensor:
         """Cosine schedule from start to end over `steps`."""
@@ -146,7 +183,7 @@ class VL_JEPA_Trainer:
         # Forward pass (with AMP)
         if self.scaler is not None:
             with _amp_autocast(self.device):
-                outputs = self.model(images, input_ids, attention_mask)
+                outputs = self._forward_model(images, input_ids, attention_mask, training=True)
                 loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
                 loss = loss_dict['total_loss']
 
@@ -162,7 +199,7 @@ class VL_JEPA_Trainer:
             self.scheduler.step()
             self._step += 1
         else:
-            outputs = self.model(images, input_ids, attention_mask)
+            outputs = self._forward_model(images, input_ids, attention_mask, training=True)
             loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
             loss = loss_dict['total_loss']
 
@@ -188,6 +225,7 @@ class VL_JEPA_Trainer:
             'total_loss': loss.item(),
             'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else (grad_norm or 0.0),
             'logit_scale': loss_dict.get('logit_scale', torch.tensor(0.0)).item(),
+            'nce_acc': loss_dict.get('nce_acc', torch.tensor(0.0)).item(),
             'momentum_tau': tau,
             'lr': self.optimizer.param_groups[0]['lr'],
         }
@@ -200,6 +238,7 @@ class VL_JEPA_Trainer:
         images: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        mask_seed: Optional[int] = None,
     ) -> Dict[str, float]:
         """Single evaluation step (no gradients, no EMA update)."""
         self.model.eval()
@@ -210,13 +249,16 @@ class VL_JEPA_Trainer:
             attention_mask = attention_mask.to(self.device)
 
         with _amp_autocast(self.device):
-            outputs = self.model(images, input_ids, attention_mask)
+            outputs = self._forward_model(
+                images, input_ids, attention_mask, training=False, mask_seed=mask_seed,
+            )
             loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
 
         return {
             'mse_loss': loss_dict['mse_loss'].item(),
             'nce_loss': loss_dict['nce_loss'].item(),
             'total_loss': loss_dict['total_loss'].item(),
+            'nce_acc': loss_dict.get('nce_acc', torch.tensor(0.0)).item(),
         }
 
     def train_epoch(
@@ -230,7 +272,7 @@ class VL_JEPA_Trainer:
         """Train for one epoch over the data loader."""
         self.model.train()
         epoch_start = time.time()
-        epoch_metrics = {'mse_loss': [], 'nce_loss': [], 'total_loss': []}
+        epoch_metrics = {'mse_loss': [], 'nce_loss': [], 'total_loss': [], 'nce_acc': []}
 
         for batch_idx, batch in enumerate(train_loader):
             if num_batches and batch_idx >= num_batches:
@@ -260,6 +302,7 @@ class VL_JEPA_Trainer:
             'avg_mse': sum(epoch_metrics['mse_loss']) / len(epoch_metrics['mse_loss']),
             'avg_nce': sum(epoch_metrics['nce_loss']) / len(epoch_metrics['nce_loss']),
             'avg_loss': sum(epoch_metrics['total_loss']) / len(epoch_metrics['total_loss']),
+            'avg_nce_acc': sum(epoch_metrics['nce_acc']) / len(epoch_metrics['nce_acc']),
             'elapsed': elapsed,
             'steps_per_sec': len(epoch_metrics['total_loss']) / elapsed if elapsed > 0 else 0,
         }
@@ -268,6 +311,7 @@ class VL_JEPA_Trainer:
             summary['val_loss'] = val_metrics['total_loss']
             summary['val_mse'] = val_metrics['mse_loss']
             summary['val_nce'] = val_metrics['nce_loss']
+            summary['val_nce_acc'] = val_metrics['nce_acc']
 
         return summary
 
@@ -275,7 +319,7 @@ class VL_JEPA_Trainer:
     def evaluate(self, val_loader: Iterator, num_batches: Optional[int] = None) -> Dict[str, float]:
         """Evaluate model on validation set."""
         self.model.eval()
-        metrics_sum = {'mse_loss': 0.0, 'nce_loss': 0.0, 'total_loss': 0.0}
+        metrics_sum = {'mse_loss': 0.0, 'nce_loss': 0.0, 'total_loss': 0.0, 'nce_acc': 0.0}
         count = 0
 
         for batch_idx, batch in enumerate(val_loader):
@@ -283,11 +327,18 @@ class VL_JEPA_Trainer:
                 break
 
             images, input_ids, attention_mask = _unpack_batch(batch)
-            metrics = self.eval_step(images, input_ids, attention_mask)
+            metrics = self.eval_step(
+                images,
+                input_ids,
+                attention_mask,
+                mask_seed=self.eval_mask_seed + batch_idx,
+            )
             for k in metrics_sum:
                 metrics_sum[k] += metrics[k]
             count += 1
 
+        if count == 0:
+            raise ValueError("Cannot evaluate an empty validation loader")
         return {k: v / count for k, v in metrics_sum.items()}
 
     def save_checkpoint(self, path: str, extra: Optional[Dict] = None):

@@ -48,3 +48,4 @@ logs/
 # OS
 .DS_Store
 .env
+experiments/exp_jepa_768d_15ep/

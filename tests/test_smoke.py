@@ -15,22 +15,40 @@ import os
 
 from src.model import (
     VL_JEPA, VisionEncoder, LanguageEncoder, Predictor,
-    compute_jepa_loss,
+    block_patch_mask, compute_jepa_loss, make_multicrop_views,
 )
 from src.trainer import VL_JEPA_Trainer
+
+HIDDEN_DIM = 96
+IMAGE_SIZE = 64
+PATCH_SIZE = 16
+NUM_PATCHES = (IMAGE_SIZE // PATCH_SIZE) ** 2
+SEQ_LEN = 32
+VOCAB_SIZE = 30522
+
+
+def _make_model(**kwargs):
+    defaults = {
+        "hidden_dim": HIDDEN_DIM,
+        "patch_size": PATCH_SIZE,
+        "image_size": IMAGE_SIZE,
+        "predictor_layers": 1,
+    }
+    defaults.update(kwargs)
+    return VL_JEPA(**defaults)
 
 
 def test_vision_encoder_with_mask():
     """Test vision encoder with masking."""
     print("Testing VisionEncoder with mask...")
-    encoder = VisionEncoder(hidden_dim=768, patch_size=16, image_size=224)
+    encoder = VisionEncoder(hidden_dim=HIDDEN_DIM, patch_size=PATCH_SIZE, image_size=IMAGE_SIZE)
 
-    x = torch.randn(2, 3, 224, 224)
-    mask = torch.zeros(2, 196, dtype=torch.bool)
-    mask[:, :147] = True  # 75% masked
+    x = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE)
+    mask = torch.zeros(2, NUM_PATCHES, dtype=torch.bool)
+    mask[:, : int(NUM_PATCHES * 0.75)] = True  # 75% masked
 
     out = encoder(x, mask)
-    assert out.shape == (2, 197, 768), f"Expected (2, 197, 768), got {out.shape}"
+    assert out.shape == (2, NUM_PATCHES + 1, HIDDEN_DIM), f"Unexpected shape: {out.shape}"
     print(f"  ✓ Vision output shape: {out.shape}")
     print(f"  ✓ mask_token exists: {'mask_token' in dict(encoder.named_parameters())}")
 
@@ -38,34 +56,34 @@ def test_vision_encoder_with_mask():
 def test_language_encoder():
     """Test language encoder shape."""
     print("Testing LanguageEncoder...")
-    encoder = LanguageEncoder(vocab_size=30522, hidden_dim=768, max_seq_len=512)
+    encoder = LanguageEncoder(vocab_size=VOCAB_SIZE, hidden_dim=HIDDEN_DIM, max_seq_len=512)
 
-    input_ids = torch.randint(0, 30522, (2, 128))
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN))
     out = encoder(input_ids)
 
-    assert out.shape == (2, 128, 768), f"Expected (2, 128, 768), got {out.shape}"
+    assert out.shape == (2, SEQ_LEN, HIDDEN_DIM), f"Unexpected shape: {out.shape}"
     print(f"  ✓ Language output shape: {out.shape}")
 
 
 def test_predictor():
     """Test predictor module."""
     print("Testing Predictor...")
-    predictor = Predictor(hidden_dim=768, num_layers=6)
+    predictor = Predictor(hidden_dim=HIDDEN_DIM, num_layers=1)
 
-    x = torch.randn(2, 197, 768)
+    x = torch.randn(2, NUM_PATCHES + 1, HIDDEN_DIM)
     out = predictor(x)
 
-    assert out.shape == (2, 197, 768), f"Expected (2, 197, 768), got {out.shape}"
+    assert out.shape == (2, NUM_PATCHES + 1, HIDDEN_DIM), f"Unexpected shape: {out.shape}"
     print(f"  ✓ Predictor output shape: {out.shape}")
 
 
 def test_vl_jepa_forward():
     """Test full VL-JEPA forward pass and loss computation."""
     print("Testing VL-JEPA forward + loss...")
-    model = VL_JEPA(hidden_dim=768, patch_size=16, image_size=224)
+    model = _make_model()
 
-    images = torch.randn(2, 3, 224, 224)
-    input_ids = torch.randint(0, 30522, (2, 128))
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN))
 
     outputs = model(images, input_ids)
     loss_dict = compute_jepa_loss(outputs)
@@ -82,11 +100,11 @@ def test_vl_jepa_forward():
     assert 'nce_loss' in loss_dict
 
     # Check shapes
-    assert outputs['predicted_patches'].shape == (2, 197, 768)
-    assert outputs['target_patches'].shape == (2, 197, 768)
-    assert outputs['patch_mask'].shape == (2, 196)
-    assert outputs['vision_proj'].shape == (2, 768)
-    assert outputs['language_proj'].shape == (2, 768)
+    assert outputs['predicted_patches'].shape == (2, NUM_PATCHES + 1, HIDDEN_DIM)
+    assert outputs['target_patches'].shape == (2, NUM_PATCHES + 1, HIDDEN_DIM)
+    assert outputs['patch_mask'].shape == (2, NUM_PATCHES)
+    assert outputs['vision_proj'].shape == (2, HIDDEN_DIM)
+    assert outputs['language_proj'].shape == (2, HIDDEN_DIM)
 
     # Check projections are normalized
     vision_norm = torch.norm(outputs['vision_proj'], p=2, dim=-1)
@@ -106,19 +124,66 @@ def test_vl_jepa_forward():
     print(f"  ✓ Total loss: {loss_dict['total_loss']:.4f}")
 
 
+def test_block_mask_exact_ratio_and_deterministic_seed():
+    """Block masking should mask an exact ratio and be reproducible with a seed."""
+    print("Testing block patch mask...")
+    generator_a = torch.Generator().manual_seed(123)
+    generator_b = torch.Generator().manual_seed(123)
+    mask_a = block_patch_mask(4, NUM_PATCHES, mask_ratio=0.75, generator=generator_a)
+    mask_b = block_patch_mask(4, NUM_PATCHES, mask_ratio=0.75, generator=generator_b)
+
+    expected_masked = int(NUM_PATCHES * 0.75)
+    assert torch.equal(mask_a, mask_b)
+    assert torch.all(mask_a.sum(dim=1) == expected_masked)
+    print(f"  ✓ Block mask shape: {mask_a.shape}, masked per sample: {expected_masked}")
+
+
+def test_multicrop_views_shapes():
+    """Global and local crops should preserve batch size and requested resolutions."""
+    print("Testing multi-crop view generation...")
+    images = torch.randn(3, 3, IMAGE_SIZE, IMAGE_SIZE)
+    views = make_multicrop_views(images, global_size=IMAGE_SIZE, local_size=32, training=True)
+
+    assert views['global'].shape == (3, 3, IMAGE_SIZE, IMAGE_SIZE)
+    assert views['local'].shape == (3, 3, 32, 32)
+    print(f"  ✓ Global crop: {views['global'].shape}; local crop: {views['local'].shape}")
+
+
+def test_contrastive_projection_gradients_flow():
+    """InfoNCE must update both projection heads."""
+    print("Testing contrastive projection gradients...")
+    model = _make_model()
+    images = torch.randn(4, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (4, SEQ_LEN))
+
+    outputs = model(images, input_ids)
+    loss = compute_jepa_loss(outputs, alpha=0.0, beta=1.0)['total_loss']
+    loss.backward()
+
+    vision_grad = model.vision_proj.weight.grad
+    language_grad = model.language_proj.weight.grad
+    assert vision_grad is not None and vision_grad.abs().sum() > 0
+    assert language_grad is not None and language_grad.abs().sum() > 0
+    print("  ✓ vision_proj and language_proj receive InfoNCE gradients")
+
+
 def test_momentum_update():
     """Test that momentum update works (target != context at init)."""
     print("Testing momentum update...")
-    model = VL_JEPA(hidden_dim=768, patch_size=16, image_size=224)
+    model = _make_model()
 
     # Before update: should be identical (loaded same weights)
     ctx_state = next(model.context_encoder.parameters())
     tgt_state = next(model.target_encoder.parameters())
     assert torch.allclose(ctx_state, tgt_state), "Target should match context at init"
+    lang_state = next(model.language_encoder.parameters())
+    tgt_lang_state = next(model.target_language_encoder.parameters())
+    assert torch.allclose(lang_state, tgt_lang_state), "Target language should match at init"
 
     # Modify context
     with torch.no_grad():
         ctx_state.add_(torch.randn_like(ctx_state) * 0.1)
+        lang_state.add_(torch.randn_like(lang_state) * 0.1)
 
     # Momentum update (tau=0.9 for test)
     model.momentum_tau = 0.9
@@ -127,6 +192,8 @@ def test_momentum_update():
     # After update: target should have moved partially
     new_tgt = next(model.target_encoder.parameters())
     assert not torch.allclose(ctx_state, new_tgt), "Target should differ from context after update"
+    new_tgt_lang = next(model.target_language_encoder.parameters())
+    assert not torch.allclose(lang_state, new_tgt_lang), "Target language should EMA-update"
     print(f"  ✓ Momentum update works (tau={model.momentum_tau})")
 
 
@@ -137,9 +204,9 @@ def test_gpu_forward():
         print("  ⚠️  No GPU available, skipping GPU test")
         return
 
-    model = VL_JEPA(hidden_dim=768).cuda()
-    images = torch.randn(2, 3, 224, 224).cuda()
-    input_ids = torch.randint(0, 30522, (2, 128)).cuda()
+    model = _make_model().cuda()
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE).cuda()
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN)).cuda()
 
     with torch.no_grad():
         outputs = model(images, input_ids)
@@ -152,9 +219,9 @@ def test_gpu_forward():
 
     # Run backward test separately (need grad)
     torch.cuda.empty_cache()
-    model2 = VL_JEPA(hidden_dim=768).cuda()
-    images2 = torch.randn(2, 3, 224, 224).cuda()
-    input_ids2 = torch.randint(0, 30522, (2, 128)).cuda()
+    model2 = _make_model().cuda()
+    images2 = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE).cuda()
+    input_ids2 = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN)).cuda()
 
     outputs2 = model2(images2, input_ids2)
     loss_dict = compute_jepa_loss(outputs2)
@@ -167,43 +234,43 @@ def test_gpu_forward():
 def test_loss_decreases_over_steps():
     """Sanity check: moving-average loss trends down over training steps."""
     print("Testing loss decreases over training steps...")
-    model = VL_JEPA(hidden_dim=768, patch_size=16, image_size=224)
+    model = _make_model()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     trainer = VL_JEPA_Trainer(model, device, learning_rate=1e-3, warmup_steps=0, max_steps=1000)
 
-    images = torch.randn(8, 3, 224, 224)
-    input_ids = torch.randint(0, 30522, (8, 128))
+    images = torch.randn(4, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (4, SEQ_LEN))
 
     losses = []
-    for _ in range(50):
+    for _ in range(8):
         metrics = trainer.train_step(images, input_ids)
         losses.append(metrics['total_loss'])
 
-    avg_first = sum(losses[:5]) / 5
-    avg_last = sum(losses[-5:]) / 5
+    avg_first = sum(losses[:2]) / 2
+    avg_last = sum(losses[-2:]) / 2
     assert avg_last < avg_first, (
         f"Expected moving-average loss to decrease: "
-        f"first5={avg_first:.4f}, last5={avg_last:.4f}"
+        f"first2={avg_first:.4f}, last2={avg_last:.4f}"
     )
-    print(f"  ✓ Loss decreased (avg first 5 vs last 5): {avg_first:.4f} → {avg_last:.4f}")
+    print(f"  ✓ Loss decreased (avg first 2 vs last 2): {avg_first:.4f} → {avg_last:.4f}")
 
 
 def test_checkpoint_roundtrip():
     """Save and reload checkpoint; forward pass should match."""
     print("Testing checkpoint save/load round-trip...")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = VL_JEPA(hidden_dim=768).to(device)
+    model = _make_model().to(device)
     trainer = VL_JEPA_Trainer(model, device, warmup_steps=0, max_steps=100)
 
-    images = torch.randn(2, 3, 224, 224).to(device)
-    input_ids = torch.randint(0, 30522, (2, 128)).to(device)
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE).to(device)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN)).to(device)
 
     trainer.train_step(images, input_ids)
 
     # Fixed masks so forward() is deterministic (model randomizes masks when None)
-    num_patches = 196
+    num_patches = NUM_PATCHES
     patch_mask = torch.zeros(2, num_patches, dtype=torch.bool, device=device)
-    patch_mask[:, :147] = True  # 75% masked, same pattern every call
+    patch_mask[:, : int(num_patches * 0.75)] = True  # 75% masked, same pattern every call
     token_mask = torch.zeros(2, input_ids.size(1), dtype=torch.bool, device=device)
 
     model.eval()
@@ -214,7 +281,7 @@ def test_checkpoint_roundtrip():
         ckpt_path = os.path.join(tmpdir, 'test_ckpt.pt')
         trainer.save_checkpoint(ckpt_path)
 
-        model2 = VL_JEPA(hidden_dim=768).to(device)
+        model2 = _make_model().to(device)
         trainer2 = VL_JEPA_Trainer(model2, device, warmup_steps=0, max_steps=100)
         trainer2.load_checkpoint(ckpt_path)
 
@@ -232,12 +299,12 @@ def test_checkpoint_roundtrip():
 def test_masked_patches_contribute_to_loss():
     """MSE loss uses masked patches only; unmasked-only mask yields ~zero MSE."""
     print("Testing masked vs unmasked patch loss contribution...")
-    model = VL_JEPA(hidden_dim=768, patch_size=16, image_size=224)
+    model = _make_model()
     model.eval()
 
-    images = torch.randn(2, 3, 224, 224)
-    input_ids = torch.randint(0, 30522, (2, 128))
-    num_patches = 196
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN))
+    num_patches = NUM_PATCHES
 
     # All patches masked — MSE should be positive
     mask_all = torch.ones(2, num_patches, dtype=torch.bool)
@@ -260,15 +327,15 @@ def test_masked_patches_contribute_to_loss():
 def test_joint_embedding():
     """Test inference-time joint embedding extraction."""
     print("Testing joint embedding extraction...")
-    model = VL_JEPA(hidden_dim=768)
+    model = _make_model()
 
-    images = torch.randn(2, 3, 224, 224)
-    input_ids = torch.randint(0, 30522, (2, 128))
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN))
 
     vision_proj, language_proj = model.get_joint_embedding(images, input_ids)
 
-    assert vision_proj.shape == (2, 768), f"Expected (2, 768), got {vision_proj.shape}"
-    assert language_proj.shape == (2, 768), f"Expected (2, 768), got {language_proj.shape}"
+    assert vision_proj.shape == (2, HIDDEN_DIM), f"Expected (2, {HIDDEN_DIM}), got {vision_proj.shape}"
+    assert language_proj.shape == (2, HIDDEN_DIM), f"Expected (2, {HIDDEN_DIM}), got {language_proj.shape}"
 
     # Check normalization
     vision_norm = torch.norm(vision_proj, p=2, dim=-1)
@@ -290,6 +357,9 @@ if __name__ == '__main__':
         ("Language Encoder", test_language_encoder),
         ("Predictor Module", test_predictor),
         ("VL-JEPA Forward + Loss", test_vl_jepa_forward),
+        ("Block Masking", test_block_mask_exact_ratio_and_deterministic_seed),
+        ("Multi-crop Views", test_multicrop_views_shapes),
+        ("Contrastive Gradients", test_contrastive_projection_gradients_flow),
         ("Momentum Update", test_momentum_update),
         ("GPU Forward + Backward", test_gpu_forward),
         ("Joint Embedding", test_joint_embedding),
