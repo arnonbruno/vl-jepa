@@ -582,9 +582,11 @@ class VL_JEPA(nn.Module):
                 self.target_language_proj(target_language_emb[:, 0, :]), p=2, dim=-1,
             )
 
-        # I-JEPA predicts the EMA target encoder representation directly.
-        predicted_patches = predicted
-        target_patches = target_emb.detach()
+        # Predictor output mapped to target space via learned prediction head.
+        # Both sides go through vision_pred_head so MSE is in the same space.
+        # Target side is detached (stop-gradient).
+        predicted_patches = self.vision_pred_head(predicted)
+        target_patches = self.vision_pred_head(target_emb).detach()
 
         return {
             'predicted_patches': predicted_patches,   # (B, N+1, D)
