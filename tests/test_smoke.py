@@ -17,7 +17,12 @@ from src.model import (
     VL_JEPA, VisionEncoder, LanguageEncoder, Predictor,
     LOGIT_SCALE_MAX, block_patch_mask, compute_jepa_loss, make_multicrop_views,
 )
-from src.trainer import VL_JEPA_Trainer
+from src.trainer import (
+    VL_JEPA_Trainer,
+    _GRAD_SCALER_GROWTH_INTERVAL,
+    _MAX_GRAD_SCALER_SCALE,
+    _make_grad_scaler,
+)
 
 HIDDEN_DIM = 96
 IMAGE_SIZE = 64
@@ -408,6 +413,60 @@ def test_masked_patches_contribute_to_loss():
     print(f"  ✓ MSE (none masked): {loss_unmasked:.6f}")
 
 
+def test_momentum_schedule_capped():
+    """EMA τ schedule should not stretch across the full LR max_steps horizon."""
+    print("Testing capped momentum schedule...")
+    model = _make_model()
+    device = torch.device('cpu')
+    trainer = VL_JEPA_Trainer(
+        model, device, warmup_steps=0, max_steps=100_000, momentum_schedule_steps=500,
+    )
+    assert len(trainer._momentum_schedule) == 500
+    assert abs(trainer._momentum_schedule[0].item() - 0.996) < 1e-6
+    assert abs(trainer._momentum_schedule[-1].item() - 1.0) < 1e-6
+    print(f"  ✓ Momentum schedule length: {len(trainer._momentum_schedule)}")
+
+
+def test_trainer_skips_non_finite_batch():
+    """Non-finite loss batches are skipped without corrupting weights."""
+    print("Testing non-finite batch skip...")
+    model = _make_model()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trainer = VL_JEPA_Trainer(model, device, warmup_steps=0, max_steps=100)
+
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE, device=device)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN), device=device)
+
+    before = next(model.context_encoder.parameters()).detach().clone()
+    with torch.no_grad():
+        model.vision_pred_head.weight.fill_(float('nan'))
+
+    metrics = trainer.train_step(images, input_ids)
+    after = next(model.context_encoder.parameters()).detach()
+
+    assert metrics.get('skipped') is True
+    assert torch.equal(before.to(device), after)
+    print("  ✓ Non-finite batch skipped; context encoder weights unchanged")
+
+
+def test_grad_scaler_growth_interval_capped():
+    """GradScaler uses a huge growth interval and hard scale cap for stability."""
+    print("Testing GradScaler stability settings...")
+    if not torch.cuda.is_available():
+        print("  ⚠️  No GPU available, skipping GradScaler test")
+        return
+
+    scaler = _make_grad_scaler(torch.device('cuda'))
+    assert scaler._init_scale == 1024.0
+    assert scaler._growth_interval >= 2**30
+    assert _GRAD_SCALER_GROWTH_INTERVAL >= 2**30
+    assert _MAX_GRAD_SCALER_SCALE == 8192.0
+    print(
+        f"  ✓ GradScaler init_scale={scaler._init_scale}, "
+        f"growth_interval={scaler._growth_interval}"
+    )
+
+
 def test_joint_embedding():
     """Test inference-time joint embedding extraction."""
     print("Testing joint embedding extraction...")
@@ -450,6 +509,9 @@ if __name__ == '__main__':
         ("Padded Small Crop", test_padded_small_crop_forward_is_finite),
         ("Contrastive Gradients", test_contrastive_projection_gradients_flow),
         ("Momentum Update", test_momentum_update),
+        ("Capped Momentum Schedule", test_momentum_schedule_capped),
+        ("Non-finite Batch Skip", test_trainer_skips_non_finite_batch),
+        ("GradScaler Stability", test_grad_scaler_growth_interval_capped),
         ("GPU Forward + Backward", test_gpu_forward),
         ("Joint Embedding", test_joint_embedding),
         ("Loss Decreases", test_loss_decreases_over_steps),

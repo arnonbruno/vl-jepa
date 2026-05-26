@@ -536,7 +536,9 @@ class VL_JEPA(nn.Module):
         )
         for student, teacher in pairs:
             for student_p, teacher_p in zip(student.parameters(), teacher.parameters()):
-                teacher_p.data.mul_(tau).add_(student_p.data, alpha=1 - tau)
+                teacher_p.copy_(
+                    tau * teacher_p.detach() + (1 - tau) * student_p.detach(),
+                )
 
     def forward(
         self,
@@ -687,8 +689,9 @@ def compute_jepa_loss(
 
     # ---- MSE on masked patches (skip [CLS] at index 0) ----
     # predicted[:, 1:] and target[:, 1:] -> (B, N, D)
-    pred_patches = predicted[:, 1:, :]
-    tgt_patches = target[:, 1:, :]
+    # FP32 MSE avoids AMP overflow when predictor/teacher magnitudes grow.
+    pred_patches = predicted[:, 1:, :].float()
+    tgt_patches = target[:, 1:, :].float()
 
     mse_all = F.mse_loss(pred_patches, tgt_patches, reduction='none')  # (B, N, D)
     mse_all = mse_all.mean(dim=-1)  # (B, N) — average over feature dim

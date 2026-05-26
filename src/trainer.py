@@ -25,6 +25,12 @@ from .model import (
     make_multicrop_views,
 )
 
+# Prevent GradScaler from growing init_scale=1024 into ~500K+ over long runs,
+# which can overflow FP16 backward passes on consumer GPUs.
+# PyTorch requires growth_factor > 1; a huge interval effectively freezes growth.
+_GRAD_SCALER_GROWTH_INTERVAL = 2**31 - 1
+_MAX_GRAD_SCALER_SCALE = 8192.0
+
 
 def _amp_autocast(device: torch.device):
     """AMP autocast with fallback for PyTorch < 2.4."""
@@ -36,12 +42,28 @@ def _amp_autocast(device: torch.device):
 
 
 def _make_grad_scaler(device: torch.device):
-    """GradScaler with fallback for PyTorch < 2.4."""
+    """GradScaler with growth interval capped so scale stays near init_scale."""
     if device.type != 'cuda':
         return None
+    kwargs = dict(
+        init_scale=1024.0,
+        backoff_factor=0.5,
+        growth_interval=_GRAD_SCALER_GROWTH_INTERVAL,
+    )
     if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
-        return torch.amp.GradScaler('cuda', init_scale=1024.0, growth_interval=2000)
-    return torch.cuda.amp.GradScaler(init_scale=1024.0, growth_interval=2000)
+        return torch.amp.GradScaler('cuda', **kwargs)
+    return torch.cuda.amp.GradScaler(**kwargs)
+
+
+def _clamp_grad_scaler_scale(scaler) -> None:
+    """Hard cap AMP scale after update (belt-and-suspenders vs runaway growth)."""
+    if scaler is None:
+        return
+    scale = scaler.get_scale()
+    if scale <= _MAX_GRAD_SCALER_SCALE:
+        return
+    device = scaler._scale.device if hasattr(scaler, '_scale') else 'cuda'
+    scaler._scale.copy_(torch.tensor(_MAX_GRAD_SCALER_SCALE, device=device))
 
 
 def _unpack_batch(batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -66,10 +88,11 @@ class VL_JEPA_Trainer:
         weight_decay: float = 0.05,
         warmup_steps: int = 1000,
         max_steps: int = 100_000,
-        alpha: float = 1.0,        # MSE weight
+        alpha: float = 0.5,        # MSE weight
         beta: float = 0.5,         # InfoNCE weight
         momentum_tau: float = 0.996,
         momentum_tau_end: float = 1.0,
+        momentum_schedule_steps: int = 15_000,
         use_multi_crop: bool = False,
         global_crop_size: int = 224,
         local_crop_size: int = 96,
@@ -84,10 +107,14 @@ class VL_JEPA_Trainer:
         self.local_crop_size = local_crop_size
         self.eval_mask_seed = eval_mask_seed
 
-        # Set momentum schedule
+        # EMA cosine schedule capped so tau reaches 1.0 in early training (~epoch 4),
+        # not stretched across the full LR cosine horizon (100K+ steps).
         self.model.momentum_tau = momentum_tau
         self.momentum_tau_end = momentum_tau_end
-        self._momentum_schedule = self._cosine_schedule(momentum_tau, momentum_tau_end, max_steps)
+        schedule_steps = max(1, min(max_steps, momentum_schedule_steps))
+        self._momentum_schedule = self._cosine_schedule(
+            momentum_tau, momentum_tau_end, schedule_steps,
+        )
 
         # Optimizer with parameter groups (different LR for predictor)
         # Following I-JEPA: predictor gets 20x higher learning rate
@@ -120,6 +147,7 @@ class VL_JEPA_Trainer:
         self.warmup_steps = warmup_steps
         self.max_steps = max_steps
         self._step = 0
+        self._skipped_batches = 0
 
         def lr_lambda(current_step):
             if current_step < warmup_steps:
@@ -139,15 +167,37 @@ class VL_JEPA_Trainer:
         self.model.logit_scale.clamp_(LOGIT_SCALE_MIN, LOGIT_SCALE_MAX)
 
     @staticmethod
-    def _assert_finite_loss(loss: torch.Tensor, loss_dict: Dict[str, torch.Tensor]) -> None:
-        if torch.isfinite(loss):
-            return
-        parts = []
+    def _loss_is_finite(loss: torch.Tensor, loss_dict: Dict[str, torch.Tensor]) -> bool:
+        if not torch.isfinite(loss):
+            return False
         for key in ('mse_loss', 'nce_loss', 'total_loss'):
             value = loss_dict.get(key)
-            if isinstance(value, torch.Tensor):
-                parts.append(f"{key}={value.detach().float().item()}")
-        raise FloatingPointError(f"Non-finite JEPA loss detected ({', '.join(parts)})")
+            if isinstance(value, torch.Tensor) and not torch.isfinite(value):
+                return False
+        return True
+
+    def _skipped_metrics(self, reason: str = 'non_finite') -> Dict[str, float]:
+        """Metrics for batches skipped due to NaN/Inf loss or gradients."""
+        self._skipped_batches += 1
+        tau = self._current_momentum_tau()
+        return {
+            'mse_loss': float('nan'),
+            'nce_loss': float('nan'),
+            'total_loss': float('nan'),
+            'grad_norm': 0.0,
+            'logit_scale': 0.0,
+            'nce_acc': 0.0,
+            'momentum_tau': tau,
+            'lr': self.optimizer.param_groups[0]['lr'],
+            'skipped': True,
+            'skip_reason': reason,
+        }
+
+    def _current_momentum_tau(self) -> float:
+        idx = self._step - 1
+        if 0 <= idx < len(self._momentum_schedule):
+            return self._momentum_schedule[idx].item()
+        return self.momentum_tau_end
 
     def _forward_model(
         self,
@@ -188,6 +238,49 @@ class VL_JEPA_Trainer:
         """Sync batch norm if using DataParallel (no-op for now)."""
         pass
 
+    def _backward_and_step(self, loss: torch.Tensor) -> Tuple[bool, float]:
+        """Backward, clip, and optimizer step. Returns (success, grad_norm)."""
+        self.optimizer.zero_grad(set_to_none=True)
+
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), 3.0, error_if_nonfinite=False,
+            )
+            grad_norm_val = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+            if not math.isfinite(grad_norm_val):
+                self.optimizer.zero_grad(set_to_none=True)
+                self.scaler.update()
+                _clamp_grad_scaler_scale(self.scaler)
+                return False, grad_norm_val
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            _clamp_grad_scaler_scale(self.scaler)
+            self.optimizer._opt_called = True
+        else:
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), 3.0, error_if_nonfinite=False,
+            )
+            grad_norm_val = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+            if not math.isfinite(grad_norm_val):
+                self.optimizer.zero_grad(set_to_none=True)
+                return False, grad_norm_val
+
+            self.optimizer.step()
+
+        self._clamp_stability_params()
+        self.scheduler.step()
+        self._step += 1
+
+        tau = self._current_momentum_tau()
+        self.model.momentum_tau = tau
+        self.model.momentum_update()
+
+        return True, grad_norm_val
+
     def train_step(
         self,
         images: torch.Tensor,
@@ -202,50 +295,18 @@ class VL_JEPA_Trainer:
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
 
-        # Forward pass (with AMP)
-        if self.scaler is not None:
-            with _amp_autocast(self.device):
-                outputs = self._forward_model(images, input_ids, attention_mask, training=True)
-                loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
-                loss = loss_dict['total_loss']
-                self._assert_finite_loss(loss, loss_dict)
-
-            # Backward with AMP
-            self.optimizer.zero_grad(set_to_none=True)
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), 3.0, error_if_nonfinite=True,
-            )
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self._clamp_stability_params()
-            # GradScaler does not set _opt_called on LambdaLR-wrapped optimizers
-            self.optimizer._opt_called = True
-            self.scheduler.step()
-            self._step += 1
-        else:
+        with _amp_autocast(self.device):
             outputs = self._forward_model(images, input_ids, attention_mask, training=True)
             loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
             loss = loss_dict['total_loss']
-            self._assert_finite_loss(loss, loss_dict)
 
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), 3.0, error_if_nonfinite=True,
-            )
-            self.optimizer.step()
-            self._clamp_stability_params()
-            self.scheduler.step()
-            self._step += 1
+        if not self._loss_is_finite(loss, loss_dict):
+            return self._skipped_metrics('non_finite_loss')
 
-        # Momentum update (EMA)
-        tau = self._momentum_schedule[self._step - 1].item() if (self._step - 1) < len(self._momentum_schedule) else self.momentum_tau_end
-        self.model.momentum_tau = tau
-        self.model.momentum_update()
+        ok, grad_norm = self._backward_and_step(loss)
+        if not ok:
+            return self._skipped_metrics('non_finite_grad')
 
-        # Running average
         self.running_loss += loss.item()
         self.running_steps += 1
 
@@ -253,11 +314,12 @@ class VL_JEPA_Trainer:
             'mse_loss': loss_dict['mse_loss'].item(),
             'nce_loss': loss_dict['nce_loss'].item(),
             'total_loss': loss.item(),
-            'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else (grad_norm or 0.0),
+            'grad_norm': grad_norm,
             'logit_scale': loss_dict.get('logit_scale', torch.tensor(0.0)).item(),
             'nce_acc': loss_dict.get('nce_acc', torch.tensor(0.0)).item(),
-            'momentum_tau': tau,
+            'momentum_tau': self.model.momentum_tau,
             'lr': self.optimizer.param_groups[0]['lr'],
+            'skipped': False,
         }
 
         return metrics
@@ -283,13 +345,21 @@ class VL_JEPA_Trainer:
                 images, input_ids, attention_mask, training=False, mask_seed=mask_seed,
             )
             loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
-            self._assert_finite_loss(loss_dict['total_loss'], loss_dict)
+            if not self._loss_is_finite(loss_dict['total_loss'], loss_dict):
+                return {
+                    'mse_loss': float('nan'),
+                    'nce_loss': float('nan'),
+                    'total_loss': float('nan'),
+                    'nce_acc': 0.0,
+                    'skipped': True,
+                }
 
         return {
             'mse_loss': loss_dict['mse_loss'].item(),
             'nce_loss': loss_dict['nce_loss'].item(),
             'total_loss': loss_dict['total_loss'].item(),
             'nce_acc': loss_dict.get('nce_acc', torch.tensor(0.0)).item(),
+            'skipped': False,
         }
 
     def train_epoch(
@@ -304,6 +374,7 @@ class VL_JEPA_Trainer:
         self.model.train()
         epoch_start = time.time()
         epoch_metrics = {'mse_loss': [], 'nce_loss': [], 'total_loss': [], 'nce_acc': []}
+        skipped = 0
 
         for batch_idx, batch in enumerate(train_loader):
             if num_batches and batch_idx >= num_batches:
@@ -312,11 +383,17 @@ class VL_JEPA_Trainer:
             images, input_ids, attention_mask = _unpack_batch(batch)
             metrics = self.train_step(images, input_ids, attention_mask)
 
+            if metrics.get('skipped'):
+                skipped += 1
+                continue
+
             for key in epoch_metrics:
                 epoch_metrics[key].append(metrics[key])
 
-            if (batch_idx + 1) % log_interval == 0:
-                avg_loss = sum(epoch_metrics['total_loss'][-log_interval:]) / log_interval
+            if (batch_idx + 1) % log_interval == 0 and epoch_metrics['total_loss']:
+                avg_loss = sum(epoch_metrics['total_loss'][-log_interval:]) / min(
+                    log_interval, len(epoch_metrics['total_loss']),
+                )
                 print(f"  Batch {batch_idx+1:4d} | Loss: {avg_loss:.4f} | "
                       f"MSE: {metrics['mse_loss']:.4f} | NCE: {metrics['nce_loss']:.4f} | "
                       f"GN: {metrics['grad_norm']:.2f} | LR: {metrics['lr']:.2e}")
@@ -327,15 +404,17 @@ class VL_JEPA_Trainer:
             val_metrics = self.evaluate(val_loader)
 
         elapsed = time.time() - epoch_start
+        n = len(epoch_metrics['total_loss'])
 
         summary = {
             'epoch': epoch,
-            'avg_mse': sum(epoch_metrics['mse_loss']) / len(epoch_metrics['mse_loss']),
-            'avg_nce': sum(epoch_metrics['nce_loss']) / len(epoch_metrics['nce_loss']),
-            'avg_loss': sum(epoch_metrics['total_loss']) / len(epoch_metrics['total_loss']),
-            'avg_nce_acc': sum(epoch_metrics['nce_acc']) / len(epoch_metrics['nce_acc']),
+            'avg_mse': sum(epoch_metrics['mse_loss']) / n if n else float('nan'),
+            'avg_nce': sum(epoch_metrics['nce_loss']) / n if n else float('nan'),
+            'avg_loss': sum(epoch_metrics['total_loss']) / n if n else float('nan'),
+            'avg_nce_acc': sum(epoch_metrics['nce_acc']) / n if n else 0.0,
             'elapsed': elapsed,
-            'steps_per_sec': len(epoch_metrics['total_loss']) / elapsed if elapsed > 0 else 0,
+            'steps_per_sec': n / elapsed if elapsed > 0 else 0,
+            'skipped_batches': skipped,
         }
 
         if val_metrics:
@@ -364,6 +443,8 @@ class VL_JEPA_Trainer:
                 attention_mask,
                 mask_seed=self.eval_mask_seed + batch_idx,
             )
+            if metrics.get('skipped'):
+                continue
             for k in metrics_sum:
                 metrics_sum[k] += metrics[k]
             count += 1
@@ -382,6 +463,7 @@ class VL_JEPA_Trainer:
             'step': self._step,
             'running_loss': self.running_loss,
             'running_steps': self.running_steps,
+            'skipped_batches': self._skipped_batches,
         }
         if extra:
             state.update(extra)
@@ -415,3 +497,4 @@ class VL_JEPA_Trainer:
             self._step = checkpoint.get('step', 0)
             self.running_loss = checkpoint.get('running_loss', 0.0)
             self.running_steps = checkpoint.get('running_steps', 0)
+            self._skipped_batches = checkpoint.get('skipped_batches', 0)

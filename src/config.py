@@ -70,6 +70,8 @@ def overrides_from_cli(**kwargs: Any) -> Dict[str, Any]:
         "text_mask_ratio": (model, "text_mask_ratio"),
         "predictor_layers": (model, "predictor_layers"),
         "momentum_tau": (model, "momentum_tau"),
+        "momentum_tau_end": (training, "momentum_tau_end"),
+        "momentum_schedule_steps": (training, "momentum_schedule_steps"),
         "epochs": (training, "epochs"),
         "batch_size": (training, "batch_size"),
         "learning_rate": (training, "learning_rate"),

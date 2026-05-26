@@ -12,16 +12,18 @@ model:
 training:
   epochs: 15
   batch_size: 32
-  learning_rate: 1.5e-4
+  learning_rate: 1.0e-4
   weight_decay: 0.05
   warmup_steps: 2000
   max_steps: null  # auto: epochs * (samples // batch_size)
+  momentum_tau_end: 1.0
+  momentum_schedule_steps: 15000  # EMA τ cosine horizon (capped vs full max_steps)
   use_multi_crop: true
   global_crop_size: 224
   local_crop_size: 96
 
 loss:
-  alpha: 1.0
+  alpha: 0.5   # MSE weight (reduced vs NCE to stabilize predictor path)
   beta: 1.0
 
 data:
