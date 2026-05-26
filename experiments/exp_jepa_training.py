@@ -181,6 +181,17 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
         action='store_true',
         help='Start training from scratch; never load checkpoints from the experiment dir',
     )
+    parser.add_argument(
+        '--nan-diagnostics-dir',
+        type=str,
+        default=None,
+        help='Directory to save JSON/tensor dumps when NaN/Inf is detected (default: off)',
+    )
+    parser.add_argument(
+        '--no-finite-checks',
+        action='store_true',
+        help='Disable pre/post forward finite checks (loss-only skip remains)',
+    )
     return parser
 
 
@@ -291,6 +302,18 @@ def main() -> None:
           f"{val_batches} batches (shuffle=False)")
     print(f"  Max steps: {max_steps}")
 
+    output_dir = Path(out_cfg["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    exp_name = f"exp_jepa_{model_cfg['hidden_dim']}d_{train_cfg['epochs']}ep"
+    exp_dir = output_dir / exp_name
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    nan_diag_dir = (
+        Path(args.nan_diagnostics_dir).expanduser()
+        if args.nan_diagnostics_dir
+        else None
+    )
+
     trainer = VL_JEPA_Trainer(
         model=model,
         device=device,
@@ -303,13 +326,9 @@ def main() -> None:
         use_multi_crop=train_cfg.get("use_multi_crop", False),
         global_crop_size=train_cfg.get("global_crop_size", model_cfg["image_size"]),
         local_crop_size=train_cfg.get("local_crop_size", 96),
+        check_finite=not args.no_finite_checks,
+        nan_diagnostics_dir=str(nan_diag_dir) if nan_diag_dir else None,
     )
-
-    output_dir = Path(out_cfg["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
-    exp_name = f"exp_jepa_{model_cfg['hidden_dim']}d_{train_cfg['epochs']}ep"
-    exp_dir = output_dir / exp_name
-    exp_dir.mkdir(parents=True, exist_ok=True)
 
     resume_meta: Optional[Dict[str, Any]] = None
     start_epoch = 0
@@ -344,6 +363,9 @@ def main() -> None:
     else:
         print(f"\n  --fresh: starting from scratch (ignoring any checkpoints in {exp_dir})")
 
+    if nan_diag_dir is not None:
+        print(f"  NaN diagnostics: {nan_diag_dir}")
+
     writer = None
     if args.tensorboard and _HAS_TENSORBOARD:
         tb_dir = Path(args.tensorboard_dir) if args.tensorboard_dir else exp_dir / 'tensorboard'
@@ -376,6 +398,7 @@ def main() -> None:
             epoch_metrics: Dict[str, list[float]] = {
                 'mse_loss': [], 'nce_loss': [], 'total_loss': [], 'nce_acc': [],
             }
+            epoch_skipped = 0
 
             for batch_idx, batch in enumerate(train_loader):
                 images, input_ids, attention_mask = batch
@@ -391,8 +414,30 @@ def main() -> None:
                         print(f"\n  ⚠️  TensorBoard graph trace skipped: {graph_err}")
                         graph_logged = True
 
-                metrics = trainer.train_step(images, input_ids, attention_mask)
+                metrics = trainer.train_step(
+                    images, input_ids, attention_mask,
+                    batch_index=batch_idx,
+                    epoch=epoch + 1,
+                )
                 last_train_metrics = metrics
+
+                if metrics.get('skipped'):
+                    epoch_skipped += 1
+                    if metrics.get('weights_corrupted'):
+                        print(
+                            f"\n  ❌ Non-finite weights detected at E{epoch+1} "
+                            f"B{batch_idx+1} ({metrics.get('skip_reason', 'unknown')}). "
+                            f"Diagnostics: {nan_diag_dir or 'disabled (--nan-diagnostics-dir)'}. "
+                            "Resume from last good checkpoint or restart with --fresh."
+                        )
+                    if (batch_idx + 1) % out_cfg["log_interval"] == 0:
+                        print(
+                            f"  E{epoch+1:2d} B{batch_idx+1:5d}/{train_batches} | "
+                            f"SKIPPED ({metrics.get('skip_reason', 'non_finite')}) | "
+                            f"skipped={epoch_skipped}",
+                            end='\r',
+                        )
+                    continue
 
                 for key in epoch_metrics:
                     epoch_metrics[key].append(metrics[key])
@@ -408,10 +453,21 @@ def main() -> None:
                           f"NCE@1: {metrics['nce_acc']:.2%} | GN: {gn:.2f} | LR: {lr:.2e}",
                           end='\r')
 
-            avg_mse = sum(epoch_metrics['mse_loss']) / len(epoch_metrics['mse_loss'])
-            avg_nce = sum(epoch_metrics['nce_loss']) / len(epoch_metrics['nce_loss'])
-            avg_loss = sum(epoch_metrics['total_loss']) / len(epoch_metrics['total_loss'])
-            avg_nce_acc = sum(epoch_metrics['nce_acc']) / len(epoch_metrics['nce_acc'])
+            n_train = len(epoch_metrics['total_loss'])
+            if n_train == 0:
+                print(
+                    f"\n  ❌ Epoch {epoch+1}: all {epoch_skipped} batches skipped "
+                    "(model weights or inputs non-finite)."
+                )
+                avg_mse = float('nan')
+                avg_nce = float('nan')
+                avg_loss = float('nan')
+                avg_nce_acc = 0.0
+            else:
+                avg_mse = sum(epoch_metrics['mse_loss']) / n_train
+                avg_nce = sum(epoch_metrics['nce_loss']) / n_train
+                avg_loss = sum(epoch_metrics['total_loss']) / n_train
+                avg_nce_acc = sum(epoch_metrics['nce_acc']) / n_train
             epoch_time = time.time() - epoch_start
 
             val_metrics = trainer.evaluate(val_loader)
@@ -430,7 +486,8 @@ def main() -> None:
                   f"Val: {val_loss:.4f} (MSE: {val_mse:.4f}, NCE: {val_nce:.4f}, "
                   f"NCE@1: {val_nce_acc:.2%}) | "
                   f"{epoch_time:.1f}s | GPU: {gpu_mem:.2f}GB | "
-                  f"τ: {trainer.model.momentum_tau:.3f}")
+                  f"τ: {trainer.model.momentum_tau:.3f} | "
+                  f"skipped: {epoch_skipped}")
 
             epoch_record = {
                 'epoch': epoch + 1,
@@ -444,6 +501,7 @@ def main() -> None:
                 'val_loss': val_loss,
                 'time': epoch_time,
                 'gpu_mem_gb': gpu_mem,
+                'skipped_batches': epoch_skipped,
             }
             all_metrics.append(epoch_record)
 

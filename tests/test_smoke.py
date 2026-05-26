@@ -25,6 +25,7 @@ from src.trainer import (
     _GRAD_SCALER_GROWTH_INTERVAL,
     _MAX_GRAD_SCALER_SCALE,
     _make_grad_scaler,
+    find_first_nonfinite_output,
     validate_checkpoint,
 )
 
@@ -518,8 +519,71 @@ def test_trainer_skips_non_finite_batch():
     after = next(model.context_encoder.parameters()).detach()
 
     assert metrics.get('skipped') is True
+    assert metrics.get('skip_reason') in (
+        'non_finite_loss', 'non_finite_output', 'corrupt_weights_pre_forward',
+    )
     assert torch.equal(before.to(device), after)
     print("  ✓ Non-finite batch skipped; context encoder weights unchanged")
+
+
+def test_trainer_detects_corrupt_weights_before_forward(tmp_path):
+    """Pre-forward weight check skips batch and marks weights_corrupted."""
+    print("Testing corrupt-weight detection before forward...")
+    model = _make_model()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trainer = VL_JEPA_Trainer(
+        model, device, warmup_steps=0, max_steps=100,
+        nan_diagnostics_dir=str(tmp_path),
+    )
+
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE, device=device)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN), device=device)
+
+    with torch.no_grad():
+        model.vision_proj.weight.fill_(float('nan'))
+
+    metrics = trainer.train_step(images, input_ids, batch_index=7, epoch=1)
+    assert metrics.get('skipped') is True
+    assert metrics.get('skip_reason') == 'corrupt_weights_pre_forward'
+    assert metrics.get('weights_corrupted') is True
+    diag_dirs = list(tmp_path.glob('nan_*'))
+    assert len(diag_dirs) == 1
+    assert (diag_dirs[0] / 'diagnostic.json').is_file()
+    print("  ✓ Corrupt weights detected; diagnostic saved")
+
+
+def test_find_first_nonfinite_output():
+    """Output finite-check locates the first bad activation tensor."""
+    print("Testing non-finite output detection...")
+    good = torch.randn(2, HIDDEN_DIM)
+    bad = good.clone()
+    bad[0, 0] = float('nan')
+    outputs = {
+        'predicted_patches': good,
+        'target_patches': good,
+        'vision_proj': bad,
+        'language_proj': good,
+    }
+    assert find_first_nonfinite_output(outputs) == 'vision_proj'
+    print("  ✓ find_first_nonfinite_output locates bad tensor")
+
+
+def test_trainer_weights_stay_finite_after_step():
+    """Successful train steps leave all model weights finite."""
+    print("Testing post-step weight finiteness...")
+    model = _make_model()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trainer = VL_JEPA_Trainer(model, device, warmup_steps=0, max_steps=100)
+
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE, device=device)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN), device=device)
+
+    for _ in range(5):
+        metrics = trainer.train_step(images, input_ids)
+        assert not metrics.get('skipped')
+        for name, param in model.named_parameters():
+            assert torch.isfinite(param).all(), f"Non-finite weights in {name}"
+    print("  ✓ Weights remain finite after 5 steps")
 
 
 def test_grad_scaler_growth_interval_capped():
@@ -584,6 +648,9 @@ if __name__ == '__main__':
         ("Momentum Update", test_momentum_update),
         ("Capped Momentum Schedule", test_momentum_schedule_capped),
         ("Non-finite Batch Skip", test_trainer_skips_non_finite_batch),
+        ("Corrupt Weight Detection", test_trainer_detects_corrupt_weights_before_forward),
+        ("Non-finite Output Detection", test_find_first_nonfinite_output),
+        ("Post-step Weight Finiteness", test_trainer_weights_stay_finite_after_step),
         ("GradScaler Stability", test_grad_scaler_growth_interval_capped),
         ("GPU Forward + Backward", test_gpu_forward),
         ("Joint Embedding", test_joint_embedding),

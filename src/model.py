@@ -684,8 +684,8 @@ def compute_jepa_loss(
     target = outputs['target_patches']          # (B, N+1, D), detached
     patch_mask = outputs['patch_mask']          # (B, N)
 
-    vision_proj = outputs['vision_proj']        # (B, D) normalized
-    language_proj = outputs['language_proj']    # (B, D) normalized
+    vision_proj = outputs['vision_proj'].float()        # (B, D) normalized
+    language_proj = outputs['language_proj'].float()    # (B, D) normalized
 
     # ---- MSE on masked patches (skip [CLS] at index 0) ----
     # predicted[:, 1:] and target[:, 1:] -> (B, N, D)
@@ -708,10 +708,10 @@ def compute_jepa_loss(
     )
     mse_masked = mse_per_sample.mean()
 
-    # ---- InfoNCE contrastive loss ----
+    # ---- InfoNCE contrastive loss (FP32 for AMP stability) ----
     batch_size = vision_proj.size(0)
     logit_scale = outputs.get('logit_scale', torch.tensor(2.659, device=vision_proj.device))
-    scale = logit_scale.clamp(LOGIT_SCALE_MIN, LOGIT_SCALE_MAX).exp()
+    scale = logit_scale.float().clamp(LOGIT_SCALE_MIN, LOGIT_SCALE_MAX).exp()
 
     target_language_proj = outputs.get('target_language_proj')
     target_vision_proj = outputs.get('target_vision_proj')
@@ -719,8 +719,10 @@ def compute_jepa_loss(
         logits_i2t = vision_proj @ language_proj.T * scale
         logits_t2i = logits_i2t.T
     else:
-        logits_i2t = vision_proj @ target_language_proj.detach().T * scale
-        logits_t2i = language_proj @ target_vision_proj.detach().T * scale
+        tgt_lang = target_language_proj.detach().float()
+        tgt_vis = target_vision_proj.detach().float()
+        logits_i2t = vision_proj @ tgt_lang.T * scale
+        logits_t2i = language_proj @ tgt_vis.T * scale
     labels = torch.arange(batch_size, device=vision_proj.device)
 
     # Symmetric NCE (both directions)

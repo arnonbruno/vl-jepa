@@ -9,11 +9,13 @@ Fixed with proper JEPA training loop:
 """
 
 import contextlib
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import time
 import math
+from datetime import datetime, timezone
 from typing import Dict, Tuple, Optional, Iterator, Any, Union
 from pathlib import Path
 
@@ -42,9 +44,91 @@ _CHECKPOINT_STATE_KEYS = frozenset({
     'skipped_batches',
 })
 
+# Forward outputs checked before loss (catches NaN activations with finite-looking loss).
+_OUTPUT_FINITE_KEYS = (
+    'predicted_patches',
+    'target_patches',
+    'vision_proj',
+    'language_proj',
+    'target_vision_proj',
+    'target_language_proj',
+)
+
 
 class CheckpointError(RuntimeError):
     """Raised when a checkpoint is invalid or contains non-finite tensors."""
+
+
+@torch.no_grad()
+def tensor_summary(t: torch.Tensor) -> Dict[str, Any]:
+    """Compact finite/min/max/mean stats for NaN diagnostics."""
+    if not isinstance(t, torch.Tensor):
+        return {'error': f'not a tensor: {type(t).__name__}'}
+    finite_mask = torch.isfinite(t)
+    finite_frac = float(finite_mask.float().mean().item()) if t.numel() else 1.0
+    summary: Dict[str, Any] = {
+        'shape': list(t.shape),
+        'dtype': str(t.dtype),
+        'finite_frac': finite_frac,
+    }
+    if t.numel() == 0:
+        summary.update({'min': None, 'max': None, 'mean': None, 'std': None})
+        return summary
+    if finite_mask.any():
+        vals = t[finite_mask].float()
+        summary.update({
+            'min': float(vals.min().item()),
+            'max': float(vals.max().item()),
+            'mean': float(vals.mean().item()),
+            'std': float(vals.std(unbiased=False).item()) if vals.numel() > 1 else 0.0,
+        })
+    else:
+        summary.update({'min': None, 'max': None, 'mean': None, 'std': None})
+    return summary
+
+
+def find_first_nonfinite_output(outputs: Dict[str, torch.Tensor]) -> Optional[str]:
+    """Return name of first forward output tensor containing NaN/Inf."""
+    for key in _OUTPUT_FINITE_KEYS:
+        value = outputs.get(key)
+        if isinstance(value, torch.Tensor) and value.numel() > 0 and not torch.isfinite(value).all():
+            return key
+    return None
+
+
+def find_first_nonfinite_input(
+    images: torch.Tensor,
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> Optional[str]:
+    """Return name of first batch input tensor containing NaN/Inf."""
+    if images.numel() > 0 and not torch.isfinite(images).all():
+        return 'images'
+    if input_ids.numel() > 0 and not torch.isfinite(input_ids.float()).all():
+        return 'input_ids'
+    if attention_mask is not None and attention_mask.numel() > 0:
+        if not torch.isfinite(attention_mask.float()).all():
+            return 'attention_mask'
+    return None
+
+
+def summarize_outputs(outputs: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    """Per-key tensor summaries for diagnostic dumps."""
+    out: Dict[str, Any] = {}
+    for key in _OUTPUT_FINITE_KEYS:
+        value = outputs.get(key)
+        if isinstance(value, torch.Tensor):
+            out[key] = tensor_summary(value)
+    patch_mask = outputs.get('patch_mask')
+    if isinstance(patch_mask, torch.Tensor):
+        out['patch_mask'] = {
+            'shape': list(patch_mask.shape),
+            'masked_frac': float(patch_mask.float().mean().item()),
+        }
+    logit_scale = outputs.get('logit_scale')
+    if isinstance(logit_scale, torch.Tensor):
+        out['logit_scale'] = float(logit_scale.detach().float().item())
+    return out
 
 
 def _find_nonfinite_tensor(obj: Any, *, prefix: str = "") -> Optional[str]:
@@ -178,9 +262,16 @@ class VL_JEPA_Trainer:
         global_crop_size: int = 224,
         local_crop_size: int = 96,
         eval_mask_seed: int = 17_029,
+        check_finite: bool = True,
+        nan_diagnostics_dir: Optional[Union[str, Path]] = None,
     ):
         self.model = model.to(device)
         self.device = device
+        self.check_finite = check_finite
+        self.nan_diagnostics_dir = (
+            Path(nan_diagnostics_dir) if nan_diagnostics_dir else None
+        )
+        self._weights_corrupted = False
         self.alpha = alpha
         self.beta = beta
         self.use_multi_crop = use_multi_crop
@@ -257,21 +348,128 @@ class VL_JEPA_Trainer:
                 return False
         return True
 
-    def _skipped_metrics(self, reason: str = 'non_finite') -> Dict[str, float]:
-        """Metrics for batches skipped due to NaN/Inf loss or gradients."""
+    def _first_nonfinite_weight(self) -> Optional[str]:
+        return _find_nonfinite_tensor(self.model.state_dict(), prefix='model')
+
+    def _save_nan_diagnostic(
+        self,
+        reason: str,
+        *,
+        batch_index: Optional[int] = None,
+        epoch: Optional[int] = None,
+        images: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        outputs: Optional[Dict[str, torch.Tensor]] = None,
+        loss_dict: Optional[Dict[str, torch.Tensor]] = None,
+        grad_norm: Optional[float] = None,
+        nonfinite_location: Optional[str] = None,
+    ) -> Optional[Path]:
+        """Write a JSON diagnostic bundle when NaN/Inf is detected (if dir configured)."""
+        if self.nan_diagnostics_dir is None:
+            return None
+
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        tag_parts = [reason]
+        if epoch is not None:
+            tag_parts.append(f'e{epoch}')
+        if batch_index is not None:
+            tag_parts.append(f'b{batch_index}')
+        out_dir = self.nan_diagnostics_dir / f"nan_{stamp}_{'_'.join(tag_parts)}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        payload: Dict[str, Any] = {
+            'reason': reason,
+            'epoch': epoch,
+            'batch_index': batch_index,
+            'step': self._step,
+            'skipped_batches': self._skipped_batches,
+            'weights_corrupted': self._weights_corrupted,
+            'nonfinite_location': nonfinite_location,
+            'amp_scale': float(self.scaler.get_scale()) if self.scaler else None,
+            'lr': self.optimizer.param_groups[0]['lr'],
+            'momentum_tau': self.model.momentum_tau,
+        }
+        if images is not None:
+            payload['images'] = tensor_summary(images)
+        if input_ids is not None:
+            payload['input_ids'] = tensor_summary(input_ids.float())
+        if attention_mask is not None:
+            payload['attention_mask'] = tensor_summary(attention_mask.float())
+        if outputs is not None:
+            payload['outputs'] = summarize_outputs(outputs)
+        if loss_dict is not None:
+            payload['loss'] = {
+                key: float(value.detach().float().item())
+                if isinstance(value, torch.Tensor) else value
+                for key, value in loss_dict.items()
+            }
+        if grad_norm is not None:
+            payload['grad_norm'] = grad_norm
+
+        bad_weight = self._first_nonfinite_weight()
+        if bad_weight is not None:
+            payload['first_nonfinite_weight'] = bad_weight
+
+        diag_path = out_dir / 'diagnostic.json'
+        with open(diag_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2)
+
+        if images is not None:
+            torch.save(
+                {
+                    'images': images.detach().cpu(),
+                    'input_ids': input_ids.detach().cpu() if input_ids is not None else None,
+                    'attention_mask': (
+                        attention_mask.detach().cpu()
+                        if attention_mask is not None else None
+                    ),
+                },
+                out_dir / 'batch_inputs.pt',
+            )
+        return out_dir
+
+    def _skipped_metrics(
+        self,
+        reason: str = 'non_finite',
+        *,
+        batch_index: Optional[int] = None,
+        epoch: Optional[int] = None,
+        images: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        outputs: Optional[Dict[str, torch.Tensor]] = None,
+        loss_dict: Optional[Dict[str, torch.Tensor]] = None,
+        grad_norm: Optional[float] = None,
+        nonfinite_location: Optional[str] = None,
+    ) -> Dict[str, float]:
+        """Metrics for batches skipped due to NaN/Inf loss, inputs, outputs, or weights."""
         self._skipped_batches += 1
+        self._save_nan_diagnostic(
+            reason,
+            batch_index=batch_index,
+            epoch=epoch,
+            images=images,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            outputs=outputs,
+            loss_dict=loss_dict,
+            grad_norm=grad_norm,
+            nonfinite_location=nonfinite_location,
+        )
         tau = self._current_momentum_tau()
         return {
             'mse_loss': float('nan'),
             'nce_loss': float('nan'),
             'total_loss': float('nan'),
-            'grad_norm': 0.0,
+            'grad_norm': grad_norm if grad_norm is not None else 0.0,
             'logit_scale': 0.0,
             'nce_acc': 0.0,
             'momentum_tau': tau,
             'lr': self.optimizer.param_groups[0]['lr'],
             'skipped': True,
             'skip_reason': reason,
+            'weights_corrupted': self._weights_corrupted,
         }
 
     def _current_momentum_tau(self) -> float:
@@ -367,6 +565,9 @@ class VL_JEPA_Trainer:
         images: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        *,
+        batch_index: Optional[int] = None,
+        epoch: Optional[int] = None,
     ) -> Dict[str, float]:
         """Single training step with proper JEPA loss."""
         self.model.train()
@@ -376,17 +577,78 @@ class VL_JEPA_Trainer:
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
 
+        skip_kw = dict(
+            batch_index=batch_index,
+            epoch=epoch,
+            images=images,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
+        if self.check_finite:
+            bad_weight = self._first_nonfinite_weight()
+            if bad_weight is not None:
+                self._weights_corrupted = True
+                return self._skipped_metrics(
+                    'corrupt_weights_pre_forward',
+                    nonfinite_location=bad_weight,
+                    **skip_kw,
+                )
+
+            bad_input = find_first_nonfinite_input(images, input_ids, attention_mask)
+            if bad_input is not None:
+                return self._skipped_metrics(
+                    'non_finite_input',
+                    nonfinite_location=bad_input,
+                    **skip_kw,
+                )
+
         with _amp_autocast(self.device):
             outputs = self._forward_model(images, input_ids, attention_mask, training=True)
+
+            if self.check_finite:
+                bad_output = find_first_nonfinite_output(outputs)
+                if bad_output is not None:
+                    return self._skipped_metrics(
+                        'non_finite_output',
+                        outputs=outputs,
+                        nonfinite_location=bad_output,
+                        **skip_kw,
+                    )
+
             loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
             loss = loss_dict['total_loss']
 
         if not self._loss_is_finite(loss, loss_dict):
-            return self._skipped_metrics('non_finite_loss')
+            return self._skipped_metrics(
+                'non_finite_loss',
+                outputs=outputs,
+                loss_dict=loss_dict,
+                **skip_kw,
+            )
 
         ok, grad_norm = self._backward_and_step(loss)
         if not ok:
-            return self._skipped_metrics('non_finite_grad')
+            return self._skipped_metrics(
+                'non_finite_grad',
+                outputs=outputs,
+                loss_dict=loss_dict,
+                grad_norm=grad_norm,
+                **skip_kw,
+            )
+
+        if self.check_finite:
+            bad_weight = self._first_nonfinite_weight()
+            if bad_weight is not None:
+                self._weights_corrupted = True
+                return self._skipped_metrics(
+                    'corrupt_weights_post_step',
+                    outputs=outputs,
+                    loss_dict=loss_dict,
+                    grad_norm=grad_norm,
+                    nonfinite_location=bad_weight,
+                    **skip_kw,
+                )
 
         self.running_loss += loss.item()
         self.running_steps += 1
@@ -401,6 +663,7 @@ class VL_JEPA_Trainer:
             'momentum_tau': self.model.momentum_tau,
             'lr': self.optimizer.param_groups[0]['lr'],
             'skipped': False,
+            'weights_corrupted': False,
         }
 
         return metrics
