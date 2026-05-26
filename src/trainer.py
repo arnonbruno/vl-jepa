@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.optim as optim
 import time
 import math
-from typing import Dict, Tuple, Optional, Iterator, Any
+from typing import Dict, Tuple, Optional, Iterator, Any, Union
 from pathlib import Path
 
 from .model import (
@@ -30,6 +30,87 @@ from .model import (
 # PyTorch requires growth_factor > 1; a huge interval effectively freezes growth.
 _GRAD_SCALER_GROWTH_INTERVAL = 2**31 - 1
 _MAX_GRAD_SCALER_SCALE = 8192.0
+
+_CHECKPOINT_STATE_KEYS = frozenset({
+    'model_state_dict',
+    'optimizer_state_dict',
+    'scheduler_state_dict',
+    'scaler_state_dict',
+    'step',
+    'running_loss',
+    'running_steps',
+    'skipped_batches',
+})
+
+
+class CheckpointError(RuntimeError):
+    """Raised when a checkpoint is invalid or contains non-finite tensors."""
+
+
+def _find_nonfinite_tensor(obj: Any, *, prefix: str = "") -> Optional[str]:
+    """Return location of first non-finite tensor in nested state, or None if clean."""
+    if isinstance(obj, torch.Tensor):
+        if obj.numel() > 0 and not torch.isfinite(obj).all():
+            return prefix or "<tensor>"
+        return None
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            found = _find_nonfinite_tensor(value, prefix=child_prefix)
+            if found is not None:
+                return found
+        return None
+    if isinstance(obj, (list, tuple)):
+        for index, value in enumerate(obj):
+            child_prefix = f"{prefix}[{index}]"
+            found = _find_nonfinite_tensor(value, prefix=child_prefix)
+            if found is not None:
+                return found
+        return None
+    return None
+
+
+def validate_checkpoint(
+    checkpoint: Dict[str, Any],
+    *,
+    path: Optional[Union[str, Path]] = None,
+    check_optimizer: bool = True,
+    check_scaler: bool = True,
+) -> None:
+    """Validate checkpoint tensors before resume. Raises CheckpointError if corrupt."""
+    location = f" ({path})" if path else ""
+    if not isinstance(checkpoint, dict):
+        raise CheckpointError(f"Checkpoint must be a dict, got {type(checkpoint).__name__}{location}")
+
+    model_state = checkpoint.get('model_state_dict')
+    if model_state is None:
+        raise CheckpointError(
+            f"Checkpoint missing 'model_state_dict'{location}. "
+            "Use --fresh to train from scratch or pass a valid --resume PATH."
+        )
+
+    bad = _find_nonfinite_tensor(model_state, prefix='model')
+    if bad is not None:
+        raise CheckpointError(
+            f"Corrupted checkpoint{location}: non-finite values in model weights at {bad}. "
+            "Use --fresh to start from scratch or --resume PATH with a healthy checkpoint."
+        )
+
+    if check_optimizer and checkpoint.get('optimizer_state_dict') is not None:
+        bad = _find_nonfinite_tensor(checkpoint['optimizer_state_dict'], prefix='optimizer')
+        if bad is not None:
+            raise CheckpointError(
+                f"Corrupted checkpoint{location}: non-finite values in optimizer state at {bad}. "
+                "Use --fresh or --resume PATH with optimizer state omitted (weights-only load)."
+            )
+
+    if check_scaler and checkpoint.get('scaler_state_dict') is not None:
+        bad = _find_nonfinite_tensor(checkpoint['scaler_state_dict'], prefix='scaler')
+        if bad is not None:
+            raise CheckpointError(
+                f"Corrupted checkpoint{location}: non-finite values in AMP GradScaler state at {bad}. "
+                "Use --fresh or resume from a checkpoint saved before AMP overflow."
+            )
 
 
 def _amp_autocast(device: torch.device):
@@ -472,12 +553,35 @@ class VL_JEPA_Trainer:
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(state, str(path))
 
-    def load_checkpoint(self, path: str, load_optimizer: bool = True):
-        """Load training state (tolerant of missing/extra keys in older checkpoints)."""
+    def load_checkpoint(
+        self,
+        path: str,
+        load_optimizer: bool = True,
+        *,
+        validate: bool = True,
+    ) -> Dict[str, Any]:
+        """Load training state (tolerant of missing/extra keys in older checkpoints).
+
+        Returns checkpoint metadata (epoch, val_loss, config, etc.) excluding state dicts.
+        Raises CheckpointError if validate=True and tensors contain NaN/Inf.
+        """
+        ckpt_path = Path(path)
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
         try:
-            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(str(ckpt_path), map_location=self.device, weights_only=False)
         except TypeError:
-            checkpoint = torch.load(path, map_location=self.device)
+            checkpoint = torch.load(str(ckpt_path), map_location=self.device)
+
+        if validate:
+            validate_checkpoint(
+                checkpoint,
+                path=ckpt_path,
+                check_optimizer=load_optimizer,
+                check_scaler=load_optimizer,
+            )
+
         self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         if load_optimizer and 'optimizer_state_dict' in checkpoint:
             try:
@@ -498,3 +602,9 @@ class VL_JEPA_Trainer:
             self.running_loss = checkpoint.get('running_loss', 0.0)
             self.running_steps = checkpoint.get('running_steps', 0)
             self._skipped_batches = checkpoint.get('skipped_batches', 0)
+
+        return {
+            key: value
+            for key, value in checkpoint.items()
+            if key not in _CHECKPOINT_STATE_KEYS
+        }

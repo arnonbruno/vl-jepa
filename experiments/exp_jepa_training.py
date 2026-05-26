@@ -37,7 +37,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.model import VL_JEPA
-from src.trainer import VL_JEPA_Trainer
+from src.trainer import CheckpointError, VL_JEPA_Trainer
 from src.config import load_config, overrides_from_cli, print_config
 from src.dataset import (
     COCOCaptionDataset,
@@ -169,6 +169,18 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
                         help='Enable TensorBoard logging (default: on)')
     parser.add_argument('--tensorboard-dir', type=str, default=None,
                         help='TensorBoard log directory (default: <exp_dir>/tensorboard)')
+    parser.add_argument(
+        '--resume',
+        type=str,
+        default=None,
+        metavar='PATH',
+        help='Explicit checkpoint path to resume (weights + optimizer). No auto-resume.',
+    )
+    parser.add_argument(
+        '--fresh',
+        action='store_true',
+        help='Start training from scratch; never load checkpoints from the experiment dir',
+    )
     return parser
 
 
@@ -185,6 +197,8 @@ def main() -> None:
 
     parser = _build_parser(base_cfg)
     args = parser.parse_args(remaining)
+    if args.resume and args.fresh:
+        parser.error('Cannot use both --resume and --fresh')
 
     cfg = load_config(
         args.config,
@@ -297,6 +311,39 @@ def main() -> None:
     exp_dir = output_dir / exp_name
     exp_dir.mkdir(parents=True, exist_ok=True)
 
+    resume_meta: Optional[Dict[str, Any]] = None
+    start_epoch = 0
+    if args.resume:
+        resume_path = Path(args.resume).expanduser().resolve()
+        print(f"\nResuming from checkpoint: {resume_path}")
+        try:
+            resume_meta = trainer.load_checkpoint(str(resume_path))
+        except CheckpointError as exc:
+            print(f"\n❌ Refusing to resume: {exc}")
+            sys.exit(1)
+        start_epoch = int(resume_meta.get('epoch', 0))
+        print(
+            f"  Loaded epoch={start_epoch}, step={trainer._step}, "
+            f"val_loss={resume_meta.get('val_loss', 'n/a')}"
+        )
+        if start_epoch >= train_cfg['epochs']:
+            print(
+                f"\n❌ Checkpoint epoch {start_epoch} >= target epochs {train_cfg['epochs']}. "
+                "Increase --epochs or choose a different checkpoint."
+            )
+            sys.exit(1)
+    elif not args.fresh:
+        existing = [p for p in (exp_dir / 'checkpoint_best.pt',) if p.is_file()]
+        if existing:
+            print(
+                f"\n  Note: checkpoint(s) exist in {exp_dir} but were NOT loaded. "
+                "Pass --resume PATH to continue or --fresh to start from scratch."
+            )
+            for path in existing:
+                print(f"    - {path}")
+    else:
+        print(f"\n  --fresh: starting from scratch (ignoring any checkpoints in {exp_dir})")
+
     writer = None
     if args.tensorboard and _HAS_TENSORBOARD:
         tb_dir = Path(args.tensorboard_dir) if args.tensorboard_dir else exp_dir / 'tensorboard'
@@ -312,12 +359,15 @@ def main() -> None:
 
     all_metrics: list[Dict[str, Any]] = []
     best_val_loss = float('inf')
+    if resume_meta and resume_meta.get('val_loss') is not None:
+        best_val_loss = float(resume_meta['val_loss'])
+
     total_start = time.time()
     graph_logged = False
     last_train_metrics: Dict[str, float] = {}
 
     try:
-        for epoch in range(train_cfg["epochs"]):
+        for epoch in range(start_epoch, train_cfg["epochs"]):
             train_ds = train_loader.dataset
             if isinstance(train_ds, COCOCaptionDataset):
                 train_ds.set_epoch(epoch)

@@ -17,11 +17,15 @@ from src.model import (
     VL_JEPA, VisionEncoder, LanguageEncoder, Predictor,
     LOGIT_SCALE_MAX, block_patch_mask, compute_jepa_loss, make_multicrop_views,
 )
+import pytest
+
 from src.trainer import (
+    CheckpointError,
     VL_JEPA_Trainer,
     _GRAD_SCALER_GROWTH_INTERVAL,
     _MAX_GRAD_SCALER_SCALE,
     _make_grad_scaler,
+    validate_checkpoint,
 )
 
 HIDDEN_DIM = 96
@@ -385,6 +389,75 @@ def test_checkpoint_roundtrip():
     print("  ✓ Checkpoint round-trip preserves model outputs")
 
 
+def test_validate_checkpoint_rejects_nan_weights():
+    """validate_checkpoint must reject NaN/Inf in model or optimizer state."""
+    device = torch.device('cpu')
+    model = _make_model().to(device)
+    trainer = VL_JEPA_Trainer(model, device, warmup_steps=0, max_steps=10)
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN))
+    trainer.train_step(images, input_ids)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        good_path = os.path.join(tmpdir, 'good.pt')
+        trainer.save_checkpoint(good_path)
+        good_ckpt = torch.load(good_path, weights_only=False)
+
+        validate_checkpoint(good_ckpt, path=good_path)
+
+        bad_ckpt = dict(good_ckpt)
+        bad_ckpt['model_state_dict'] = {
+            k: torch.full_like(v, float('nan'))
+            for k, v in good_ckpt['model_state_dict'].items()
+            if isinstance(v, torch.Tensor)
+        }
+        with pytest.raises(CheckpointError, match='model weights'):
+            validate_checkpoint(bad_ckpt, path='bad.pt')
+
+        bad_opt = dict(good_ckpt)
+        opt_state = bad_opt['optimizer_state_dict']
+        first_key = next(iter(opt_state['state']))
+        opt_state['state'][first_key]['exp_avg'] = torch.full(
+            opt_state['state'][first_key]['exp_avg'].shape,
+            float('inf'),
+        )
+        with pytest.raises(CheckpointError, match='optimizer state'):
+            validate_checkpoint(bad_opt, path='bad.pt')
+
+
+def test_load_checkpoint_raises_on_corrupt_file():
+    """load_checkpoint must refuse corrupted checkpoints when validate=True."""
+    device = torch.device('cpu')
+    model = _make_model().to(device)
+    trainer = VL_JEPA_Trainer(model, device, warmup_steps=0, max_steps=10)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = os.path.join(tmpdir, 'corrupt.pt')
+        trainer.save_checkpoint(ckpt_path)
+        ckpt = torch.load(ckpt_path, weights_only=False)
+        ckpt['model_state_dict']['logit_scale'] = torch.tensor(float('nan'))
+        torch.save(ckpt, ckpt_path)
+
+        trainer2 = VL_JEPA_Trainer(_make_model().to(device), device, warmup_steps=0, max_steps=10)
+        with pytest.raises(CheckpointError, match='Corrupted checkpoint'):
+            trainer2.load_checkpoint(ckpt_path)
+
+
+def test_load_checkpoint_returns_metadata():
+    """load_checkpoint returns epoch and other extra fields."""
+    device = torch.device('cpu')
+    model = _make_model().to(device)
+    trainer = VL_JEPA_Trainer(model, device, warmup_steps=0, max_steps=10)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = os.path.join(tmpdir, 'meta.pt')
+        trainer.save_checkpoint(ckpt_path, extra={'epoch': 3, 'val_loss': 1.25})
+        meta = trainer.load_checkpoint(ckpt_path)
+        assert meta['epoch'] == 3
+        assert meta['val_loss'] == 1.25
+        assert 'model_state_dict' not in meta
+
+
 def test_masked_patches_contribute_to_loss():
     """MSE loss uses masked patches only; unmasked-only mask yields ~zero MSE."""
     print("Testing masked vs unmasked patch loss contribution...")
@@ -516,6 +589,9 @@ if __name__ == '__main__':
         ("Joint Embedding", test_joint_embedding),
         ("Loss Decreases", test_loss_decreases_over_steps),
         ("Checkpoint Round-trip", test_checkpoint_roundtrip),
+        ("Checkpoint Validation", test_validate_checkpoint_rejects_nan_weights),
+        ("Corrupt Checkpoint Reject", test_load_checkpoint_raises_on_corrupt_file),
+        ("Checkpoint Metadata", test_load_checkpoint_returns_metadata),
         ("Masked Patch Loss", test_masked_patches_contribute_to_loss),
     ]
 
