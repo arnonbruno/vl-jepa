@@ -297,12 +297,15 @@ class VL_JEPA_Trainer:
         decay_params = []
         no_decay_params = []
         predictor_params = []
+        proj_params = []
 
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
             if 'predictor' in name:
                 predictor_params.append(p)
+            elif 'vision_proj' in name or 'language_proj' in name:
+                proj_params.append(p)
             elif 'bias' in name or 'LayerNorm' in name or 'layer_norm' in name:
                 no_decay_params.append(p)
             elif 'logit_scale' in name:
@@ -314,6 +317,8 @@ class VL_JEPA_Trainer:
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': no_decay_params, 'weight_decay': 0.0},
             {'params': predictor_params, 'weight_decay': weight_decay, 'lr': learning_rate * 20.0},
+            # Projection heads need higher LR for contrastive learning
+            {'params': proj_params, 'weight_decay': weight_decay, 'lr': learning_rate * 10.0},
         ]
 
         self.optimizer = optim.AdamW(param_groups, lr=learning_rate, betas=(0.9, 0.95))
