@@ -3,7 +3,7 @@ Training utilities for VL-JEPA.
 Fixed with proper JEPA training loop:
   - JEPA loss: MSE on masked patches + InfoNCE cross-modal alignment
   - Momentum update of target encoder (EMA)
-  - AMP + configurable global gradient clipping (default max_grad_norm=1.0)
+  - AMP + configurable global gradient clipping (default max_grad_norm=2.0)
   - Validation split with eval loop
   - TensorBoard logging
 """
@@ -262,7 +262,7 @@ class VL_JEPA_Trainer:
         global_crop_size: int = 224,
         local_crop_size: int = 96,
         eval_mask_seed: int = 17_029,
-        max_grad_norm: float = 1.0,
+        max_grad_norm: float = 2.0,
         check_finite: bool = True,
         nan_diagnostics_dir: Optional[Union[str, Path]] = None,
     ):
