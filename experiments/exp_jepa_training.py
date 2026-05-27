@@ -335,6 +335,7 @@ def main() -> None:
         beta=loss_cfg["beta"],
         gamma=loss_cfg.get("gamma", 0.1),
         max_grad_norm=train_cfg.get("max_grad_norm", 1.0),
+        memory_bank_size=train_cfg.get("memory_bank_size", 65536),
         use_multi_crop=train_cfg.get("use_multi_crop", False),
         global_crop_size=train_cfg.get("global_crop_size", model_cfg["image_size"]),
         local_crop_size=train_cfg.get("local_crop_size", 96),

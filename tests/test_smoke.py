@@ -14,7 +14,7 @@ import tempfile
 import os
 
 from src.model import (
-    VL_JEPA, VisionEncoder, LanguageEncoder, Predictor,
+    VL_JEPA, VisionEncoder, LanguageEncoder, Predictor, MemoryBank,
     LOGIT_SCALE_MAX, block_patch_mask, compute_jepa_loss, make_multicrop_views,
 )
 import pytest
@@ -241,6 +241,28 @@ def test_padded_small_crop_forward_is_finite():
     assert outputs['patch_mask'].shape == (2, 4)
     assert torch.isfinite(loss_dict['total_loss'])
     print("  ✓ Non-divisible 30px crop pads to a finite 2x2 patch grid")
+
+
+def test_memory_bank_expands_contrastive_negatives():
+    """Memory bank should increase i2t logits width beyond batch size."""
+    print("Testing memory bank contrastive negatives...")
+    model = _make_model()
+    bank = MemoryBank(size=128, dim=HIDDEN_DIM, device=torch.device('cpu'))
+
+    images = torch.randn(4, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (4, SEQ_LEN))
+    outputs = model(images, input_ids)
+
+    for _ in range(4):
+        bank.enqueue(outputs['target_language_proj'])
+
+    loss_with_bank = compute_jepa_loss(outputs, alpha=0.0, beta=1.0, memory_bank=bank)
+    loss_batch_only = compute_jepa_loss(outputs, alpha=0.0, beta=1.0, memory_bank=None)
+
+    assert bank.num_filled > 4
+    assert torch.isfinite(loss_with_bank['nce_loss'])
+    assert loss_with_bank['nce_loss'].item() != loss_batch_only['nce_loss'].item()
+    print(f"  ✓ Queue filled={bank.num_filled}, NCE with bank={loss_with_bank['nce_loss']:.4f}")
 
 
 def test_contrastive_projection_gradients_flow():

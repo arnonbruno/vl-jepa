@@ -82,6 +82,7 @@ def overrides_from_cli(**kwargs: Any) -> Dict[str, Any]:
         "global_crop_size": (training, "global_crop_size"),
         "local_crop_size": (training, "local_crop_size"),
         "max_grad_norm": (training, "max_grad_norm"),
+        "memory_bank_size": (training, "memory_bank_size"),
         "alpha": (loss, "alpha"),
         "beta": (loss, "beta"),
         "gamma": (loss, "gamma"),

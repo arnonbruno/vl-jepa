@@ -667,6 +667,85 @@ class VL_JEPA(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# MoCo-style memory bank for contrastive negatives
+# ---------------------------------------------------------------------------
+
+class MemoryBank:
+    """FIFO queue of momentum language projection keys (MoCo-style).
+
+    Stores detached, L2-normalized language keys on device. Vision queries
+    the queue; only language embeddings are enqueued.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        dim: int,
+        device: torch.device,
+    ):
+        if size <= 0:
+            raise ValueError(f"memory bank size must be positive, got {size}")
+        if dim <= 0:
+            raise ValueError(f"memory bank dim must be positive, got {dim}")
+        self.size = int(size)
+        self.dim = int(dim)
+        self.device = device
+        self.queue = torch.zeros(self.size, self.dim, dtype=torch.float32, device=device)
+        self.ptr = 0
+        self.num_filled = 0
+
+    @torch.no_grad()
+    def enqueue(self, keys: torch.Tensor) -> None:
+        """Enqueue a batch of keys (B, D). Keys must already be detached."""
+        if keys.numel() == 0:
+            return
+        keys = keys.detach().float()
+        if keys.dim() != 2 or keys.size(1) != self.dim:
+            raise ValueError(
+                f"Expected keys shape (B, {self.dim}), got {tuple(keys.shape)}",
+            )
+        keys = F.normalize(keys, p=2, dim=-1, eps=1e-6)
+        batch_size = keys.size(0)
+        if batch_size >= self.size:
+            self.queue.copy_(keys[-self.size:])
+            self.ptr = 0
+            self.num_filled = self.size
+            return
+
+        end = self.ptr + batch_size
+        if end <= self.size:
+            self.queue[self.ptr:end] = keys
+        else:
+            first = self.size - self.ptr
+            self.queue[self.ptr:] = keys[:first]
+            self.queue[:batch_size - first] = keys[first:]
+        self.ptr = (self.ptr + batch_size) % self.size
+        self.num_filled = min(self.num_filled + batch_size, self.size)
+
+    def get(self) -> torch.Tensor:
+        """Return all valid keys in the queue (up to ``num_filled``)."""
+        if self.num_filled == 0:
+            return self.queue[:0]
+        if self.num_filled < self.size:
+            return self.queue[:self.num_filled]
+        return self.queue
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return {
+            'queue': self.queue.clone(),
+            'ptr': torch.tensor(self.ptr, dtype=torch.long),
+            'num_filled': torch.tensor(self.num_filled, dtype=torch.long),
+        }
+
+    def load_state_dict(self, state: Dict[str, torch.Tensor]) -> None:
+        self.queue.copy_(state['queue'].to(device=self.device, dtype=torch.float32))
+        self.ptr = int(state['ptr'].item())
+        self.num_filled = int(state['num_filled'].item())
+        self.num_filled = min(max(0, self.num_filled), self.size)
+        self.ptr = self.ptr % self.size
+
+
+# ---------------------------------------------------------------------------
 # Loss computation (standalone function for clarity)
 # ---------------------------------------------------------------------------
 
@@ -681,6 +760,7 @@ def compute_jepa_loss(
     alpha: float = 1.0,       # weight for MSE prediction loss
     beta: float = 0.5,        # weight for InfoNCE contrastive loss
     gamma: float = 0.1,       # weight for variance regularization (anti-collapse)
+    memory_bank: Optional['MemoryBank'] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute VL-JEPA loss:
@@ -725,17 +805,24 @@ def compute_jepa_loss(
     logit_scale = outputs.get('logit_scale', torch.tensor(2.659, device=vision_proj.device))
     scale = logit_scale.float().clamp(LOGIT_SCALE_MIN, LOGIT_SCALE_MAX).exp()
 
-    # Student-to-student contrastive: both projections receive gradients.
-    logits_i2t = vision_proj @ language_proj.T * scale
-    logits_t2i = logits_i2t.T
     labels = torch.arange(batch_size, device=vision_proj.device)
 
-    # Symmetric NCE (both directions)
+    # MoCo-style keys: momentum language projections (batch) + FIFO queue.
+    momentum_lang_keys = outputs.get('target_language_proj', language_proj).float()
+    lang_keys = momentum_lang_keys
+    if memory_bank is not None and memory_bank.num_filled > 0:
+        lang_keys = torch.cat([momentum_lang_keys, memory_bank.get()], dim=0)
+
+    # i2t: vision queries vs momentum language keys (+ queue negatives).
+    logits_i2t = vision_proj @ lang_keys.T * scale
     nce_loss_i2t = F.cross_entropy(logits_i2t, labels)
-    nce_loss_t2i = F.cross_entropy(logits_t2i, labels)
-    nce_loss = (nce_loss_i2t + nce_loss_t2i) / 2
     nce_acc_i2t = (logits_i2t.argmax(dim=1) == labels).float().mean()
+
+    # t2i: language queries vs in-batch vision keys (symmetric CE).
+    logits_t2i = language_proj @ vision_proj.T * scale
+    nce_loss_t2i = F.cross_entropy(logits_t2i, labels)
     nce_acc_t2i = (logits_t2i.argmax(dim=1) == labels).float().mean()
+    nce_loss = (nce_loss_i2t + nce_loss_t2i) / 2
 
     # ---- Variance regularization (pre-normalized projections) ----
     vision_raw = outputs['vision_proj_raw'].float()

@@ -22,6 +22,7 @@ training:
   global_crop_size: 224
   local_crop_size: 96
   max_grad_norm: 2.0  # student-student contrastive (was 3.0, then 1.0)
+  memory_bank_size: 65536  # MoCo-style language key queue for InfoNCE negatives
 
 loss:
   alpha: 0.5   # MSE weight (reduced vs NCE to stabilize predictor path)

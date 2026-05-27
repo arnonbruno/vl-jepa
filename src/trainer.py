@@ -22,6 +22,7 @@ from pathlib import Path
 from .model import (
     LOGIT_SCALE_MAX,
     LOGIT_SCALE_MIN,
+    MemoryBank,
     VL_JEPA,
     compute_jepa_loss,
     make_multicrop_views,
@@ -38,6 +39,7 @@ _CHECKPOINT_STATE_KEYS = frozenset({
     'optimizer_state_dict',
     'scheduler_state_dict',
     'scaler_state_dict',
+    'memory_bank_state_dict',
     'step',
     'running_loss',
     'running_steps',
@@ -264,11 +266,17 @@ class VL_JEPA_Trainer:
         local_crop_size: int = 96,
         eval_mask_seed: int = 17_029,
         max_grad_norm: float = 2.0,
+        memory_bank_size: int = 65536,
         check_finite: bool = True,
         nan_diagnostics_dir: Optional[Union[str, Path]] = None,
     ):
         self.model = model.to(device)
         self.device = device
+        self.memory_bank = MemoryBank(
+            memory_bank_size,
+            model.hidden_dim,
+            device,
+        )
         self.check_finite = check_finite
         self.nan_diagnostics_dir = (
             Path(nan_diagnostics_dir) if nan_diagnostics_dir else None
@@ -629,7 +637,9 @@ class VL_JEPA_Trainer:
                         **skip_kw,
                     )
 
-            loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta, self.gamma)
+            loss_dict = compute_jepa_loss(
+                outputs, self.alpha, self.beta, self.gamma, memory_bank=self.memory_bank,
+            )
             loss = loss_dict['total_loss']
 
         if not self._loss_is_finite(loss, loss_dict):
@@ -649,6 +659,10 @@ class VL_JEPA_Trainer:
                 grad_norm=grad_norm,
                 **skip_kw,
             )
+
+        queue_keys = outputs.get('target_language_proj')
+        if queue_keys is not None:
+            self.memory_bank.enqueue(queue_keys)
 
         if self.check_finite:
             bad_weight = self._first_nonfinite_weight()
@@ -702,7 +716,9 @@ class VL_JEPA_Trainer:
             outputs = self._forward_model(
                 images, input_ids, attention_mask, training=False, mask_seed=mask_seed,
             )
-            loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta, self.gamma)
+            loss_dict = compute_jepa_loss(
+                outputs, self.alpha, self.beta, self.gamma, memory_bank=self.memory_bank,
+            )
             if not self._loss_is_finite(loss_dict['total_loss'], loss_dict):
                 return {
                     'mse_loss': float('nan'),
@@ -820,6 +836,7 @@ class VL_JEPA_Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
+            'memory_bank_state_dict': self.memory_bank.state_dict(),
             'step': self._step,
             'running_loss': self.running_loss,
             'running_steps': self.running_steps,
@@ -862,6 +879,8 @@ class VL_JEPA_Trainer:
             )
 
         self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        if 'memory_bank_state_dict' in checkpoint:
+            self.memory_bank.load_state_dict(checkpoint['memory_bank_state_dict'])
         if load_optimizer and 'optimizer_state_dict' in checkpoint:
             try:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
