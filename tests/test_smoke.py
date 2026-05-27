@@ -197,7 +197,7 @@ def test_multicrop_forward_is_finite():
 
 
 def test_target_teacher_modes_are_restored_after_forward():
-    """Forward should not leave EMA teacher modules stuck in eval mode."""
+    """Forward should not leave EMA vision teacher stuck in eval mode."""
     print("Testing teacher mode restoration...")
     model = _make_model()
     model.train()
@@ -206,12 +206,10 @@ def test_target_teacher_modes_are_restored_after_forward():
 
     _ = model(images, input_ids)
     assert model.target_encoder.training
-    assert model.target_language_encoder.training
 
     model.eval()
     _ = model(images, input_ids)
     assert not model.target_encoder.training
-    assert not model.target_language_encoder.training
     print("  ✓ Teacher module training/eval modes are restored")
 
 
@@ -257,7 +255,7 @@ def test_memory_bank_expands_contrastive_negatives():
     outputs = model(images, input_ids)
 
     for _ in range(4):
-        bank.enqueue(outputs['target_language_proj'])
+        bank.enqueue(outputs['language_proj'].detach())
 
     loss_with_bank = compute_jepa_loss(outputs, alpha=0.0, beta=1.0, memory_bank=bank)
     loss_batch_only = compute_jepa_loss(outputs, alpha=0.0, beta=1.0, memory_bank=None)
@@ -308,9 +306,9 @@ def test_siglip_contrastive_loss_is_finite():
 
 
 def test_contrastive_projection_gradients_flow():
-    """InfoNCE must update both projection heads."""
-    print("Testing contrastive projection gradients...")
-    model = _make_model()
+    """SigLIP must update both projection heads."""
+    print("Testing SigLIP projection gradients...")
+    model = _make_model(contrastive_loss='siglip')
     images = torch.randn(4, 3, IMAGE_SIZE, IMAGE_SIZE)
     input_ids = torch.randint(0, VOCAB_SIZE, (4, SEQ_LEN))
 
@@ -322,7 +320,7 @@ def test_contrastive_projection_gradients_flow():
     language_grad = model.language_proj.weight.grad
     assert vision_grad is not None and vision_grad.abs().sum() > 0
     assert language_grad is not None and language_grad.abs().sum() > 0
-    print("  ✓ vision_proj and language_proj receive InfoNCE gradients")
+    print("  ✓ vision_proj and language_proj receive SigLIP gradients")
 
 
 def test_gradient_clipping_caps_norm():
@@ -362,14 +360,10 @@ def test_momentum_update():
     ctx_state = next(model.context_encoder.parameters())
     tgt_state = next(model.target_encoder.parameters())
     assert torch.allclose(ctx_state, tgt_state), "Target should match context at init"
-    lang_state = next(model.language_encoder.parameters())
-    tgt_lang_state = next(model.target_language_encoder.parameters())
-    assert torch.allclose(lang_state, tgt_lang_state), "Target language should match at init"
 
     # Modify context
     with torch.no_grad():
         ctx_state.add_(torch.randn_like(ctx_state) * 0.1)
-        lang_state.add_(torch.randn_like(lang_state) * 0.1)
 
     # Momentum update (tau=0.9 for test)
     model.momentum_tau = 0.9
@@ -378,8 +372,6 @@ def test_momentum_update():
     # After update: target should have moved partially
     new_tgt = next(model.target_encoder.parameters())
     assert not torch.allclose(ctx_state, new_tgt), "Target should differ from context after update"
-    new_tgt_lang = next(model.target_language_encoder.parameters())
-    assert not torch.allclose(lang_state, new_tgt_lang), "Target language should EMA-update"
     print(f"  ✓ Momentum update works (tau={model.momentum_tau})")
 
 

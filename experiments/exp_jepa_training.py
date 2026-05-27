@@ -124,6 +124,12 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
     parser.add_argument('--phase-training', action=argparse.BooleanOptionalAction,
                         default=training.get('phase_training', False),
                         help='Use phased alpha/beta/gamma schedule')
+    parser.add_argument('--gradient-checkpointing', action=argparse.BooleanOptionalAction,
+                        default=training.get('gradient_checkpointing', False),
+                        help='Enable gradient checkpointing for supported backbones')
+    parser.add_argument('--unfreeze-after-epoch', type=int,
+                        default=training.get('unfreeze_after_epoch'),
+                        help='Epoch to unfreeze last vision blocks (default: never)')
     parser.add_argument('--hidden-dim', type=int, default=model.get('hidden_dim', 768),
                         help='Hidden dimension')
     parser.add_argument('--patch-size', type=int, default=model.get('patch_size', 16),
@@ -265,6 +271,8 @@ def main() -> None:
             global_crop_size=args.global_crop_size,
             local_crop_size=args.local_crop_size,
             phase_training=args.phase_training,
+            gradient_checkpointing=args.gradient_checkpointing,
+            unfreeze_after_epoch=args.unfreeze_after_epoch,
             alpha=args.alpha,
             beta=args.beta,
             gamma=args.gamma,
@@ -313,6 +321,9 @@ def main() -> None:
         projection_dim=model_cfg.get("projection_dim", 256),
         contrastive_loss=model_cfg.get("contrastive_loss", "infonce"),
     )
+    if train_cfg.get("gradient_checkpointing", False):
+        model.set_gradient_checkpointing(True)
+        print("  Gradient checkpointing: enabled")
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel: {total_params/1e6:.1f}M params ({trainable_params/1e6:.1f}M trainable)")
@@ -368,6 +379,9 @@ def main() -> None:
         gamma=loss_cfg.get("gamma", 0.1),
         max_grad_norm=train_cfg.get("max_grad_norm", 1.0),
         memory_bank_size=train_cfg.get("memory_bank_size", 65536),
+        unfreeze_after_epoch=train_cfg.get("unfreeze_after_epoch"),
+        unfreeze_vision_blocks=train_cfg.get("unfreeze_vision_blocks", 2),
+        encoder_unfreeze_lr=train_cfg.get("encoder_unfreeze_lr", 1e-5),
         use_multi_crop=train_cfg.get("use_multi_crop", False),
         global_crop_size=train_cfg.get("global_crop_size", model_cfg["image_size"]),
         local_crop_size=train_cfg.get("local_crop_size", 96),
@@ -499,11 +513,17 @@ def main() -> None:
                     avg_loss = sum(window) / len(window)
                     lr = metrics['lr']
                     gn = metrics['grad_norm']
+                    vram_msg = ""
+                    if device.type == 'cuda':
+                        vram_msg = (
+                            f" | VRAM alloc/res: {metrics.get('vram_alloc_gb', 0.0):.2f}/"
+                            f"{metrics.get('vram_reserved_gb', 0.0):.2f}GB"
+                        )
                     print(f"  E{epoch+1:2d} B{batch_idx+1:5d}/{train_batches} | "
                           f"Loss: {avg_loss:.4f} | MSE: {metrics['mse_loss']:.4f} | "
                           f"NCE: {metrics['nce_loss']:.4f} | "
                           f"NCE@1: {metrics['nce_acc']:.2%} | GN: {gn:.2f} | LR: {lr:.2e}",
-                          end='\r')
+                          end=f"{vram_msg}\r")
 
             n_train = len(epoch_metrics['total_loss'])
             if n_train == 0:

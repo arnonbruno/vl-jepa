@@ -53,8 +53,6 @@ _OUTPUT_FINITE_KEYS = (
     'target_patches',
     'vision_proj',
     'language_proj',
-    'target_vision_proj',
-    'target_language_proj',
 )
 
 
@@ -326,6 +324,9 @@ class VL_JEPA_Trainer:
         eval_mask_seed: int = 17_029,
         max_grad_norm: float = 2.0,
         memory_bank_size: int = 65536,
+        unfreeze_after_epoch: Optional[int] = None,
+        unfreeze_vision_blocks: int = 2,
+        encoder_unfreeze_lr: float = 1e-5,
         check_finite: bool = True,
         nan_diagnostics_dir: Optional[Union[str, Path]] = None,
     ):
@@ -350,6 +351,10 @@ class VL_JEPA_Trainer:
         self.local_crop_size = local_crop_size
         self.eval_mask_seed = eval_mask_seed
         self.max_grad_norm = max_grad_norm
+        self.unfreeze_after_epoch = unfreeze_after_epoch
+        self.unfreeze_vision_blocks = max(1, int(unfreeze_vision_blocks))
+        self.encoder_unfreeze_lr = float(encoder_unfreeze_lr)
+        self._vision_unfrozen = False
 
         # EMA cosine schedule capped so tau reaches 1.0 in early training (~epoch 4),
         # not stretched across the full LR cosine horizon (100K+ steps).
@@ -409,6 +414,36 @@ class VL_JEPA_Trainer:
         # Loss tracking
         self.running_loss = 0.0
         self.running_steps = 0
+
+    def _maybe_unfreeze_vision(self, epoch: Optional[int]) -> None:
+        if self._vision_unfrozen:
+            return
+        if self.unfreeze_after_epoch is None or epoch is None:
+            return
+        if epoch < int(self.unfreeze_after_epoch):
+            return
+
+        toggled = self.model.unfreeze_vision_last_blocks(self.unfreeze_vision_blocks)
+        if toggled <= 0:
+            self._vision_unfrozen = True
+            return
+
+        existing = {id(p) for group in self.optimizer.param_groups for p in group['params']}
+        new_params = [
+            p for p in self.model.parameters()
+            if p.requires_grad and id(p) not in existing
+        ]
+        if new_params:
+            self.optimizer.add_param_group({
+                'params': new_params,
+                'weight_decay': self.optimizer.param_groups[0].get('weight_decay', 0.0),
+                'lr': self.encoder_unfreeze_lr,
+            })
+            print(
+                f"  -> Unfroze last {self.unfreeze_vision_blocks} vision blocks at epoch {epoch} "
+                f"({len(new_params)} tensors, lr={self.encoder_unfreeze_lr:.2e})"
+            )
+        self._vision_unfrozen = True
 
     @torch.no_grad()
     def _clamp_stability_params(self) -> None:
@@ -652,6 +687,7 @@ class VL_JEPA_Trainer:
     ) -> Dict[str, float]:
         """Single training step with proper JEPA loss."""
         self.model.train()
+        self._maybe_unfreeze_vision(epoch)
 
         images = images.to(self.device)
         input_ids = input_ids.to(self.device)
@@ -753,6 +789,9 @@ class VL_JEPA_Trainer:
             'skipped': False,
             'weights_corrupted': False,
         }
+        if self.device.type == 'cuda':
+            metrics['vram_alloc_gb'] = torch.cuda.memory_allocated(self.device) / 1e9
+            metrics['vram_reserved_gb'] = torch.cuda.memory_reserved(self.device) / 1e9
 
         return metrics
 
@@ -817,7 +856,9 @@ class VL_JEPA_Trainer:
                 break
 
             images, input_ids, attention_mask = _unpack_batch(batch)
-            metrics = self.train_step(images, input_ids, attention_mask)
+            metrics = self.train_step(
+                images, input_ids, attention_mask, batch_index=batch_idx, epoch=epoch + 1,
+            )
 
             if metrics.get('skipped'):
                 skipped += 1

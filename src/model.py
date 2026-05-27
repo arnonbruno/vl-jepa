@@ -18,6 +18,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 try:
     import timm
@@ -32,6 +33,14 @@ except ImportError:  # pragma: no cover - dataset already depends on transformer
 
 LOGIT_SCALE_MIN = math.log(1.0 / 100.0)
 LOGIT_SCALE_MAX = math.log(100.0)
+
+
+def _checkpoint_module(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Compatibility shim for PyTorch checkpoint(use_reentrant=...)."""
+    try:
+        return checkpoint(module, x, use_reentrant=False)
+    except TypeError:  # pragma: no cover - older PyTorch fallback
+        return checkpoint(module, x)
 
 
 # ---------------------------------------------------------------------------
@@ -247,11 +256,18 @@ def apply_bert_token_mask(
 class VisionEncoder(nn.Module):
     """Vision encoder — processes (possibly masked) images into patch embeddings."""
 
-    def __init__(self, hidden_dim: int = 768, patch_size: int = 16, image_size: int = 224):
+    def __init__(
+        self,
+        hidden_dim: int = 768,
+        patch_size: int = 16,
+        image_size: int = 224,
+        gradient_checkpointing: bool = False,
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.patch_size = patch_size
         self.image_size = image_size
+        self.gradient_checkpointing = bool(gradient_checkpointing)
 
         self.grid_size = image_size // patch_size
         self.num_patches = self.grid_size ** 2
@@ -303,6 +319,9 @@ class VisionEncoder(nn.Module):
                 continue
             nn.init.xavier_uniform_(p)
 
+    def set_gradient_checkpointing(self, enable: bool = True) -> None:
+        self.gradient_checkpointing = bool(enable)
+
     def forward(self, x: torch.Tensor,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -347,7 +366,13 @@ class VisionEncoder(nn.Module):
         x = x + self._pos_embed_for_grid(grid_h, grid_w)
 
         # Transformer
-        x = self.transformer(x)
+        if self.gradient_checkpointing and self.training:
+            for layer in self.transformer.layers:
+                x = _checkpoint_module(layer, x)
+            if self.transformer.norm is not None:
+                x = self.transformer.norm(x)
+        else:
+            x = self.transformer(x)
         x = self.layer_norm(x)
         return x
 
@@ -361,6 +386,7 @@ class TimmVisionEncoder(nn.Module):
         *,
         image_size: int = 224,
         freeze: bool = True,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         if timm is None:
@@ -386,25 +412,65 @@ class TimmVisionEncoder(nn.Module):
         self.grid_size = image_size // self.patch_size
         self.num_patches = self.grid_size ** 2
 
+        # Learnable mask token used to replace masked patch tokens.
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
+        nn.init.normal_(self.mask_token, std=0.02)
+        self.set_gradient_checkpointing(gradient_checkpointing)
+
         if freeze:
-            for p in self.parameters():
+            for p in self.backbone.parameters():
                 p.requires_grad = False
+
+    def set_gradient_checkpointing(self, enable: bool = True) -> None:
+        if hasattr(self.backbone, "set_grad_checkpointing"):
+            self.backbone.set_grad_checkpointing(enable)
+        elif hasattr(self.backbone, "grad_checkpointing"):
+            self.backbone.grad_checkpointing = bool(enable)
 
     def forward(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # timm ViTs do not expose the repo's learned mask token path; masks are
-        # intentionally ignored for the frozen-pretrained baseline.
-        del mask
-        feats = self.backbone.forward_features(x)
-        if isinstance(feats, dict):
-            feats = feats.get("x", feats.get("last_hidden_state"))
-        if not isinstance(feats, torch.Tensor) or feats.dim() != 3:
+        feats = self.backbone.patch_embed(x)
+        if not isinstance(feats, torch.Tensor):
             raise ValueError(
-                f"{self.model_name} must return (B, N+1, D) features, got {type(feats)}"
+                f"{self.model_name} patch embedding must return a tensor, got {type(feats)}"
             )
+
+        if feats.dim() == 4:
+            bsz, grid_h, grid_w, channels = feats.shape
+            num_tokens = grid_h * grid_w
+            flat_feats = feats.view(bsz, num_tokens, channels)
+        elif feats.dim() == 3:
+            bsz, num_tokens, channels = feats.shape
+            flat_feats = feats
+            grid_h = grid_w = int(math.sqrt(num_tokens))
+        else:
+            raise ValueError(
+                f"{self.model_name} patch embedding returned unsupported shape {tuple(feats.shape)}"
+            )
+
+        if mask is not None:
+            if mask.shape != (bsz, num_tokens):
+                raise ValueError(f"Expected mask shape {(bsz, num_tokens)}, got {tuple(mask.shape)}")
+            masked = self.mask_token.to(dtype=flat_feats.dtype).expand(bsz, num_tokens, -1)
+            flat_feats = torch.where(mask.unsqueeze(-1), masked, flat_feats)
+
+        feats = (
+            flat_feats.view(bsz, grid_h, grid_w, channels)
+            if feats.dim() == 4
+            else flat_feats
+        )
+        feats = self.backbone._pos_embed(feats)
+        feats = self.backbone.patch_drop(feats)
+        feats = self.backbone.norm_pre(feats)
+        if getattr(self.backbone, "grad_checkpointing", False) and self.training:
+            for block in self.backbone.blocks:
+                feats = _checkpoint_module(block, feats)
+        else:
+            feats = self.backbone.blocks(feats)
+        feats = self.backbone.norm(feats)
         return feats
 
 
@@ -490,6 +556,12 @@ class HFLanguageEncoder(nn.Module):
             for p in self.parameters():
                 p.requires_grad = False
 
+    def set_gradient_checkpointing(self, enable: bool = True) -> None:
+        if enable and hasattr(self.bert, "gradient_checkpointing_enable"):
+            self.bert.gradient_checkpointing_enable()
+        if not enable and hasattr(self.bert, "gradient_checkpointing_disable"):
+            self.bert.gradient_checkpointing_disable()
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -510,9 +582,15 @@ class Predictor(nn.Module):
     predicts the corresponding target encoder output for masked positions.
     """
 
-    def __init__(self, hidden_dim: int = 768, num_layers: int = 6):
+    def __init__(
+        self,
+        hidden_dim: int = 768,
+        num_layers: int = 6,
+        gradient_checkpointing: bool = False,
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.gradient_checkpointing = bool(gradient_checkpointing)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
@@ -532,6 +610,9 @@ class Predictor(nn.Module):
                 continue
             nn.init.xavier_uniform_(p)
 
+    def set_gradient_checkpointing(self, enable: bool = True) -> None:
+        self.gradient_checkpointing = bool(enable)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -539,7 +620,13 @@ class Predictor(nn.Module):
         Returns:
             (B, N+1, D) predicted target embeddings
         """
-        x = self.transformer(x)
+        if self.gradient_checkpointing and self.training:
+            for layer in self.transformer.layers:
+                x = _checkpoint_module(layer, x)
+            if self.transformer.norm is not None:
+                x = self.transformer.norm(x)
+        else:
+            x = self.transformer(x)
         x = self.layer_norm(x)
         return x
 
@@ -593,7 +680,8 @@ class VL_JEPA(nn.Module):
                  text_backbone: Optional[str] = "custom",
                  freeze_encoders: bool = True,
                  projection_dim: int = 256,
-                 contrastive_loss: str = "infonce"):
+                 contrastive_loss: str = "infonce",
+                 gradient_checkpointing: bool = False):
         super().__init__()
 
         self.mask_ratio = mask_ratio
@@ -607,12 +695,18 @@ class VL_JEPA(nn.Module):
 
         # Context encoder (student)
         if self.vision_backbone == "custom":
-            self.context_encoder = VisionEncoder(hidden_dim, patch_size, image_size)
+            self.context_encoder = VisionEncoder(
+                hidden_dim,
+                patch_size,
+                image_size,
+                gradient_checkpointing=gradient_checkpointing,
+            )
         else:
             self.context_encoder = TimmVisionEncoder(
                 self.vision_backbone,
                 image_size=image_size,
                 freeze=freeze_encoders,
+                gradient_checkpointing=gradient_checkpointing,
             )
         self.hidden_dim = self.context_encoder.hidden_dim
 
@@ -623,7 +717,11 @@ class VL_JEPA(nn.Module):
             p.requires_grad = False
 
         # Predictor
-        self.predictor = Predictor(self.hidden_dim, num_layers=predictor_layers)
+        self.predictor = Predictor(
+            self.hidden_dim,
+            num_layers=predictor_layers,
+            gradient_checkpointing=gradient_checkpointing,
+        )
 
         # Language encoder
         if self.text_backbone == "custom":
@@ -653,20 +751,6 @@ class VL_JEPA(nn.Module):
 
         self._init_weights()
 
-        # EMA teachers for language and projection heads stabilize cross-modal NCE.
-        self.target_language_encoder = copy.deepcopy(self.language_encoder)
-        self.target_vision_proj = copy.deepcopy(self.vision_proj)
-        self.target_language_proj = copy.deepcopy(self.language_proj)
-        self.target_vision_pred_head = copy.deepcopy(self.vision_pred_head)
-        for module in (
-            self.target_language_encoder,
-            self.target_vision_proj,
-            self.target_language_proj,
-            self.target_vision_pred_head,
-        ):
-            for p in module.parameters():
-                p.requires_grad = False
-
     def _init_weights(self):
         # projection heads with smaller init
         nn.init.xavier_uniform_(self.vision_proj.weight, gain=0.1)
@@ -679,16 +763,58 @@ class VL_JEPA(nn.Module):
         tau = self.momentum_tau
         pairs = (
             (self.context_encoder, self.target_encoder),
-            (self.language_encoder, self.target_language_encoder),
-            (self.vision_proj, self.target_vision_proj),
-            (self.language_proj, self.target_language_proj),
-            (self.vision_pred_head, self.target_vision_pred_head),
         )
         for student, teacher in pairs:
             for student_p, teacher_p in zip(student.parameters(), teacher.parameters()):
                 teacher_p.copy_(
                     tau * teacher_p.detach() + (1 - tau) * student_p.detach(),
                 )
+
+    def set_gradient_checkpointing(self, enable: bool = True) -> None:
+        for module in (
+            self.context_encoder,
+            self.target_encoder,
+            self.language_encoder,
+            self.predictor,
+        ):
+            setter = getattr(module, "set_gradient_checkpointing", None)
+            if callable(setter):
+                setter(enable)
+
+    def unfreeze_vision_last_blocks(self, num_blocks: int = 2) -> int:
+        blocks = None
+        tail_modules = []
+        if hasattr(self.context_encoder, "backbone"):
+            blocks = getattr(self.context_encoder.backbone, "blocks", None)
+            norm = getattr(self.context_encoder.backbone, "norm", None)
+            if norm is not None:
+                tail_modules.append(norm)
+        elif hasattr(self.context_encoder, "transformer"):
+            blocks = getattr(self.context_encoder.transformer, "layers", None)
+            norm = getattr(self.context_encoder, "layer_norm", None)
+            if norm is not None:
+                tail_modules.append(norm)
+
+        if blocks is None:
+            return 0
+
+        blocks = list(blocks)
+        if not blocks:
+            return 0
+        num_blocks = max(1, min(len(blocks), int(num_blocks)))
+        modules = blocks[-num_blocks:] + tail_modules
+
+        toggled = 0
+        for module in modules:
+            for param in module.parameters():
+                if not param.requires_grad:
+                    param.requires_grad = True
+                    toggled += 1
+        mask_token = getattr(self.context_encoder, "mask_token", None)
+        if isinstance(mask_token, torch.nn.Parameter) and not mask_token.requires_grad:
+            mask_token.requires_grad = True
+            toggled += 1
+        return toggled
 
     def forward(
         self,
@@ -737,16 +863,8 @@ class VL_JEPA(nn.Module):
         context_emb = self.context_encoder(context_images, patch_mask)  # (B, N+1, D)
 
         # ---- 2. Target encoders (full local target for MSE, global target for NCE) ----
-        teacher_modules = (
-            self.target_encoder,
-            self.target_language_encoder,
-            self.target_vision_proj,
-            self.target_language_proj,
-            self.target_vision_pred_head,
-        )
-        with torch.no_grad(), _temporarily_eval(*teacher_modules):
+        with torch.no_grad(), _temporarily_eval(self.target_encoder):
             target_emb = self.target_encoder(context_images, mask=None)  # (B, N+1, D)
-            target_global_emb = self.target_encoder(target_images, mask=None)
 
         # ---- 3. Global unmasked student view for contrastive alignment ----
         global_student_emb = self.context_encoder(target_images, mask=None)
@@ -755,7 +873,6 @@ class VL_JEPA(nn.Module):
         predicted = self.predictor(context_emb)  # (B, N+1, D)
 
         # ---- 5. Language encoding ----
-        clean_input_ids = input_ids
         if token_mask is None and self.training and self.text_mask_ratio > 0:
             token_mask = random_token_mask(
                 B, input_ids.size(1), mask_ratio=self.text_mask_ratio, device=device,
@@ -764,25 +881,24 @@ class VL_JEPA(nn.Module):
             input_ids = apply_bert_token_mask(input_ids, token_mask)
 
         language_emb = self.language_encoder(input_ids, attention_mask)  # (B, S, D)
-        with torch.no_grad(), _temporarily_eval(*teacher_modules):
-            target_language_emb = self.target_language_encoder(clean_input_ids, attention_mask)
 
         # ---- 6. Joint projections ----
         # Use the full-image student CLS for image-text alignment; the local
         # masked context stays reserved for JEPA patch prediction.
         vision_cls = global_student_emb[:, 0, :]   # (B, D)
-        language_cls = language_emb[:, 0, :]        # (B, D) — use [CLS] equivalent (first token)
+        if attention_mask is not None:
+            mask_float = attention_mask.unsqueeze(-1).float()
+            language_cls = (language_emb * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1.0)
+        else:
+            language_cls = language_emb.mean(dim=1)
 
         vision_proj_raw = self.vision_proj.raw(vision_cls)
         language_proj_raw = self.language_proj.raw(language_cls)
         vision_proj = F.normalize(vision_proj_raw, p=2, dim=-1, eps=1e-6)
         language_proj = F.normalize(language_proj_raw, p=2, dim=-1, eps=1e-6)
-        with torch.no_grad(), _temporarily_eval(*teacher_modules):
-            target_vision_proj = self.target_vision_proj(target_global_emb[:, 0, :])
-            target_language_proj = self.target_language_proj(target_language_emb[:, 0, :])
-            target_patches = self.target_vision_pred_head(target_emb).detach()
+        target_patches = target_emb.detach()
 
-        # Predictor output mapped to the EMA teacher-head space.
+        # Predictor output mapped to JEPA prediction space.
         predicted_patches = self.vision_pred_head(predicted)
 
         return {
@@ -795,8 +911,6 @@ class VL_JEPA(nn.Module):
             'language_proj': language_proj,            # (B, D), normalized
             'vision_proj_raw': vision_proj_raw,       # (B, D), pre-normalize (for variance loss)
             'language_proj_raw': language_proj_raw,
-            'target_vision_proj': target_vision_proj,  # (B, D), normalized + detached
-            'target_language_proj': target_language_proj,
             'logit_scale': self.logit_scale,           # scalar
             'logit_bias': self.logit_bias,              # scalar
             'contrastive_loss_type': self.contrastive_loss,
@@ -814,7 +928,11 @@ class VL_JEPA(nn.Module):
         language_emb = self.language_encoder(input_ids, attention_mask)
 
         vision_cls = vision_emb[:, 0, :]
-        language_cls = language_emb[:, 0, :]
+        if attention_mask is not None:
+            mask_float = attention_mask.unsqueeze(-1).float()
+            language_cls = (language_emb * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1.0)
+        else:
+            language_cls = language_emb.mean(dim=1)
 
         vision_proj = self.vision_proj(vision_cls)
         language_proj = self.language_proj(language_cls)

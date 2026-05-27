@@ -89,6 +89,8 @@ def overrides_from_cli(**kwargs: Any) -> Dict[str, Any]:
         "phase_training": (training, "phase_training"),
         "max_grad_norm": (training, "max_grad_norm"),
         "memory_bank_size": (training, "memory_bank_size"),
+        "gradient_checkpointing": (training, "gradient_checkpointing"),
+        "unfreeze_after_epoch": (training, "unfreeze_after_epoch"),
         "alpha": (loss, "alpha"),
         "beta": (loss, "beta"),
         "gamma": (loss, "gamma"),

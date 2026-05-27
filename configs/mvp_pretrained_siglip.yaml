@@ -15,7 +15,7 @@ model:
 
 training:
   epochs: 10
-  batch_size: 16
+  batch_size: 8
   learning_rate: 1.0e-4
   weight_decay: 0.05
   warmup_steps: 500
@@ -24,6 +24,10 @@ training:
   global_crop_size: 224
   local_crop_size: 96
   phase_training: true
+  gradient_checkpointing: true
+  unfreeze_after_epoch: 5
+  unfreeze_vision_blocks: 2
+  encoder_unfreeze_lr: 1.0e-5
   max_grad_norm: 1.0
   memory_bank_size: 0
 
@@ -35,7 +39,7 @@ loss:
 data:
   coco_root: ~/.cache/torch/hub/checkpoints
   image_size: 224
-  batch_size: 16
+  batch_size: 8
   num_workers: 4
   max_caption_length: 64
 
