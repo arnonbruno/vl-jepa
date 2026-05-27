@@ -1,40 +1,50 @@
 # VL-JEPA default training configuration
+# See README.md and INVESTIGATION.md for architecture context.
 
 model:
-  hidden_dim: 768
+  hidden_dim: 768          # ViT-Large / BERT-base scale (12-layer encoders)
   patch_size: 16
   image_size: 224
-  mask_ratio: 0.75
-  text_mask_ratio: 0.0
-  predictor_layers: 6
-  momentum_tau: 0.996
+  mask_ratio: 0.75         # I-JEPA block mask on context views
+  text_mask_ratio: 0.0     # 0 = no BERT-style token masking (captions are short)
+  predictor_layers: 6      # ViT-Small-scale predictor depth
+  momentum_tau: 0.996        # EMA start; cosine schedule → momentum_tau_end
 
 training:
   epochs: 15
   batch_size: 32
-  learning_rate: 1.0e-4
+  learning_rate: 1.0e-4    # Base LR (encoders); predictor=20×, projections=10× in trainer
   weight_decay: 0.05
   warmup_steps: 2000
-  max_steps: null  # auto: epochs * (samples // batch_size)
+  max_steps: null          # auto: epochs × train_batches
   momentum_tau_end: 1.0
   momentum_schedule_steps: 15000  # EMA τ cosine horizon (capped vs full max_steps)
   use_multi_crop: true
   global_crop_size: 224
   local_crop_size: 96
-  max_grad_norm: 2.0  # student-student contrastive (was 3.0, then 1.0)
-  memory_bank_size: 65536  # MoCo-style language key queue for InfoNCE negatives
+
+  # Gradient clipping (max_norm): student-student InfoNCE produces larger grads than
+  # MSE-only JEPA. 2.0 stabilizes contrastive updates without over-suppressing them.
+  # (was 1.0 — too tight; 3.0 — allowed occasional spikes)
+  max_grad_norm: 2.0
+
+  # MoCo-style FIFO queue of student language_proj keys for i2t InfoNCE negatives.
+  # With batch_size=32, in-batch negatives alone sit at ln(32)≈3.47 with no learning
+  # signal; 65536 keys approximates full-dataset negative diversity per step.
+  # Queue stores detached student projections (not EMA teacher — teacher is stale at τ=0.996).
+  memory_bank_size: 65536
 
 loss:
-  alpha: 0.5   # MSE weight (reduced vs NCE to stabilize predictor path)
-  beta: 0.5
-  gamma: 0.1   # VICReg-style variance regularization (prevents embedding collapse)
+  alpha: 0.5   # MSE (masked patch prediction)
+  beta: 0.5    # InfoNCE (vision ↔ language + queue)
+  gamma: 0.1   # VICReg-style variance reg (prevents projection collapse)
 
 data:
   coco_root: ~/.cache/torch/hub/checkpoints
   image_size: 224
   batch_size: 32
   num_workers: 4
-  max_caption_length: 64
+  max_caption_length: 64   # DistilBERT tokenizer max length
 
 output:
   output_dir: experiments

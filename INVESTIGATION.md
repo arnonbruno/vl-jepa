@@ -1,80 +1,148 @@
-# VL-JEPA Training Investigation - May 26, 2026
+# VL-JEPA Training Investigation
+
+**Last updated**: May 27, 2026 (architecture as of commit `8b6298d`)
+
+---
+
+## Executive summary
+
+Training on COCO 2017 was **stable** after fixing AMP/InfoNCE NaNs, but **contrastive learning did not improve** for many epochs: NCE stayed at `ln(batch_size) ≈ 3.47` and NCE@1 at ~3.12% (random for B=32). A sequence of targeted fixes (student NCE, context CLS, variance reg, projection LR, memory bank, student queue keys) addressed root causes. The current stack is documented in `README.md`; contrastive metrics remain an active tuning area.
+
+---
 
 ## Timeline
 
-1. **Initial problem:** Training crashed at batch ~1690 with NaN (exit code -15)
-2. **First fix:** Cursor-agent diagnosed InfoNCE running in FP16 under AMP → overflow. Fixed by running InfoNCE in FP32.
-3. **Result:** Training stable, passed batch 1690, completed epochs 1-10 without NaN.
-4. **New problem:** Model not learning contrastive objective despite stable training.
+### Phase 1 — NaN instability (resolved)
 
-## Symptoms
+1. Training crashed around batch ~1690 with NaN (exit -15).
+2. **Diagnosis**: InfoNCE computed in FP16 under AMP → softmax overflow.
+3. **Fix** (`93491ad`): Run InfoNCE in FP32; cap GradScaler growth; EMA schedule fixes (`c6caa1e`).
+4. **Result**: Training completes epochs without NaN; checkpoint validation added.
 
-### Training Behavior
-- MSE converged to near-zero by epoch 2 (reconstruction working)
-- NCE loss stuck at ~3.46 (near ln(32) ≈ 3.47 = random baseline)
-- NCE@1 accuracy stuck at 3.18-3.20% (random = 1/32 = 3.125%)
-- No improvement over 10 epochs (20% of training)
+### Phase 2 — Contrastive not learning (in-batch only)
 
-### Metrics Summary
+**Symptoms** (10 epochs, B=32, COCO):
 
-| Epoch | Train Loss | Val Loss | Train NCE | Val NCE | Val NCE@1 | Train MSE |
-|-------|-----------|----------|-----------|---------|-----------|-----------|
-| 1 | 3.458 | 3.458 | 3.457 | 3.457 | 3.17% | 0.00225 |
-| 2 | 3.470 | 3.460 | 3.470 | 3.460 | 3.18% | 2.0e-05 |
-| 3 | 3.469 | 3.460 | 3.469 | 3.460 | 3.18% | 4.7e-06 |
-| 5 | 3.467 | 3.457 | 3.467 | 3.457 | 3.19% | 3.7e-07 |
-| 10 | 3.467 | 3.457 | 3.467 | 3.457 | 3.20% | 2.8e-07 |
+| Epoch | Train NCE | Val NCE | Val NCE@1 | Train MSE |
+|-------|-----------|---------|-----------|-----------|
+| 1 | 3.457 | 3.457 | 3.17% | 0.002 |
+| 10 | 3.467 | 3.457 | 3.20% | ~0 |
 
-**Key observations:**
-- MSE dropped 4 orders of magnitude (learning reconstruction)
-- NCE barely moved (not learning contrastive)
-- Loss actually increased slightly from epoch 1 to epoch 2
-- Gradient norm very low (0.03-0.05) by epoch 10
+- MSE dropped 4+ orders of magnitude (reconstruction works).
+- NCE flat at random baseline; gradient norms fell to ~0.03–0.05 by epoch 10.
 
-## Possible Causes
+**Hypotheses tested**:
 
-1. **Teacher-student collapse:** EMA teacher might be too similar to student, providing no learning signal
-2. **Negative sampling issue:** Contrastive negatives not informative
-3. **Temperature/scale problem:** Logit scale might be wrong
-4. **Embedding collapse:** Vision and language embeddings might be collapsing to same values
-5. **Teacher momentum too high:** τ = 0.997 might prevent teacher from diverging enough
-6. **Multi-crop configuration issue:** Possible mismatch in how crops are processed
+| Hypothesis | Finding |
+|------------|---------|
+| Teacher–student too similar | Student–teacher InfoNCE had weak/no useful gradient |
+| Wrong vision token for NCE | Predictor CLS is wrong; **context encoder CLS** is correct |
+| Embedding collapse | **Variance regularization** (`γ=0.1`) helps without killing NCE |
+| Projection heads too slow | **10× LR** on `vision_proj` / `language_proj` |
+| Too few negatives (B=32) | **65K MoCo queue** needed for i2t |
 
-## Files to Investigate
+### Phase 3 — Memory bank fixes
 
-- `src/model.py` — InfoNCE implementation, temperature, negative sampling
-- `src/trainer.py` — EMA update, teacher momentum schedule
-- `configs/default.yaml` — temperature, momentum, multi-crop settings
-- `experiments/exp_jepa_training.py` — training loop, loss weighting
+| Commit | Change | Outcome |
+|--------|--------|---------|
+| `5243a7d` | Student (not teacher) projections in InfoNCE | Required for gradient flow |
+| `adc126b` | Context CLS for vision queries | Aligns contrastive with encoder representation |
+| `319dd72` | VICReg variance loss | Anti-collapse |
+| `bae0884` | Projection LR 10× | Heads adapt faster |
+| `08927de` | 65,536 FIFO language key queue | Many more i2t negatives |
+| `08927de` (initial) | Enqueued **teacher** `target_language_proj` | **Failed**: stale τ=0.996 teacher → nearly identical queue entries → NCE **rose** toward ~7.27 |
+| **`8b6298d`** | Enqueue **student** `language_proj` | Queue diversity restored; meaningful negatives |
 
-## Relevant Code Points
+**Root cause of stale-teacher queue** (`8b6298d`):
 
-### From previous cursor-agent session (commit 93491ad):
-- InfoNCE now runs in FP32 (was FP16 causing NaN)
-- NaN diagnostics added with `--nan-diagnostics-dir`
-- Pre/post forward checks for weight corruption
+```
+Previous: memory_bank.enqueue(target_language_proj)  # EMA, updates slowly
+Effect:   65K keys nearly identical → softmax saturated → NCE climbed (4.75 → 7.27)
 
-### Current config (from logs):
-- τ (EMA momentum): 0.997
-- Learning rate: 1e-4 (max)
-- Batch size: 32
-- Multi-crop: enabled (global + local crops)
+Fixed:    memory_bank.enqueue(language_proj)         # student, every step
+Effect:   Diverse negatives; i2t loss scale changes (not comparable to ln(32))
+```
 
-## What We Know Works
+---
 
-- Reconstruction (MSE) converges
-- Training is stable (no NaN after fix)
-- Checkpoints save correctly
-- GPU memory usage consistent (~6.8GB)
+## Current contrastive configuration
 
-## What We Need to Fix
+```yaml
+# configs/default.yaml (excerpt)
+loss:
+  alpha: 0.5
+  beta: 0.5
+  gamma: 0.1          # variance regularization
 
-The contrastive learning component is not receiving gradient signal or the objective itself is misconfigured. Need to investigate:
-1. Are teacher embeddings actually different from student?
-2. Are negatives being sampled correctly?
-3. Is temperature/scaling correct?
-4. Is the contrastive loss actually being backpropagated?
+training:
+  batch_size: 32
+  max_grad_norm: 2.0  # was 1.0, then 3.0; 2.0 best for student-student NCE
+  memory_bank_size: 65536
+```
 
-## Next Steps
+**InfoNCE details** (`src/model.py`):
 
-Spawn cursor-agent with this context to investigate the contrastive learning pipeline and propose fixes.
+- **i2t**: `vision_proj` (context CLS) vs `[batch language_proj ∥ queue]`
+- **t2i**: `language_proj` vs in-batch `vision_proj` only
+- Keys in queue: detached, L2-normalized **student** `language_proj`
+- Teacher projections (`target_*`) used only for **MSE patch targets**, not NCE
+
+---
+
+## Metrics interpretation (post memory bank)
+
+| Metric | Old (B=32 only) | New (B=32 + 65K queue) |
+|--------|-----------------|-------------------------|
+| Random NCE baseline | `ln(32) ≈ 3.47` | i2t: `ln(32 + N_fill) → ln(65568) ≈ 11.1` when full |
+| NCE@1 random | 1/32 = 3.125% | Still ~3.1% early on (hard task) |
+| What to watch | NCE@1, val loss | Downward val NCE trends, not absolute value vs 3.47 |
+
+**Example** (`experiments/exp_jepa_768d_50ep`, after `8b6298d`):
+
+- Best val loss: **1.92** (epoch 7)
+- Best val NCE in that run: **3.64** (epoch 7)
+- MSE → ~0 by epoch 2–3
+
+---
+
+## What works
+
+- I-JEPA reconstruction (MSE on masked patches)
+- Stable long training with FP32 NCE + GradScaler cap
+- Checkpoint save/resume including `memory_bank_state_dict`
+- COCO 2017 dataloaders with DistilBERT tokenization
+- Student queue memory bank (after `8b6298d`)
+
+## Open issues
+
+1. **NCE@1** still near random on validation in many runs — alignment needs more epochs / hyperparameter search.
+2. Some 50-epoch runs hit **non-finite batches** after epoch 5–6 (MSE spike → inf); investigate LR / MSE weight / AMP interaction.
+3. Multi-crop + memory bank increases compute; tune `alpha`/`beta` if MSE dominates.
+
+---
+
+## Files reference
+
+| File | Relevant logic |
+|------|----------------|
+| `src/model.py` | `compute_jepa_loss`, `MemoryBank`, `variance_loss` |
+| `src/trainer.py` | EMA schedule, param groups (10×/20× LR), `memory_bank.enqueue` |
+| `configs/default.yaml` | `memory_bank_size`, `max_grad_norm`, loss weights |
+| `experiments/exp_jepa_training.py` | CLI, COCO loaders, logging |
+
+---
+
+## Key commits (chronological)
+
+```
+c6caa1e  Fix NaN instability (AMP scaler, EMA schedule)
+93491ad  InfoNCE FP32 + NaN diagnostics
+5243a7d  Student embeddings for InfoNCE
+f88da89  Configurable grad clipping
+a712827  max_grad_norm = 2.0
+319dd72  Variance regularization
+adc126b  Context encoder CLS for contrastive
+bae0884  Projection head LR 10×
+08927de  MoCo memory bank (65K)
+8b6298d  Student projections in memory bank (fix stale teacher queue)
+```
