@@ -660,7 +660,7 @@ class VL_JEPA_Trainer:
                 **skip_kw,
             )
 
-        queue_keys = outputs.get('target_language_proj')
+        queue_keys = outputs.get('language_proj')
         if queue_keys is not None:
             self.memory_bank.enqueue(queue_keys)
 

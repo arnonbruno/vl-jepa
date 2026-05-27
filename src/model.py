@@ -808,7 +808,7 @@ def compute_jepa_loss(
     labels = torch.arange(batch_size, device=vision_proj.device)
 
     # MoCo-style keys: momentum language projections (batch) + FIFO queue.
-    momentum_lang_keys = outputs.get('target_language_proj', language_proj).float()
+    momentum_lang_keys = language_proj.float()
     lang_keys = momentum_lang_keys
     if memory_bank is not None and memory_bank.num_filled > 0:
         lang_keys = torch.cat([momentum_lang_keys, memory_bank.get()], dim=0)
