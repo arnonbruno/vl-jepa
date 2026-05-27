@@ -713,16 +713,9 @@ def compute_jepa_loss(
     logit_scale = outputs.get('logit_scale', torch.tensor(2.659, device=vision_proj.device))
     scale = logit_scale.float().clamp(LOGIT_SCALE_MIN, LOGIT_SCALE_MAX).exp()
 
-    target_language_proj = outputs.get('target_language_proj')
-    target_vision_proj = outputs.get('target_vision_proj')
-    if target_language_proj is None or target_vision_proj is None:
-        logits_i2t = vision_proj @ language_proj.T * scale
-        logits_t2i = logits_i2t.T
-    else:
-        tgt_lang = target_language_proj.detach().float()
-        tgt_vis = target_vision_proj.detach().float()
-        logits_i2t = vision_proj @ tgt_lang.T * scale
-        logits_t2i = language_proj @ tgt_vis.T * scale
+    # Student-to-student contrastive: both projections receive gradients.
+    logits_i2t = vision_proj @ language_proj.T * scale
+    logits_t2i = logits_i2t.T
     labels = torch.arange(batch_size, device=vision_proj.device)
 
     # Symmetric NCE (both directions)
