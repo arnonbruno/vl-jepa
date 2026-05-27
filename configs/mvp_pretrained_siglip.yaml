@@ -1,0 +1,45 @@
+model:
+  hidden_dim: 768
+  patch_size: 16
+  image_size: 224
+  mask_ratio: 0.75
+  text_mask_ratio: 0.0
+  predictor_layers: 4
+  momentum_tau: 0.996
+  vision_backbone: vit_base_patch16_224.mae
+  text_backbone: distilbert-base-uncased
+  freeze_encoders: true
+  projection_dim: 256
+  contrastive_loss: siglip
+  contrastive_on_global: true
+
+training:
+  epochs: 10
+  batch_size: 16
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  warmup_steps: 500
+  max_steps: null
+  use_multi_crop: true
+  global_crop_size: 224
+  local_crop_size: 96
+  phase_training: true
+  max_grad_norm: 1.0
+  memory_bank_size: 0
+
+loss:
+  alpha: 0.0
+  beta: 1.0
+  gamma: 0.01
+
+data:
+  coco_root: ~/.cache/torch/hub/checkpoints
+  image_size: 224
+  batch_size: 16
+  num_workers: 4
+  max_caption_length: 64
+
+output:
+  output_dir: experiments
+  log_interval: 10
+  checkpoint_interval: 5

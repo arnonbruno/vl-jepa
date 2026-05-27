@@ -12,6 +12,7 @@ import contextlib
 import json
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import time
 import math
@@ -244,6 +245,64 @@ def _unpack_batch(batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Ten
     return images, input_ids, attention_mask
 
 
+def loss_weights_for_epoch(epoch: int) -> Tuple[float, float, float]:
+    """Return phase-training weights for a 1-based epoch number."""
+    if epoch <= 5:
+        return 0.0, 1.0, 0.01
+    if epoch <= 20:
+        return 0.2, 0.8, 0.01
+    return 0.3, 0.7, 0.01
+
+
+@torch.no_grad()
+def retrieval_recall(
+    model: nn.Module,
+    loader: Iterator,
+    device: torch.device,
+    k_list: Tuple[int, ...] = (1, 5, 10),
+) -> Dict[str, float]:
+    """Compute full-loader image/text retrieval Recall@K."""
+    model.eval()
+    image_feats = []
+    text_feats = []
+
+    for batch in loader:
+        images, input_ids, attention_mask = _unpack_batch(batch)
+        images = images.to(device)
+        input_ids = input_ids.to(device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
+        vision_proj, language_proj = model.get_joint_embedding(
+            images,
+            input_ids,
+            attention_mask,
+        )
+        image_feats.append(vision_proj.float().cpu())
+        text_feats.append(language_proj.float().cpu())
+
+    if not image_feats:
+        raise ValueError("Cannot compute retrieval recall on an empty loader")
+
+    image_feats = F.normalize(torch.cat(image_feats, dim=0), dim=-1)
+    text_feats = F.normalize(torch.cat(text_feats, dim=0), dim=-1)
+    sim = image_feats @ text_feats.T
+    target = torch.arange(sim.size(0))
+
+    out: Dict[str, float] = {}
+    i2t_rank = sim.argsort(dim=1, descending=True)
+    t2i_rank = sim.T.argsort(dim=1, descending=True)
+    for k in k_list:
+        k_eff = min(k, sim.size(0))
+        out[f"i2t_r{k}"] = (
+            i2t_rank[:, :k_eff] == target[:, None]
+        ).any(dim=1).float().mean().item()
+        out[f"t2i_r{k}"] = (
+            t2i_rank[:, :k_eff] == target[:, None]
+        ).any(dim=1).float().mean().item()
+    return out
+
+
 class VL_JEPA_Trainer:
     """Trainer for VL-JEPA with proper JEPA loss."""
 
@@ -272,10 +331,11 @@ class VL_JEPA_Trainer:
     ):
         self.model = model.to(device)
         self.device = device
-        self.memory_bank = MemoryBank(
-            memory_bank_size,
-            model.hidden_dim,
-            device,
+        projection_dim = getattr(model, "projection_dim", model.hidden_dim)
+        self.memory_bank = (
+            MemoryBank(memory_bank_size, projection_dim, device)
+            if memory_bank_size and memory_bank_size > 0
+            else None
         )
         self.check_finite = check_finite
         self.nan_diagnostics_dir = (
@@ -316,7 +376,7 @@ class VL_JEPA_Trainer:
                 proj_params.append(p)
             elif 'bias' in name or 'LayerNorm' in name or 'layer_norm' in name:
                 no_decay_params.append(p)
-            elif 'logit_scale' in name:
+            elif 'logit_scale' in name or 'logit_bias' in name:
                 no_decay_params.append(p)
             else:
                 decay_params.append(p)
@@ -661,7 +721,7 @@ class VL_JEPA_Trainer:
             )
 
         queue_keys = outputs.get('language_proj')
-        if queue_keys is not None:
+        if self.memory_bank is not None and queue_keys is not None:
             self.memory_bank.enqueue(queue_keys)
 
         if self.check_finite:
@@ -836,7 +896,9 @@ class VL_JEPA_Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
-            'memory_bank_state_dict': self.memory_bank.state_dict(),
+            'memory_bank_state_dict': (
+                self.memory_bank.state_dict() if self.memory_bank is not None else None
+            ),
             'step': self._step,
             'running_loss': self.running_loss,
             'running_steps': self.running_steps,
@@ -879,7 +941,7 @@ class VL_JEPA_Trainer:
             )
 
         self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-        if 'memory_bank_state_dict' in checkpoint:
+        if self.memory_bank is not None and checkpoint.get('memory_bank_state_dict') is not None:
             self.memory_bank.load_state_dict(checkpoint['memory_bank_state_dict'])
         if load_optimizer and 'optimizer_state_dict' in checkpoint:
             try:

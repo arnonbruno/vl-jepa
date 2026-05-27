@@ -16,6 +16,7 @@ import os
 from src.model import (
     VL_JEPA, VisionEncoder, LanguageEncoder, Predictor, MemoryBank,
     LOGIT_SCALE_MAX, block_patch_mask, compute_jepa_loss, make_multicrop_views,
+    sigmoid_contrastive_loss,
 )
 import pytest
 
@@ -43,6 +44,8 @@ def _make_model(**kwargs):
         "patch_size": PATCH_SIZE,
         "image_size": IMAGE_SIZE,
         "predictor_layers": 1,
+        "freeze_encoders": False,
+        "projection_dim": HIDDEN_DIM,
     }
     defaults.update(kwargs)
     return VL_JEPA(**defaults)
@@ -263,6 +266,45 @@ def test_memory_bank_expands_contrastive_negatives():
     assert torch.isfinite(loss_with_bank['nce_loss'])
     assert loss_with_bank['nce_loss'].item() != loss_batch_only['nce_loss'].item()
     print(f"  ✓ Queue filled={bank.num_filled}, NCE with bank={loss_with_bank['nce_loss']:.4f}")
+
+
+def test_memory_bank_size_zero_disables_queue():
+    """Trainer should run cleanly without allocating a memory bank."""
+    print("Testing memory_bank_size=0...")
+    model = _make_model()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trainer = VL_JEPA_Trainer(
+        model,
+        device,
+        learning_rate=1e-4,
+        warmup_steps=0,
+        max_steps=10,
+        memory_bank_size=0,
+    )
+    images = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (2, SEQ_LEN))
+    metrics = trainer.train_step(images, input_ids)
+
+    assert trainer.memory_bank is None
+    assert math.isfinite(metrics['total_loss'])
+    print("  ✓ No memory bank allocated; train step finite")
+
+
+def test_siglip_contrastive_loss_is_finite():
+    """SigLIP loss path should produce finite loss and bounded accuracy."""
+    print("Testing SigLIP loss...")
+    vision_proj = torch.nn.functional.normalize(torch.randn(4, HIDDEN_DIM), dim=-1)
+    language_proj = torch.nn.functional.normalize(torch.randn(4, HIDDEN_DIM), dim=-1)
+    loss, acc = sigmoid_contrastive_loss(
+        vision_proj,
+        language_proj,
+        torch.tensor(2.659),
+        torch.tensor(-10.0),
+    )
+
+    assert torch.isfinite(loss)
+    assert 0.0 <= acc.item() <= 1.0
+    print(f"  ✓ SigLIP loss finite: {loss:.4f}, acc={acc:.2%}")
 
 
 def test_contrastive_projection_gradients_flow():
@@ -694,6 +736,8 @@ if __name__ == '__main__':
         ("Teacher Mode Restoration", test_target_teacher_modes_are_restored_after_forward),
         ("Logit Scale Bound", test_logit_scale_is_bounded_before_exp),
         ("Padded Small Crop", test_padded_small_crop_forward_is_finite),
+        ("Memory Bank Disabled", test_memory_bank_size_zero_disables_queue),
+        ("SigLIP Loss", test_siglip_contrastive_loss_is_finite),
         ("Contrastive Gradients", test_contrastive_projection_gradients_flow),
         ("Gradient Clipping", test_gradient_clipping_caps_norm),
         ("Momentum Update", test_momentum_update),

@@ -9,6 +9,11 @@ model:
   text_mask_ratio: 0.0     # 0 = no BERT-style token masking (captions are short)
   predictor_layers: 6      # ViT-Small-scale predictor depth
   momentum_tau: 0.996        # EMA start; cosine schedule → momentum_tau_end
+  vision_backbone: custom
+  text_backbone: custom
+  freeze_encoders: false
+  projection_dim: 256
+  contrastive_loss: infonce
 
 training:
   epochs: 15
@@ -22,6 +27,7 @@ training:
   use_multi_crop: true
   global_crop_size: 224
   local_crop_size: 96
+  phase_training: false
 
   # Gradient clipping (max_norm): student-student InfoNCE produces larger grads than
   # MSE-only JEPA. 2.0 stabilizes contrastive updates without over-suppressing them.

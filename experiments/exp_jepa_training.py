@@ -37,7 +37,12 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.model import VL_JEPA
-from src.trainer import CheckpointError, VL_JEPA_Trainer
+from src.trainer import (
+    CheckpointError,
+    VL_JEPA_Trainer,
+    loss_weights_for_epoch,
+    retrieval_recall,
+)
 from src.config import load_config, overrides_from_cli, print_config
 from src.dataset import (
     COCOCaptionDataset,
@@ -116,6 +121,9 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
     parser.add_argument('--local-crop-size', type=int,
                         default=training.get('local_crop_size', 96),
                         help='Local context crop size')
+    parser.add_argument('--phase-training', action=argparse.BooleanOptionalAction,
+                        default=training.get('phase_training', False),
+                        help='Use phased alpha/beta/gamma schedule')
     parser.add_argument('--hidden-dim', type=int, default=model.get('hidden_dim', 768),
                         help='Hidden dimension')
     parser.add_argument('--patch-size', type=int, default=model.get('patch_size', 16),
@@ -126,6 +134,18 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
                         help='Fraction of vision patches to mask')
     parser.add_argument('--text-mask-ratio', type=float, default=model.get('text_mask_ratio', 0.0),
                         help='Fraction of language tokens to mask (default: 0, no MLM loss)')
+    parser.add_argument('--vision-backbone', type=str, default=model.get('vision_backbone', 'custom'),
+                        help='Vision backbone name ("custom" or a timm model)')
+    parser.add_argument('--text-backbone', type=str, default=model.get('text_backbone', 'custom'),
+                        help='Text backbone name ("custom" or a HuggingFace model)')
+    parser.add_argument('--freeze-encoders', action=argparse.BooleanOptionalAction,
+                        default=model.get('freeze_encoders', True),
+                        help='Freeze vision/text encoders')
+    parser.add_argument('--projection-dim', type=int, default=model.get('projection_dim', 256),
+                        help='Joint embedding projection dimension')
+    parser.add_argument('--contrastive-loss', choices=('infonce', 'siglip'),
+                        default=model.get('contrastive_loss', 'infonce'),
+                        help='Contrastive loss type')
     parser.add_argument('--predictor-layers', type=int, default=model.get('predictor_layers', 6),
                         help='Number of predictor transformer layers')
     parser.add_argument('--momentum-tau', type=float, default=model.get('momentum_tau', 0.996),
@@ -216,6 +236,7 @@ def main() -> None:
 
     parser = _build_parser(base_cfg)
     args = parser.parse_args(remaining)
+    args.config = pre_args.config
     if args.resume and args.fresh:
         parser.error('Cannot use both --resume and --fresh')
 
@@ -227,6 +248,11 @@ def main() -> None:
             image_size=args.image_size,
             mask_ratio=args.mask_ratio,
             text_mask_ratio=args.text_mask_ratio,
+            vision_backbone=args.vision_backbone,
+            text_backbone=args.text_backbone,
+            freeze_encoders=args.freeze_encoders,
+            projection_dim=args.projection_dim,
+            contrastive_loss=args.contrastive_loss,
             predictor_layers=args.predictor_layers,
             momentum_tau=args.momentum_tau,
             epochs=args.epochs,
@@ -238,6 +264,7 @@ def main() -> None:
             use_multi_crop=args.multi_crop,
             global_crop_size=args.global_crop_size,
             local_crop_size=args.local_crop_size,
+            phase_training=args.phase_training,
             alpha=args.alpha,
             beta=args.beta,
             gamma=args.gamma,
@@ -280,6 +307,11 @@ def main() -> None:
         predictor_layers=model_cfg["predictor_layers"],
         momentum_tau=model_cfg["momentum_tau"],
         text_mask_ratio=model_cfg.get("text_mask_ratio", 0.0),
+        vision_backbone=model_cfg.get("vision_backbone", "custom"),
+        text_backbone=model_cfg.get("text_backbone", "custom"),
+        freeze_encoders=model_cfg.get("freeze_encoders", True),
+        projection_dim=model_cfg.get("projection_dim", 256),
+        contrastive_loss=model_cfg.get("contrastive_loss", "infonce"),
     )
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -403,6 +435,13 @@ def main() -> None:
 
     try:
         for epoch in range(start_epoch, train_cfg["epochs"]):
+            if train_cfg.get("phase_training", False):
+                trainer.alpha, trainer.beta, trainer.gamma = loss_weights_for_epoch(epoch + 1)
+                print(
+                    f"\nPhase weights E{epoch+1}: "
+                    f"alpha={trainer.alpha:.2f}, beta={trainer.beta:.2f}, gamma={trainer.gamma:.2f}"
+                )
+
             train_ds = train_loader.dataset
             if isinstance(train_ds, COCOCaptionDataset):
                 train_ds.set_epoch(epoch)
@@ -488,6 +527,7 @@ def main() -> None:
             val_nce = val_metrics['nce_loss']
             val_loss = val_metrics['total_loss']
             val_nce_acc = val_metrics['nce_acc']
+            recall_metrics = retrieval_recall(model, val_loader, device)
 
             gpu_mem = torch.cuda.max_memory_allocated() / 1e9 if device.type == 'cuda' else 0
             if device.type == 'cuda':
@@ -498,6 +538,7 @@ def main() -> None:
                   f"NCE@1: {avg_nce_acc:.2%}) | "
                   f"Val: {val_loss:.4f} (MSE: {val_mse:.4f}, NCE: {val_nce:.4f}, "
                   f"NCE@1: {val_nce_acc:.2%}) | "
+                  f"R@1 i2t/t2i: {recall_metrics['i2t_r1']:.2%}/{recall_metrics['t2i_r1']:.2%} | "
                   f"{epoch_time:.1f}s | GPU: {gpu_mem:.2f}GB | "
                   f"τ: {trainer.model.momentum_tau:.3f} | "
                   f"skipped: {epoch_skipped}")
@@ -512,6 +553,7 @@ def main() -> None:
                 'val_nce': val_nce,
                 'val_nce_acc': val_nce_acc,
                 'val_loss': val_loss,
+                **{f"val_{k}": v for k, v in recall_metrics.items()},
                 'time': epoch_time,
                 'gpu_mem_gb': gpu_mem,
                 'skipped_batches': epoch_skipped,
@@ -528,6 +570,8 @@ def main() -> None:
                 writer.add_scalar('val/mse', val_mse, step)
                 writer.add_scalar('val/nce', val_nce, step)
                 writer.add_scalar('val/nce_acc', val_nce_acc, step)
+                for name, value in recall_metrics.items():
+                    writer.add_scalar(f'val/{name}', value, step)
                 if last_train_metrics:
                     writer.add_scalar('train/lr', last_train_metrics['lr'], step)
                     writer.add_scalar('train/grad_norm', last_train_metrics['grad_norm'], step)

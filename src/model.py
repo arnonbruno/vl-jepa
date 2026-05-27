@@ -19,6 +19,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import timm
+except ImportError:  # pragma: no cover - exercised only when pretrained path is used
+    timm = None
+
+try:
+    from transformers import DistilBertModel
+except ImportError:  # pragma: no cover - dataset already depends on transformers
+    DistilBertModel = None
+
 
 LOGIT_SCALE_MIN = math.log(1.0 / 100.0)
 LOGIT_SCALE_MAX = math.log(100.0)
@@ -342,6 +352,62 @@ class VisionEncoder(nn.Module):
         return x
 
 
+class TimmVisionEncoder(nn.Module):
+    """Pretrained timm ViT wrapper with the same sequence output contract."""
+
+    def __init__(
+        self,
+        model_name: str = "vit_base_patch16_224.mae",
+        *,
+        image_size: int = 224,
+        freeze: bool = True,
+    ):
+        super().__init__()
+        if timm is None:
+            raise ImportError("timm is required for TimmVisionEncoder")
+
+        kwargs = {"pretrained": True, "num_classes": 0}
+        try:
+            self.backbone = timm.create_model(
+                model_name,
+                dynamic_img_size=True,
+                **kwargs,
+            )
+        except TypeError:
+            self.backbone = timm.create_model(model_name, **kwargs)
+
+        self.model_name = model_name
+        self.hidden_dim = int(getattr(self.backbone, "num_features", 0) or getattr(self.backbone, "embed_dim"))
+        patch_size = getattr(getattr(self.backbone, "patch_embed", None), "patch_size", 16)
+        if isinstance(patch_size, tuple):
+            patch_size = patch_size[0]
+        self.patch_size = int(patch_size)
+        self.image_size = image_size
+        self.grid_size = image_size // self.patch_size
+        self.num_patches = self.grid_size ** 2
+
+        if freeze:
+            for p in self.parameters():
+                p.requires_grad = False
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # timm ViTs do not expose the repo's learned mask token path; masks are
+        # intentionally ignored for the frozen-pretrained baseline.
+        del mask
+        feats = self.backbone.forward_features(x)
+        if isinstance(feats, dict):
+            feats = feats.get("x", feats.get("last_hidden_state"))
+        if not isinstance(feats, torch.Tensor) or feats.dim() != 3:
+            raise ValueError(
+                f"{self.model_name} must return (B, N+1, D) features, got {type(feats)}"
+            )
+        return feats
+
+
 # ---------------------------------------------------------------------------
 # Language Encoder — processes text tokens
 # ---------------------------------------------------------------------------
@@ -402,6 +468,37 @@ class LanguageEncoder(nn.Module):
         return x
 
 
+class HFLanguageEncoder(nn.Module):
+    """HuggingFace DistilBERT wrapper returning token-level hidden states."""
+
+    def __init__(
+        self,
+        model_name: str = "distilbert-base-uncased",
+        *,
+        freeze: bool = True,
+    ):
+        super().__init__()
+        if DistilBertModel is None:
+            raise ImportError("transformers is required for HFLanguageEncoder")
+        self.bert = DistilBertModel.from_pretrained(model_name)
+        hidden_dim = getattr(self.bert.config, "dim", None)
+        if hidden_dim is None:
+            hidden_dim = getattr(self.bert.config, "hidden_size")
+        self.hidden_dim = int(hidden_dim)
+
+        if freeze:
+            for p in self.parameters():
+                p.requires_grad = False
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        return out.last_hidden_state
+
+
 # ---------------------------------------------------------------------------
 # Predictor — predicts target embeddings from context embeddings
 # ---------------------------------------------------------------------------
@@ -447,6 +544,30 @@ class Predictor(nn.Module):
         return x
 
 
+class ProjectionHead(nn.Module):
+    """MLP projection head for contrastive/retrieval space."""
+
+    def __init__(self, in_dim: int, out_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, in_dim),
+            nn.GELU(),
+            nn.Linear(in_dim, out_dim),
+        )
+
+    @property
+    def weight(self) -> torch.nn.Parameter:
+        """Compatibility shim for tests that inspect the final projection."""
+        return self.net[-1].weight
+
+    def raw(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.raw(x), p=2, dim=-1, eps=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # VL-JEPA: Joint Embedding Predictive Architecture
 # ---------------------------------------------------------------------------
@@ -467,39 +588,68 @@ class VL_JEPA(nn.Module):
     def __init__(self, hidden_dim: int = 768, patch_size: int = 16,
                  image_size: int = 224, mask_ratio: float = 0.75,
                  predictor_layers: int = 6, momentum_tau: float = 0.996,
-                 text_mask_ratio: float = 0.0):
+                 text_mask_ratio: float = 0.0,
+                 vision_backbone: Optional[str] = "custom",
+                 text_backbone: Optional[str] = "custom",
+                 freeze_encoders: bool = True,
+                 projection_dim: int = 256,
+                 contrastive_loss: str = "infonce"):
         super().__init__()
 
-        self.hidden_dim = hidden_dim
         self.mask_ratio = mask_ratio
         self.momentum_tau = momentum_tau
         self.text_mask_ratio = text_mask_ratio
+        self.vision_backbone = vision_backbone or "custom"
+        self.text_backbone = text_backbone or "custom"
+        self.freeze_encoders = freeze_encoders
+        self.projection_dim = projection_dim
+        self.contrastive_loss = contrastive_loss.lower()
 
-        # Context encoder (student) — trained with gradients
-        self.context_encoder = VisionEncoder(hidden_dim, patch_size, image_size)
+        # Context encoder (student)
+        if self.vision_backbone == "custom":
+            self.context_encoder = VisionEncoder(hidden_dim, patch_size, image_size)
+        else:
+            self.context_encoder = TimmVisionEncoder(
+                self.vision_backbone,
+                image_size=image_size,
+                freeze=freeze_encoders,
+            )
+        self.hidden_dim = self.context_encoder.hidden_dim
 
         # Target encoder (teacher) — EMA of context_encoder, no gradients
-        self.target_encoder = VisionEncoder(hidden_dim, patch_size, image_size)
+        self.target_encoder = copy.deepcopy(self.context_encoder)
         self.target_encoder.load_state_dict(self.context_encoder.state_dict())
         for p in self.target_encoder.parameters():
             p.requires_grad = False
 
         # Predictor
-        self.predictor = Predictor(hidden_dim, num_layers=predictor_layers)
+        self.predictor = Predictor(self.hidden_dim, num_layers=predictor_layers)
 
         # Language encoder
-        self.language_encoder = LanguageEncoder(hidden_dim=hidden_dim)
+        if self.text_backbone == "custom":
+            self.language_encoder = LanguageEncoder(hidden_dim=hidden_dim)
+        else:
+            self.language_encoder = HFLanguageEncoder(
+                self.text_backbone,
+                freeze=freeze_encoders,
+            )
+        self.language_hidden_dim = self.language_encoder.hidden_dim
+        if freeze_encoders:
+            for module in (self.context_encoder, self.language_encoder):
+                for p in module.parameters():
+                    p.requires_grad = False
 
         # Projections to joint space
-        self.vision_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.language_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.vision_proj = ProjectionHead(self.hidden_dim, projection_dim)
+        self.language_proj = ProjectionHead(self.language_hidden_dim, projection_dim)
 
         # Student prediction head and EMA teacher head define the MSE loss space.
         # Applying a head on only one side makes the predictor/teacher spaces asymmetric.
-        self.vision_pred_head = nn.Linear(hidden_dim, hidden_dim)
+        self.vision_pred_head = nn.Linear(self.hidden_dim, self.hidden_dim)
 
-        # Learnable temperature for InfoNCE
+        # Learnable temperature/bias for InfoNCE and SigLIP.
         self.logit_scale = nn.Parameter(torch.ones([]) * 2.659)  # ~ln(1/0.07)
+        self.logit_bias = nn.Parameter(torch.tensor(-10.0))
 
         self._init_weights()
 
@@ -598,10 +748,13 @@ class VL_JEPA(nn.Module):
             target_emb = self.target_encoder(context_images, mask=None)  # (B, N+1, D)
             target_global_emb = self.target_encoder(target_images, mask=None)
 
-        # ---- 3. Predictor ----
+        # ---- 3. Global unmasked student view for contrastive alignment ----
+        global_student_emb = self.context_encoder(target_images, mask=None)
+
+        # ---- 4. Predictor ----
         predicted = self.predictor(context_emb)  # (B, N+1, D)
 
-        # ---- 4. Language encoding ----
+        # ---- 5. Language encoding ----
         clean_input_ids = input_ids
         if token_mask is None and self.training and self.text_mask_ratio > 0:
             token_mask = random_token_mask(
@@ -614,22 +767,19 @@ class VL_JEPA(nn.Module):
         with torch.no_grad(), _temporarily_eval(*teacher_modules):
             target_language_emb = self.target_language_encoder(clean_input_ids, attention_mask)
 
-        # ---- 5. Joint projections ----
-        # Use context encoder CLS for contrastive alignment (student vision representation).
-        vision_cls = context_emb[:, 0, :]          # (B, D)
+        # ---- 6. Joint projections ----
+        # Use the full-image student CLS for image-text alignment; the local
+        # masked context stays reserved for JEPA patch prediction.
+        vision_cls = global_student_emb[:, 0, :]   # (B, D)
         language_cls = language_emb[:, 0, :]        # (B, D) — use [CLS] equivalent (first token)
 
-        vision_proj_raw = self.vision_proj(vision_cls)
-        language_proj_raw = self.language_proj(language_cls)
+        vision_proj_raw = self.vision_proj.raw(vision_cls)
+        language_proj_raw = self.language_proj.raw(language_cls)
         vision_proj = F.normalize(vision_proj_raw, p=2, dim=-1, eps=1e-6)
         language_proj = F.normalize(language_proj_raw, p=2, dim=-1, eps=1e-6)
         with torch.no_grad(), _temporarily_eval(*teacher_modules):
-            target_vision_proj = F.normalize(
-                self.target_vision_proj(target_global_emb[:, 0, :]), p=2, dim=-1, eps=1e-6,
-            )
-            target_language_proj = F.normalize(
-                self.target_language_proj(target_language_emb[:, 0, :]), p=2, dim=-1, eps=1e-6,
-            )
+            target_vision_proj = self.target_vision_proj(target_global_emb[:, 0, :])
+            target_language_proj = self.target_language_proj(target_language_emb[:, 0, :])
             target_patches = self.target_vision_pred_head(target_emb).detach()
 
         # Predictor output mapped to the EMA teacher-head space.
@@ -648,20 +798,26 @@ class VL_JEPA(nn.Module):
             'target_vision_proj': target_vision_proj,  # (B, D), normalized + detached
             'target_language_proj': target_language_proj,
             'logit_scale': self.logit_scale,           # scalar
+            'logit_bias': self.logit_bias,              # scalar
+            'contrastive_loss_type': self.contrastive_loss,
         }
 
     @torch.no_grad()
-    def get_joint_embedding(self, images: torch.Tensor,
-                            input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_joint_embedding(
+        self,
+        images: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get normalized joint embeddings for retrieval (inference)."""
         vision_emb = self.context_encoder(images)
-        language_emb = self.language_encoder(input_ids)
+        language_emb = self.language_encoder(input_ids, attention_mask)
 
         vision_cls = vision_emb[:, 0, :]
         language_cls = language_emb[:, 0, :]
 
-        vision_proj = F.normalize(self.vision_proj(vision_cls), p=2, dim=-1, eps=1e-6)
-        language_proj = F.normalize(self.language_proj(language_cls), p=2, dim=-1, eps=1e-6)
+        vision_proj = self.vision_proj(vision_cls)
+        language_proj = self.language_proj(language_cls)
 
         return vision_proj, language_proj
 
@@ -755,6 +911,28 @@ def variance_loss(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     return torch.mean(F.relu(1.0 - std))
 
 
+def sigmoid_contrastive_loss(
+    vision_proj: torch.Tensor,
+    language_proj: torch.Tensor,
+    logit_scale: torch.Tensor,
+    logit_bias: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SigLIP-style pairwise sigmoid contrastive loss."""
+    batch_size = vision_proj.size(0)
+    scale = logit_scale.float().clamp(LOGIT_SCALE_MIN, LOGIT_SCALE_MAX).exp()
+    logits = vision_proj.float() @ language_proj.float().T
+    logits = logits * scale + logit_bias.float()
+
+    labels = -torch.ones_like(logits)
+    labels.diagonal().fill_(1.0)
+    loss = -F.logsigmoid(labels * logits).sum() / batch_size
+
+    target = torch.arange(batch_size, device=logits.device)
+    i2t_acc = (logits.argmax(dim=1) == target).float().mean()
+    t2i_acc = (logits.argmax(dim=0) == target).float().mean()
+    return loss, ((i2t_acc + t2i_acc) / 2).detach()
+
+
 def compute_jepa_loss(
     outputs: Dict[str, torch.Tensor],
     alpha: float = 1.0,       # weight for MSE prediction loss
@@ -800,29 +978,41 @@ def compute_jepa_loss(
     )
     mse_masked = mse_per_sample.mean()
 
-    # ---- InfoNCE contrastive loss (FP32 for AMP stability) ----
+    # ---- Contrastive loss (FP32 for AMP stability) ----
     batch_size = vision_proj.size(0)
     logit_scale = outputs.get('logit_scale', torch.tensor(2.659, device=vision_proj.device))
     scale = logit_scale.float().clamp(LOGIT_SCALE_MIN, LOGIT_SCALE_MAX).exp()
+    loss_type = str(outputs.get('contrastive_loss_type', 'infonce')).lower()
 
-    labels = torch.arange(batch_size, device=vision_proj.device)
+    if loss_type == 'siglip':
+        nce_loss, nce_acc = sigmoid_contrastive_loss(
+            vision_proj,
+            language_proj,
+            logit_scale,
+            outputs.get('logit_bias', torch.tensor(-10.0, device=vision_proj.device)),
+        )
+    elif loss_type == 'infonce':
+        labels = torch.arange(batch_size, device=vision_proj.device)
 
-    # MoCo-style keys: momentum language projections (batch) + FIFO queue.
-    momentum_lang_keys = language_proj.float()
-    lang_keys = momentum_lang_keys
-    if memory_bank is not None and memory_bank.num_filled > 0:
-        lang_keys = torch.cat([momentum_lang_keys, memory_bank.get()], dim=0)
+        # MoCo-style keys: momentum language projections (batch) + FIFO queue.
+        momentum_lang_keys = language_proj.float()
+        lang_keys = momentum_lang_keys
+        if memory_bank is not None and memory_bank.num_filled > 0:
+            lang_keys = torch.cat([momentum_lang_keys, memory_bank.get()], dim=0)
 
-    # i2t: vision queries vs momentum language keys (+ queue negatives).
-    logits_i2t = vision_proj @ lang_keys.T * scale
-    nce_loss_i2t = F.cross_entropy(logits_i2t, labels)
-    nce_acc_i2t = (logits_i2t.argmax(dim=1) == labels).float().mean()
+        # i2t: vision queries vs momentum language keys (+ queue negatives).
+        logits_i2t = vision_proj @ lang_keys.T * scale
+        nce_loss_i2t = F.cross_entropy(logits_i2t, labels)
+        nce_acc_i2t = (logits_i2t.argmax(dim=1) == labels).float().mean()
 
-    # t2i: language queries vs in-batch vision keys (symmetric CE).
-    logits_t2i = language_proj @ vision_proj.T * scale
-    nce_loss_t2i = F.cross_entropy(logits_t2i, labels)
-    nce_acc_t2i = (logits_t2i.argmax(dim=1) == labels).float().mean()
-    nce_loss = (nce_loss_i2t + nce_loss_t2i) / 2
+        # t2i: language queries vs in-batch vision keys (symmetric CE).
+        logits_t2i = language_proj @ vision_proj.T * scale
+        nce_loss_t2i = F.cross_entropy(logits_t2i, labels)
+        nce_acc_t2i = (logits_t2i.argmax(dim=1) == labels).float().mean()
+        nce_loss = (nce_loss_i2t + nce_loss_t2i) / 2
+        nce_acc = ((nce_acc_i2t + nce_acc_t2i) / 2).detach()
+    else:
+        raise ValueError(f"Unknown contrastive loss type: {loss_type!r}")
 
     # ---- Variance regularization (pre-normalized projections) ----
     vision_raw = outputs['vision_proj_raw'].float()
@@ -838,5 +1028,5 @@ def compute_jepa_loss(
         'var_loss': var_loss,
         'total_loss': total_loss,
         'logit_scale': scale.detach(),
-        'nce_acc': ((nce_acc_i2t + nce_acc_t2i) / 2).detach(),
+        'nce_acc': nce_acc,
     }
