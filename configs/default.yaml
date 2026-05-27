@@ -26,6 +26,7 @@ training:
 loss:
   alpha: 0.5   # MSE weight (reduced vs NCE to stabilize predictor path)
   beta: 0.5
+  gamma: 0.1   # VICReg-style variance regularization (prevents embedding collapse)
 
 data:
   coco_root: ~/.cache/torch/hub/checkpoints

@@ -160,6 +160,8 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
                         help='MSE loss weight')
     parser.add_argument('--beta', type=float, default=loss.get('beta', 0.5),
                         help='InfoNCE loss weight')
+    parser.add_argument('--gamma', type=float, default=loss.get('gamma', 0.1),
+                        help='Variance regularization weight (anti-collapse)')
     parser.add_argument(
         '--max-grad-norm',
         type=float,
@@ -238,6 +240,7 @@ def main() -> None:
             local_crop_size=args.local_crop_size,
             alpha=args.alpha,
             beta=args.beta,
+            gamma=args.gamma,
             max_grad_norm=args.max_grad_norm,
             output_dir=args.output_dir,
             log_interval=args.log_interval,
@@ -330,6 +333,7 @@ def main() -> None:
         max_steps=max_steps,
         alpha=loss_cfg["alpha"],
         beta=loss_cfg["beta"],
+        gamma=loss_cfg.get("gamma", 0.1),
         max_grad_norm=train_cfg.get("max_grad_norm", 1.0),
         use_multi_crop=train_cfg.get("use_multi_crop", False),
         global_crop_size=train_cfg.get("global_crop_size", model_cfg["image_size"]),

@@ -84,6 +84,7 @@ def overrides_from_cli(**kwargs: Any) -> Dict[str, Any]:
         "max_grad_norm": (training, "max_grad_norm"),
         "alpha": (loss, "alpha"),
         "beta": (loss, "beta"),
+        "gamma": (loss, "gamma"),
         "samples": (data, "samples"),
         "seq_len": (data, "seq_len"),
         "data_dir": (data, "data_dir"),

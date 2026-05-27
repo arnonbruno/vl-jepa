@@ -619,8 +619,10 @@ class VL_JEPA(nn.Module):
         vision_cls = predicted[:, 0, :]            # (B, D)
         language_cls = language_emb[:, 0, :]        # (B, D) — use [CLS] equivalent (first token)
 
-        vision_proj = F.normalize(self.vision_proj(vision_cls), p=2, dim=-1, eps=1e-6)
-        language_proj = F.normalize(self.language_proj(language_cls), p=2, dim=-1, eps=1e-6)
+        vision_proj_raw = self.vision_proj(vision_cls)
+        language_proj_raw = self.language_proj(language_cls)
+        vision_proj = F.normalize(vision_proj_raw, p=2, dim=-1, eps=1e-6)
+        language_proj = F.normalize(language_proj_raw, p=2, dim=-1, eps=1e-6)
         with torch.no_grad(), _temporarily_eval(*teacher_modules):
             target_vision_proj = F.normalize(
                 self.target_vision_proj(target_global_emb[:, 0, :]), p=2, dim=-1, eps=1e-6,
@@ -641,6 +643,8 @@ class VL_JEPA(nn.Module):
             'language_cls': language_cls,
             'vision_proj': vision_proj,               # (B, D), normalized
             'language_proj': language_proj,            # (B, D), normalized
+            'vision_proj_raw': vision_proj_raw,       # (B, D), pre-normalize (for variance loss)
+            'language_proj_raw': language_proj_raw,
             'target_vision_proj': target_vision_proj,  # (B, D), normalized + detached
             'target_language_proj': target_language_proj,
             'logit_scale': self.logit_scale,           # scalar
@@ -666,19 +670,27 @@ class VL_JEPA(nn.Module):
 # Loss computation (standalone function for clarity)
 # ---------------------------------------------------------------------------
 
+def variance_loss(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    """VICReg-style variance regularization: encourage std >= 1 per feature dim."""
+    std = torch.sqrt(x.var(dim=0, unbiased=False) + eps)
+    return torch.mean(F.relu(1.0 - std))
+
+
 def compute_jepa_loss(
     outputs: Dict[str, torch.Tensor],
     alpha: float = 1.0,       # weight for MSE prediction loss
     beta: float = 0.5,        # weight for InfoNCE contrastive loss
+    gamma: float = 0.1,       # weight for variance regularization (anti-collapse)
 ) -> Dict[str, torch.Tensor]:
     """
     Compute VL-JEPA loss:
 
-      L = α * L_mse + β * L_nce
+      L = α * L_mse + β * L_nce + γ * L_var
 
     L_mse: MSE between predicted and target patch embeddings, averaged over
            masked positions only (skip [CLS] token at index 0).
     L_nce: InfoNCE loss aligning vision and language [CLS] projections.
+    L_var: VICReg-style variance loss on pre-normalized projections (prevents collapse).
     """
     predicted = outputs['predicted_patches']   # (B, N+1, D)
     target = outputs['target_patches']          # (B, N+1, D), detached
@@ -725,12 +737,18 @@ def compute_jepa_loss(
     nce_acc_i2t = (logits_i2t.argmax(dim=1) == labels).float().mean()
     nce_acc_t2i = (logits_t2i.argmax(dim=1) == labels).float().mean()
 
+    # ---- Variance regularization (pre-normalized projections) ----
+    vision_raw = outputs['vision_proj_raw'].float()
+    language_raw = outputs['language_proj_raw'].float()
+    var_loss = (variance_loss(vision_raw) + variance_loss(language_raw)) / 2
+
     # ---- Total ----
-    total_loss = alpha * mse_masked + beta * nce_loss
+    total_loss = alpha * mse_masked + beta * nce_loss + gamma * var_loss
 
     return {
         'mse_loss': mse_masked,
         'nce_loss': nce_loss,
+        'var_loss': var_loss,
         'total_loss': total_loss,
         'logit_scale': scale.detach(),
         'nce_acc': ((nce_acc_i2t + nce_acc_t2i) / 2).detach(),

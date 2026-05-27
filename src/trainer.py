@@ -255,6 +255,7 @@ class VL_JEPA_Trainer:
         max_steps: int = 100_000,
         alpha: float = 0.5,        # MSE weight
         beta: float = 0.5,         # InfoNCE weight
+        gamma: float = 0.1,         # Variance regularization weight
         momentum_tau: float = 0.996,
         momentum_tau_end: float = 1.0,
         momentum_schedule_steps: int = 15_000,
@@ -275,6 +276,7 @@ class VL_JEPA_Trainer:
         self._weights_corrupted = False
         self.alpha = alpha
         self.beta = beta
+        self.gamma = gamma
         self.use_multi_crop = use_multi_crop
         self.global_crop_size = global_crop_size
         self.local_crop_size = local_crop_size
@@ -344,7 +346,7 @@ class VL_JEPA_Trainer:
     def _loss_is_finite(loss: torch.Tensor, loss_dict: Dict[str, torch.Tensor]) -> bool:
         if not torch.isfinite(loss):
             return False
-        for key in ('mse_loss', 'nce_loss', 'total_loss'):
+        for key in ('mse_loss', 'nce_loss', 'var_loss', 'total_loss'):
             value = loss_dict.get(key)
             if isinstance(value, torch.Tensor) and not torch.isfinite(value):
                 return False
@@ -622,7 +624,7 @@ class VL_JEPA_Trainer:
                         **skip_kw,
                     )
 
-            loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
+            loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta, self.gamma)
             loss = loss_dict['total_loss']
 
         if not self._loss_is_finite(loss, loss_dict):
@@ -662,6 +664,7 @@ class VL_JEPA_Trainer:
         metrics = {
             'mse_loss': loss_dict['mse_loss'].item(),
             'nce_loss': loss_dict['nce_loss'].item(),
+            'var_loss': loss_dict['var_loss'].item(),
             'total_loss': loss.item(),
             'grad_norm': grad_norm,
             'logit_scale': loss_dict.get('logit_scale', torch.tensor(0.0)).item(),
@@ -694,11 +697,12 @@ class VL_JEPA_Trainer:
             outputs = self._forward_model(
                 images, input_ids, attention_mask, training=False, mask_seed=mask_seed,
             )
-            loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta)
+            loss_dict = compute_jepa_loss(outputs, self.alpha, self.beta, self.gamma)
             if not self._loss_is_finite(loss_dict['total_loss'], loss_dict):
                 return {
                     'mse_loss': float('nan'),
                     'nce_loss': float('nan'),
+                    'var_loss': float('nan'),
                     'total_loss': float('nan'),
                     'nce_acc': 0.0,
                     'skipped': True,
@@ -707,6 +711,7 @@ class VL_JEPA_Trainer:
         return {
             'mse_loss': loss_dict['mse_loss'].item(),
             'nce_loss': loss_dict['nce_loss'].item(),
+            'var_loss': loss_dict['var_loss'].item(),
             'total_loss': loss_dict['total_loss'].item(),
             'nce_acc': loss_dict.get('nce_acc', torch.tensor(0.0)).item(),
             'skipped': False,
