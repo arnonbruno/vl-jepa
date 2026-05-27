@@ -615,8 +615,8 @@ class VL_JEPA(nn.Module):
             target_language_emb = self.target_language_encoder(clean_input_ids, attention_mask)
 
         # ---- 5. Joint projections ----
-        # Use predictor CLS for the student vision embedding so NCE trains the JEPA path.
-        vision_cls = predicted[:, 0, :]            # (B, D)
+        # Use context encoder CLS for contrastive alignment (student vision representation).
+        vision_cls = context_emb[:, 0, :]          # (B, D)
         language_cls = language_emb[:, 0, :]        # (B, D) — use [CLS] equivalent (first token)
 
         vision_proj_raw = self.vision_proj(vision_cls)
