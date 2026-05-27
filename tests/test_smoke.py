@@ -261,6 +261,34 @@ def test_contrastive_projection_gradients_flow():
     print("  ✓ vision_proj and language_proj receive InfoNCE gradients")
 
 
+def test_gradient_clipping_caps_norm():
+    """Global grad norm clip should bound post-clip parameter gradients."""
+    print("Testing gradient clipping...")
+    model = _make_model()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    max_norm = 0.5
+    trainer = VL_JEPA_Trainer(
+        model,
+        device,
+        learning_rate=1e-3,
+        warmup_steps=0,
+        max_steps=10,
+        alpha=0.0,
+        beta=1.0,
+        max_grad_norm=max_norm,
+    )
+    images = torch.randn(4, 3, IMAGE_SIZE, IMAGE_SIZE, device=device)
+    input_ids = torch.randint(0, VOCAB_SIZE, (4, SEQ_LEN), device=device)
+
+    metrics = trainer.train_step(images, input_ids)
+    assert metrics['grad_norm'] > 0
+    post_clip_norm = torch.nn.utils.clip_grad_norm_(
+        trainer.model.parameters(), float('inf'),
+    )
+    assert float(post_clip_norm) <= max_norm + 1e-5
+    print(f"  ✓ Post-clip grad norm {float(post_clip_norm):.4f} <= {max_norm}")
+
+
 def test_momentum_update():
     """Test that momentum update works (target != context at init)."""
     print("Testing momentum update...")
@@ -645,6 +673,7 @@ if __name__ == '__main__':
         ("Logit Scale Bound", test_logit_scale_is_bounded_before_exp),
         ("Padded Small Crop", test_padded_small_crop_forward_is_finite),
         ("Contrastive Gradients", test_contrastive_projection_gradients_flow),
+        ("Gradient Clipping", test_gradient_clipping_caps_norm),
         ("Momentum Update", test_momentum_update),
         ("Capped Momentum Schedule", test_momentum_schedule_capped),
         ("Non-finite Batch Skip", test_trainer_skips_non_finite_batch),

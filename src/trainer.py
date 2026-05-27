@@ -3,7 +3,7 @@ Training utilities for VL-JEPA.
 Fixed with proper JEPA training loop:
   - JEPA loss: MSE on masked patches + InfoNCE cross-modal alignment
   - Momentum update of target encoder (EMA)
-  - AMP + gradient clipping for GPU efficiency
+  - AMP + configurable global gradient clipping (default max_grad_norm=1.0)
   - Validation split with eval loop
   - TensorBoard logging
 """
@@ -262,6 +262,7 @@ class VL_JEPA_Trainer:
         global_crop_size: int = 224,
         local_crop_size: int = 96,
         eval_mask_seed: int = 17_029,
+        max_grad_norm: float = 1.0,
         check_finite: bool = True,
         nan_diagnostics_dir: Optional[Union[str, Path]] = None,
     ):
@@ -278,6 +279,7 @@ class VL_JEPA_Trainer:
         self.global_crop_size = global_crop_size
         self.local_crop_size = local_crop_size
         self.eval_mask_seed = eval_mask_seed
+        self.max_grad_norm = max_grad_norm
 
         # EMA cosine schedule capped so tau reaches 1.0 in early training (~epoch 4),
         # not stretched across the full LR cosine horizon (100K+ steps).
@@ -525,7 +527,9 @@ class VL_JEPA_Trainer:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), 3.0, error_if_nonfinite=False,
+                self.model.parameters(),
+                self.max_grad_norm,
+                error_if_nonfinite=False,
             )
             grad_norm_val = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
             if not math.isfinite(grad_norm_val):
@@ -541,7 +545,9 @@ class VL_JEPA_Trainer:
         else:
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), 3.0, error_if_nonfinite=False,
+                self.model.parameters(),
+                self.max_grad_norm,
+                error_if_nonfinite=False,
             )
             grad_norm_val = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
             if not math.isfinite(grad_norm_val):

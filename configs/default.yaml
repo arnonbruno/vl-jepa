@@ -21,10 +21,11 @@ training:
   use_multi_crop: true
   global_crop_size: 224
   local_crop_size: 96
+  max_grad_norm: 1.0  # tighter clip for student-student contrastive (was 3.0)
 
 loss:
   alpha: 0.5   # MSE weight (reduced vs NCE to stabilize predictor path)
-  beta: 1.0
+  beta: 0.5
 
 data:
   coco_root: ~/.cache/torch/hub/checkpoints

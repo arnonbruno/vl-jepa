@@ -150,7 +150,7 @@ python experiments/exp_jepa_training.py --epochs 50 --batch-size 32 --data-dir /
 
 - **Batch size**: 32 with 224×224 images and 128 tokens uses ~10.3 GB. Can increase to 64.
 - **AMP**: Automatic Mixed Precision (FP16) enabled by default — reduces memory by ~40%.
-- **Gradient clipping**: Set to 3.0 (prevents spikes from predictor).
+- **Gradient clipping**: `max_grad_norm=1.0` (configurable; stabilizes student-student contrastive grads).
 - **Predictor LR**: 20× higher than encoder LR (I-JEPA practice).
 - **EMA momentum**: Cosine schedule 0.996 → 1.0 over training.
 
