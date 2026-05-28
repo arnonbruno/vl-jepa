@@ -492,7 +492,6 @@ class VL_JEPA_Trainer:
                 'params': new_params,
                 'weight_decay': self.optimizer.param_groups[0].get('weight_decay', 0.0),
                 'lr': self.encoder_unfreeze_lr,
-                'initial_lr': self.encoder_unfreeze_lr,
             })
             self._rebuild_scheduler()
             print(
