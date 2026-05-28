@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import random
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -38,6 +38,38 @@ _COCO_SPLIT_LENGTHS: Dict[str, int] = {
     "train": 118_287,
     "val": 5_000,
 }
+
+# Default DataLoader tuning for GPU training (overridable via create_dataloaders).
+_DEFAULT_PREFETCH_FACTOR = 4
+
+
+def resolve_num_workers(num_workers: Optional[int] = None) -> int:
+    """Pick a worker count suited to the host CPU (8–12 on typical 8-core boxes)."""
+    if num_workers is not None and num_workers >= 0:
+        return int(num_workers)
+    cpu_count = os.cpu_count() or 8
+    return min(12, max(4, cpu_count - 2))
+
+
+def build_dataloader_kwargs(
+    num_workers: int,
+    *,
+    pin_memory: Optional[bool] = None,
+    prefetch_factor: int = _DEFAULT_PREFETCH_FACTOR,
+    persistent_workers: bool = True,
+) -> Dict[str, Any]:
+    """Build kwargs for ``DataLoader`` with GPU-friendly prefetch and pinning."""
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+    kwargs: Dict[str, Any] = {"pin_memory": pin_memory}
+    if num_workers > 0:
+        kwargs["num_workers"] = num_workers
+        if persistent_workers:
+            kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = max(2, int(prefetch_factor))
+    else:
+        kwargs["num_workers"] = 0
+    return kwargs
 
 
 class CocoDatasetError(RuntimeError):
@@ -204,6 +236,28 @@ class COCOCaptionDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         self._coco = _load_coco_captions(
             self.coco_root, split, transform, download=download
         )
+        self._tokenized_captions: List[List[Tuple[torch.Tensor, torch.Tensor]]] = []
+        self._build_token_cache()
+
+    def _build_token_cache(self) -> None:
+        """Tokenize every caption variant once (batched per image for speed)."""
+        for index in range(len(self._coco)):
+            _, captions = self._coco[index]
+            if not captions:
+                captions = [""]
+            encoded = self.tokenizer(
+                list(captions),
+                max_length=self.max_caption_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            input_ids = encoded["input_ids"].to(dtype=torch.long)
+            attention_mask = encoded["attention_mask"].to(dtype=torch.long)
+            per_image: List[Tuple[torch.Tensor, torch.Tensor]] = []
+            for cap_idx in range(input_ids.size(0)):
+                per_image.append((input_ids[cap_idx], attention_mask[cap_idx]))
+            self._tokenized_captions.append(per_image)
 
     def set_epoch(self, epoch: int) -> None:
         """Fix per-index caption RNG for this epoch (one caption per image)."""
@@ -213,35 +267,32 @@ class COCOCaptionDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         return len(self._coco)
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        image, captions = self._coco[index]
-        if not captions:
-            caption = ""
-        else:
-            rng = random.Random(self._epoch * 1_000_003 + index)
-            caption = rng.choice(captions)
-
-        encoded = self.tokenizer(
-            caption,
-            max_length=self.max_caption_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        input_ids = encoded["input_ids"].squeeze(0).to(dtype=torch.long)
-        attention_mask = encoded["attention_mask"].squeeze(0).to(dtype=torch.long)
+        image, _ = self._coco[index]
+        tokenized = self._tokenized_captions[index]
+        rng = random.Random(self._epoch * 1_000_003 + index)
+        cap_idx = rng.randrange(len(tokenized))
+        input_ids, attention_mask = tokenized[cap_idx]
         return image, input_ids, attention_mask
 
 
 def create_dataloaders(
     batch_size: int = 32,
-    num_workers: int = 4,
+    num_workers: Optional[int] = None,
     coco_root: Optional[Union[str, Path]] = None,
     image_size: int = 224,
     max_caption_length: int = 64,
     download: bool = True,
+    prefetch_factor: int = _DEFAULT_PREFETCH_FACTOR,
+    persistent_workers: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
     """Build train and validation DataLoaders for COCO 2017 captions."""
     root = _expand_path(coco_root) if coco_root is not None else _default_coco_root()
+    workers = resolve_num_workers(num_workers)
+    loader_kwargs = build_dataloader_kwargs(
+        workers,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
+    )
 
     train_ds = COCOCaptionDataset(
         split="train",
@@ -263,17 +314,15 @@ def create_dataloaders(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
         drop_last=True,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
         drop_last=False,
+        **loader_kwargs,
     )
     return train_loader, val_loader
 

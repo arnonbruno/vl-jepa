@@ -15,7 +15,7 @@ model:
 
 training:
   epochs: 10
-  batch_size: 8
+  batch_size: 32
   learning_rate: 1.0e-4
   weight_decay: 0.05
   warmup_steps: 500
@@ -39,8 +39,9 @@ loss:
 data:
   coco_root: ~/.cache/torch/hub/checkpoints
   image_size: 224
-  batch_size: 8
-  num_workers: 4
+  batch_size: 32
+  num_workers: 8
+  prefetch_factor: 4
   max_caption_length: 64
 
 output:

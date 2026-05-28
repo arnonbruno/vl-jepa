@@ -49,7 +49,8 @@ data:
   coco_root: ~/.cache/torch/hub/checkpoints
   image_size: 224
   batch_size: 32
-  num_workers: 4
+  num_workers: 8
+  prefetch_factor: 4
   max_caption_length: 64   # DistilBERT tokenizer max length
 
 output:

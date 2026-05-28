@@ -193,6 +193,25 @@ def _center_crop_resize_batch(images: torch.Tensor, size: int) -> torch.Tensor:
     return F.interpolate(crop, size=(size, size), mode='bilinear', align_corners=False)
 
 
+def apply_patch_mask_to_embeddings(
+    patch_emb: torch.Tensor,
+    patch_mask: torch.Tensor,
+    mask_token: torch.Tensor,
+) -> torch.Tensor:
+    """Replace masked patch positions with ``mask_token`` (CLS at index 0 is kept)."""
+    if patch_emb.dim() != 3 or patch_mask.dim() != 2:
+        raise ValueError(
+            f"Expected patch_emb (B, N+1, D) and patch_mask (B, N), "
+            f"got {tuple(patch_emb.shape)} and {tuple(patch_mask.shape)}",
+        )
+    cls_token = patch_emb[:, :1, :]
+    patches = patch_emb[:, 1:, :]
+    mask = patch_mask.unsqueeze(-1).expand_as(patches)
+    token = mask_token.view(1, 1, -1).expand_as(patches)
+    masked_patches = torch.where(mask, token, patches)
+    return torch.cat([cls_token, masked_patches], dim=1)
+
+
 @torch.no_grad()
 def make_multicrop_views(
     images: torch.Tensor,
@@ -916,6 +935,69 @@ class VL_JEPA(nn.Module):
             'contrastive_loss_type': self.contrastive_loss,
         }
 
+    def forward_from_cache(
+        self,
+        local_patch_emb: torch.Tensor,
+        global_patch_emb: torch.Tensor,
+        language_emb: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        patch_mask: Optional[torch.Tensor] = None,
+        mask_seed: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Forward pass using precomputed encoder outputs (frozen-encoder fast path)."""
+        B = local_patch_emb.size(0)
+        device = local_patch_emb.device
+        num_patches = local_patch_emb.size(1) - 1
+        generator = None
+        if mask_seed is not None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(mask_seed)
+
+        if patch_mask is None:
+            patch_mask = block_patch_mask(
+                B, num_patches, self.mask_ratio, device, generator=generator,
+            )
+
+        mask_token = getattr(self.context_encoder, "mask_token", None)
+        if mask_token is None:
+            raise RuntimeError("context_encoder has no mask_token for cached JEPA masking")
+
+        context_emb = apply_patch_mask_to_embeddings(
+            local_patch_emb, patch_mask, mask_token,
+        )
+        target_emb = local_patch_emb.detach()
+        global_student_emb = global_patch_emb
+        predicted = self.predictor(context_emb)
+        language_emb = language_emb.float()
+
+        vision_cls = global_student_emb[:, 0, :]
+        if attention_mask is not None:
+            mask_float = attention_mask.unsqueeze(-1).float()
+            language_cls = (language_emb * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1.0)
+        else:
+            language_cls = language_emb.mean(dim=1)
+
+        vision_proj_raw = self.vision_proj.raw(vision_cls)
+        language_proj_raw = self.language_proj.raw(language_cls)
+        vision_proj = F.normalize(vision_proj_raw, p=2, dim=-1, eps=1e-6)
+        language_proj = F.normalize(language_proj_raw, p=2, dim=-1, eps=1e-6)
+        predicted_patches = self.vision_pred_head(predicted)
+
+        return {
+            'predicted_patches': predicted_patches,
+            'target_patches': target_emb,
+            'patch_mask': patch_mask,
+            'vision_cls': vision_cls,
+            'language_cls': language_cls,
+            'vision_proj': vision_proj,
+            'language_proj': language_proj,
+            'vision_proj_raw': vision_proj_raw,
+            'language_proj_raw': language_proj_raw,
+            'logit_scale': self.logit_scale,
+            'logit_bias': self.logit_bias,
+            'contrastive_loss_type': self.contrastive_loss,
+        }
+
     @torch.no_grad()
     def get_joint_embedding(
         self,
@@ -926,8 +1008,20 @@ class VL_JEPA(nn.Module):
         """Get normalized joint embeddings for retrieval (inference)."""
         vision_emb = self.context_encoder(images)
         language_emb = self.language_encoder(input_ids, attention_mask)
+        return self.get_joint_embedding_from_encoder_outputs(
+            vision_emb, language_emb, attention_mask,
+        )
 
-        vision_cls = vision_emb[:, 0, :]
+    @torch.no_grad()
+    def get_joint_embedding_from_encoder_outputs(
+        self,
+        vision_patch_emb: torch.Tensor,
+        language_emb: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project precomputed encoder outputs to the joint embedding space."""
+        vision_cls = vision_patch_emb[:, 0, :].float()
+        language_emb = language_emb.float()
         if attention_mask is not None:
             mask_float = attention_mask.unsqueeze(-1).float()
             language_cls = (language_emb * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1.0)
@@ -936,7 +1030,6 @@ class VL_JEPA(nn.Module):
 
         vision_proj = self.vision_proj(vision_cls)
         language_proj = self.language_proj(language_cls)
-
         return vision_proj, language_proj
 
 

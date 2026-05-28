@@ -243,6 +243,18 @@ def _unpack_batch(batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Ten
     return images, input_ids, attention_mask
 
 
+def _unpack_cached_batch(
+    batch,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Unpack cached embedding batches (local, global, language_emb, attention_mask)."""
+    if not isinstance(batch, (list, tuple)) or len(batch) != 4:
+        raise ValueError(
+            f"Cached batch must be (local, global, language_emb, attention_mask), "
+            f"got {type(batch)} len={len(batch) if isinstance(batch, (list, tuple)) else 'n/a'}",
+        )
+    return batch[0], batch[1], batch[2], batch[3]
+
+
 def loss_weights_for_epoch(epoch: int) -> Tuple[float, float, float]:
     """Return phase-training weights for a 1-based epoch number."""
     if epoch <= 5:
@@ -258,6 +270,8 @@ def retrieval_recall(
     loader: Iterator,
     device: torch.device,
     k_list: Tuple[int, ...] = (1, 5, 10),
+    *,
+    use_cached_embeddings: bool = False,
 ) -> Dict[str, float]:
     """Compute full-loader image/text retrieval Recall@K."""
     model.eval()
@@ -265,17 +279,27 @@ def retrieval_recall(
     text_feats = []
 
     for batch in loader:
-        images, input_ids, attention_mask = _unpack_batch(batch)
-        images = images.to(device)
-        input_ids = input_ids.to(device)
-        if attention_mask is not None:
+        if use_cached_embeddings:
+            local, global_emb, language_emb, attention_mask = _unpack_cached_batch(batch)
+            global_emb = global_emb.to(device)
+            language_emb = language_emb.to(device)
             attention_mask = attention_mask.to(device)
-
-        vision_proj, language_proj = model.get_joint_embedding(
-            images,
-            input_ids,
-            attention_mask,
-        )
+            vision_proj, language_proj = model.get_joint_embedding_from_encoder_outputs(
+                global_emb.float(),
+                language_emb.float(),
+                attention_mask,
+            )
+        else:
+            images, input_ids, attention_mask = _unpack_batch(batch)
+            images = images.to(device)
+            input_ids = input_ids.to(device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            vision_proj, language_proj = model.get_joint_embedding(
+                images,
+                input_ids,
+                attention_mask,
+            )
         image_feats.append(vision_proj.float().cpu())
         text_feats.append(language_proj.float().cpu())
 
@@ -329,9 +353,11 @@ class VL_JEPA_Trainer:
         encoder_unfreeze_lr: float = 1e-5,
         check_finite: bool = True,
         nan_diagnostics_dir: Optional[Union[str, Path]] = None,
+        use_cached_embeddings: bool = False,
     ):
         self.model = model.to(device)
         self.device = device
+        self.use_cached_embeddings = use_cached_embeddings
         projection_dim = getattr(model, "projection_dim", model.hidden_dim)
         self.memory_bank = (
             MemoryBank(memory_bank_size, projection_dim, device)
@@ -598,7 +624,21 @@ class VL_JEPA_Trainer:
         *,
         training: bool,
         mask_seed: Optional[int] = None,
+        local_patch_emb: Optional[torch.Tensor] = None,
+        global_patch_emb: Optional[torch.Tensor] = None,
+        language_emb: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        if self.use_cached_embeddings:
+            if local_patch_emb is None or global_patch_emb is None or language_emb is None:
+                raise ValueError("Cached forward requires local/global/language embeddings")
+            return self.model.forward_from_cache(
+                local_patch_emb.float(),
+                global_patch_emb.float(),
+                language_emb.float(),
+                attention_mask,
+                mask_seed=mask_seed,
+            )
+
         if not self.use_multi_crop:
             return self.model(
                 images, input_ids, attention_mask, mask_seed=mask_seed,
@@ -672,7 +712,8 @@ class VL_JEPA_Trainer:
 
         tau = self._current_momentum_tau()
         self.model.momentum_tau = tau
-        self.model.momentum_update()
+        if not self.use_cached_embeddings:
+            self.model.momentum_update()
 
         return True, grad_norm_val
 
@@ -684,6 +725,9 @@ class VL_JEPA_Trainer:
         *,
         batch_index: Optional[int] = None,
         epoch: Optional[int] = None,
+        local_patch_emb: Optional[torch.Tensor] = None,
+        global_patch_emb: Optional[torch.Tensor] = None,
+        language_emb: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
         """Single training step with proper JEPA loss."""
         self.model.train()
@@ -693,6 +737,12 @@ class VL_JEPA_Trainer:
         input_ids = input_ids.to(self.device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
+        if local_patch_emb is not None:
+            local_patch_emb = local_patch_emb.to(self.device, non_blocking=True)
+        if global_patch_emb is not None:
+            global_patch_emb = global_patch_emb.to(self.device, non_blocking=True)
+        if language_emb is not None:
+            language_emb = language_emb.to(self.device, non_blocking=True)
 
         skip_kw = dict(
             batch_index=batch_index,
@@ -712,16 +762,37 @@ class VL_JEPA_Trainer:
                     **skip_kw,
                 )
 
-            bad_input = find_first_nonfinite_input(images, input_ids, attention_mask)
-            if bad_input is not None:
-                return self._skipped_metrics(
-                    'non_finite_input',
-                    nonfinite_location=bad_input,
-                    **skip_kw,
-                )
+            if self.use_cached_embeddings:
+                for name, tensor in (
+                    ('local_patch_emb', local_patch_emb),
+                    ('global_patch_emb', global_patch_emb),
+                    ('language_emb', language_emb),
+                ):
+                    if tensor is not None and tensor.numel() > 0 and not torch.isfinite(tensor).all():
+                        return self._skipped_metrics(
+                            'non_finite_input',
+                            nonfinite_location=name,
+                            **skip_kw,
+                        )
+            else:
+                bad_input = find_first_nonfinite_input(images, input_ids, attention_mask)
+                if bad_input is not None:
+                    return self._skipped_metrics(
+                        'non_finite_input',
+                        nonfinite_location=bad_input,
+                        **skip_kw,
+                    )
 
         with _amp_autocast(self.device):
-            outputs = self._forward_model(images, input_ids, attention_mask, training=True)
+            outputs = self._forward_model(
+                images,
+                input_ids,
+                attention_mask,
+                training=True,
+                local_patch_emb=local_patch_emb,
+                global_patch_emb=global_patch_emb,
+                language_emb=language_emb,
+            )
 
             if self.check_finite:
                 bad_output = find_first_nonfinite_output(outputs)
@@ -802,6 +873,10 @@ class VL_JEPA_Trainer:
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         mask_seed: Optional[int] = None,
+        *,
+        local_patch_emb: Optional[torch.Tensor] = None,
+        global_patch_emb: Optional[torch.Tensor] = None,
+        language_emb: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
         """Single evaluation step (no gradients, no EMA update)."""
         self.model.eval()
@@ -810,10 +885,23 @@ class VL_JEPA_Trainer:
         input_ids = input_ids.to(self.device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
+        if local_patch_emb is not None:
+            local_patch_emb = local_patch_emb.to(self.device, non_blocking=True)
+        if global_patch_emb is not None:
+            global_patch_emb = global_patch_emb.to(self.device, non_blocking=True)
+        if language_emb is not None:
+            language_emb = language_emb.to(self.device, non_blocking=True)
 
         with _amp_autocast(self.device):
             outputs = self._forward_model(
-                images, input_ids, attention_mask, training=False, mask_seed=mask_seed,
+                images,
+                input_ids,
+                attention_mask,
+                training=False,
+                mask_seed=mask_seed,
+                local_patch_emb=local_patch_emb,
+                global_patch_emb=global_patch_emb,
+                language_emb=language_emb,
             )
             loss_dict = compute_jepa_loss(
                 outputs, self.alpha, self.beta, self.gamma, memory_bank=self.memory_bank,
@@ -855,10 +943,23 @@ class VL_JEPA_Trainer:
             if num_batches and batch_idx >= num_batches:
                 break
 
-            images, input_ids, attention_mask = _unpack_batch(batch)
-            metrics = self.train_step(
-                images, input_ids, attention_mask, batch_index=batch_idx, epoch=epoch + 1,
-            )
+            if self.use_cached_embeddings:
+                local, global_emb, language_emb, attention_mask = _unpack_cached_batch(batch)
+                metrics = self.train_step(
+                    images=torch.empty(0),
+                    input_ids=torch.empty(0),
+                    attention_mask=attention_mask,
+                    batch_index=batch_idx,
+                    epoch=epoch + 1,
+                    local_patch_emb=local,
+                    global_patch_emb=global_emb,
+                    language_emb=language_emb,
+                )
+            else:
+                images, input_ids, attention_mask = _unpack_batch(batch)
+                metrics = self.train_step(
+                    images, input_ids, attention_mask, batch_index=batch_idx, epoch=epoch + 1,
+                )
 
             if metrics.get('skipped'):
                 skipped += 1
@@ -913,13 +1014,25 @@ class VL_JEPA_Trainer:
             if num_batches and batch_idx >= num_batches:
                 break
 
-            images, input_ids, attention_mask = _unpack_batch(batch)
-            metrics = self.eval_step(
-                images,
-                input_ids,
-                attention_mask,
-                mask_seed=self.eval_mask_seed + batch_idx,
-            )
+            if self.use_cached_embeddings:
+                local, global_emb, language_emb, attention_mask = _unpack_cached_batch(batch)
+                metrics = self.eval_step(
+                    torch.empty(0),
+                    torch.empty(0),
+                    attention_mask,
+                    mask_seed=self.eval_mask_seed + batch_idx,
+                    local_patch_emb=local,
+                    global_patch_emb=global_emb,
+                    language_emb=language_emb,
+                )
+            else:
+                images, input_ids, attention_mask = _unpack_batch(batch)
+                metrics = self.eval_step(
+                    images,
+                    input_ids,
+                    attention_mask,
+                    mask_seed=self.eval_mask_seed + batch_idx,
+                )
             if metrics.get('skipped'):
                 continue
             for k in metrics_sum:

@@ -44,10 +44,12 @@ from src.trainer import (
     retrieval_recall,
 )
 from src.config import load_config, overrides_from_cli, print_config
+from src.cached_dataset import create_cached_dataloaders
 from src.dataset import (
     COCOCaptionDataset,
     create_dataloaders,
     expected_split_length,
+    resolve_num_workers,
 )
 
 
@@ -66,6 +68,63 @@ class _GraphTraceWrapper(torch.nn.Module):
     ) -> torch.Tensor:
         outputs = self.model(images, input_ids, attention_mask)
         return outputs['predicted_patches'].sum()
+
+
+def _profile_dataloader(
+    train_loader,
+    trainer: VL_JEPA_Trainer,
+    device: torch.device,
+    *,
+    num_batches: int,
+    use_cached: bool,
+) -> None:
+    """Print per-batch data-loading vs forward timing breakdown."""
+    print(f"\n{'=' * 70}")
+    print(f"Data-loading profile ({num_batches} batches, cached={use_cached})")
+    print(f"{'=' * 70}")
+
+    total_data = 0.0
+    total_fwd = 0.0
+    loader_iter = iter(train_loader)
+
+    for batch_idx in range(num_batches):
+        t0 = time.time()
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            print(f"  Stopped early: loader exhausted at batch {batch_idx}")
+            break
+        t1 = time.time()
+
+        if use_cached:
+            local, global_emb, language_emb, attention_mask = batch
+            images = torch.empty(0)
+            input_ids = torch.empty(0)
+        else:
+            images, input_ids, attention_mask = batch
+            local = global_emb = language_emb = None
+
+        trainer.train_step(
+            images,
+            input_ids,
+            attention_mask,
+            local_patch_emb=local,
+            global_patch_emb=global_emb,
+            language_emb=language_emb,
+        )
+        t2 = time.time()
+
+        data_s = t1 - t0
+        fwd_s = t2 - t1
+        total_data += data_s
+        total_fwd += fwd_s
+        print(f"  B{batch_idx+1:3d} | Data: {data_s:.3f}s | Forward: {fwd_s:.3f}s")
+
+    total = total_data + total_fwd
+    if total > 0:
+        print(f"\n  Total data: {total_data:.2f}s | Total forward: {total_fwd:.2f}s")
+        print(f"  Data fraction: {total_data / total:.1%} | "
+              f"Throughput: {num_batches / total:.1f} batches/s")
 
 
 def _expand_coco_root(path: Optional[str]) -> Optional[str]:
@@ -177,8 +236,32 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
     parser.add_argument(
         '--num-workers',
         type=int,
-        default=data.get('num_workers', 4),
-        help='DataLoader worker processes',
+        default=data.get('num_workers'),
+        help='DataLoader worker processes (default: auto from CPU count)',
+    )
+    parser.add_argument(
+        '--prefetch-factor',
+        type=int,
+        default=data.get('prefetch_factor', 4),
+        help='DataLoader prefetch_factor when num_workers > 0',
+    )
+    parser.add_argument(
+        '--cached-data',
+        type=str,
+        default=None,
+        metavar='DIR',
+        help='Directory with precomputed train.pt/val.pt embeddings',
+    )
+    parser.add_argument(
+        '--profile-data',
+        action='store_true',
+        help='Profile data-loading vs forward time for the first batches, then exit',
+    )
+    parser.add_argument(
+        '--profile-batches',
+        type=int,
+        default=20,
+        help='Number of batches to profile when --profile-data is set',
     )
     parser.add_argument('--output-dir', type=str, default=output.get('output_dir', 'experiments'),
                         help='Output directory for metrics/checkpoints')
@@ -328,15 +411,31 @@ def main() -> None:
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel: {total_params/1e6:.1f}M params ({trainable_params/1e6:.1f}M trainable)")
 
-    print("\nLoading COCO 2017 caption dataloaders...")
-    train_loader, val_loader = create_dataloaders(
-        batch_size=batch_size,
-        num_workers=args.num_workers,
-        coco_root=coco_root,
-        image_size=image_size,
-        max_caption_length=args.max_caption_length,
-        download=args.download,
-    )
+    workers = resolve_num_workers(args.num_workers)
+    use_cached = args.cached_data is not None
+
+    if use_cached:
+        cache_dir = Path(args.cached_data).expanduser().resolve()
+        print(f"\nLoading cached embedding dataloaders from {cache_dir}...")
+        train_loader, val_loader = create_cached_dataloaders(
+            cache_dir,
+            batch_size=batch_size,
+            num_workers=workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+    else:
+        print("\nLoading COCO 2017 caption dataloaders...")
+        train_loader, val_loader = create_dataloaders(
+            batch_size=batch_size,
+            num_workers=workers,
+            coco_root=coco_root,
+            image_size=image_size,
+            max_caption_length=args.max_caption_length,
+            download=args.download,
+            prefetch_factor=args.prefetch_factor,
+        )
+    print(f"  DataLoader: num_workers={workers}, prefetch_factor={args.prefetch_factor}, "
+          f"pin_memory={torch.cuda.is_available()}, persistent_workers={workers > 0}")
 
     train_batches = len(train_loader)
     val_batches = len(val_loader)
@@ -387,7 +486,14 @@ def main() -> None:
         local_crop_size=train_cfg.get("local_crop_size", 96),
         check_finite=not args.no_finite_checks,
         nan_diagnostics_dir=str(nan_diag_dir) if nan_diag_dir else None,
+        use_cached_embeddings=use_cached,
     )
+
+    if use_cached and train_cfg.get("use_multi_crop", False):
+        print(
+            "  Note: --cached-data uses precomputed crops; multi-crop in training is ignored. "
+            "Re-run precompute_embeddings.py with matching --multi-crop settings."
+        )
 
     resume_meta: Optional[Dict[str, Any]] = None
     start_epoch = 0
@@ -434,6 +540,16 @@ def main() -> None:
     elif args.tensorboard and not _HAS_TENSORBOARD:
         print("\n  ⚠️  TensorBoard requested but torch.utils.tensorboard is unavailable")
 
+    if args.profile_data:
+        _profile_dataloader(
+            train_loader,
+            trainer,
+            device,
+            num_batches=args.profile_batches,
+            use_cached=use_cached,
+        )
+        return
+
     print(f"\n{'=' * 70}")
     print(f"Training for {train_cfg['epochs']} epochs...")
     print(f"{'=' * 70}")
@@ -461,14 +577,31 @@ def main() -> None:
                 train_ds.set_epoch(epoch)
 
             epoch_start = time.time()
+            data_time = 0.0
+            forward_time = 0.0
             epoch_metrics: Dict[str, list[float]] = {
                 'mse_loss': [], 'nce_loss': [], 'total_loss': [], 'nce_acc': [],
             }
             epoch_skipped = 0
 
-            for batch_idx, batch in enumerate(train_loader):
-                images, input_ids, attention_mask = batch
-                if writer is not None and not graph_logged:
+            train_iter = iter(train_loader)
+            for batch_idx in range(train_batches):
+                t_data = time.time()
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    break
+                data_time += time.time() - t_data
+
+                if use_cached:
+                    local, global_emb, language_emb, attention_mask = batch
+                    images = torch.empty(0)
+                    input_ids = torch.empty(0)
+                else:
+                    images, input_ids, attention_mask = batch
+                    local = global_emb = language_emb = None
+
+                if writer is not None and not graph_logged and not use_cached:
                     try:
                         trace_model = _GraphTraceWrapper(model).to(device)
                         trace_images = images.to(device)
@@ -480,11 +613,18 @@ def main() -> None:
                         print(f"\n  ⚠️  TensorBoard graph trace skipped: {graph_err}")
                         graph_logged = True
 
+                t_fwd = time.time()
                 metrics = trainer.train_step(
-                    images, input_ids, attention_mask,
+                    images,
+                    input_ids,
+                    attention_mask,
                     batch_index=batch_idx,
                     epoch=epoch + 1,
+                    local_patch_emb=local,
+                    global_patch_emb=global_emb,
+                    language_emb=language_emb,
                 )
+                forward_time += time.time() - t_fwd
                 last_train_metrics = metrics
 
                 if metrics.get('skipped'):
@@ -547,19 +687,27 @@ def main() -> None:
             val_nce = val_metrics['nce_loss']
             val_loss = val_metrics['total_loss']
             val_nce_acc = val_metrics['nce_acc']
-            recall_metrics = retrieval_recall(model, val_loader, device)
+            recall_metrics = retrieval_recall(
+                model, val_loader, device, use_cached_embeddings=use_cached,
+            )
 
             gpu_mem = torch.cuda.max_memory_allocated() / 1e9 if device.type == 'cuda' else 0
             if device.type == 'cuda':
                 torch.cuda.reset_peak_memory_stats()
 
+            timing_msg = ""
+            if n_train > 0 and (data_time + forward_time) > 0:
+                timing_msg = (
+                    f" | data: {data_time:.1f}s fwd: {forward_time:.1f}s "
+                    f"({data_time / (data_time + forward_time):.0%} data)"
+                )
             print(f"\nEpoch {epoch+1:2d}/{train_cfg['epochs']} | "
                   f"Train: {avg_loss:.4f} (MSE: {avg_mse:.4f}, NCE: {avg_nce:.4f}, "
                   f"NCE@1: {avg_nce_acc:.2%}) | "
                   f"Val: {val_loss:.4f} (MSE: {val_mse:.4f}, NCE: {val_nce:.4f}, "
                   f"NCE@1: {val_nce_acc:.2%}) | "
                   f"R@1 i2t/t2i: {recall_metrics['i2t_r1']:.2%}/{recall_metrics['t2i_r1']:.2%} | "
-                  f"{epoch_time:.1f}s | GPU: {gpu_mem:.2f}GB | "
+                  f"{epoch_time:.1f}s{timing_msg} | GPU: {gpu_mem:.2f}GB | "
                   f"τ: {trainer.model.momentum_tau:.3f} | "
                   f"skipped: {epoch_skipped}")
 

@@ -11,9 +11,11 @@ import torch
 from src.dataset import (
     COCOCaptionDataset,
     CocoDatasetError,
+    build_dataloader_kwargs,
     create_dataloaders,
     ensure_coco_2017,
     expected_split_length,
+    resolve_num_workers,
 )
 
 
@@ -45,8 +47,31 @@ def val_dataset(coco_root: Path) -> COCOCaptionDataset:
     )
 
 
+def test_resolve_num_workers_auto() -> None:
+    assert resolve_num_workers(None) >= 4
+    assert resolve_num_workers(0) == 0
+    assert resolve_num_workers(6) == 6
+
+
+def test_build_dataloader_kwargs_persistent() -> None:
+    kwargs = build_dataloader_kwargs(4, prefetch_factor=4)
+    assert kwargs["num_workers"] == 4
+    assert kwargs["persistent_workers"] is True
+    assert kwargs["prefetch_factor"] == 4
+    assert build_dataloader_kwargs(0)["num_workers"] == 0
+
+
 def test_val_dataset_length(val_dataset: COCOCaptionDataset) -> None:
     assert len(val_dataset) == expected_split_length("val")
+
+
+def test_pretokenized_caption_cache(val_dataset: COCOCaptionDataset) -> None:
+    assert len(val_dataset._tokenized_captions) == len(val_dataset)
+    for encodings in val_dataset._tokenized_captions[:20]:
+        assert encodings
+        input_ids, attention_mask = encodings[0]
+        assert input_ids.shape == (64,)
+        assert attention_mask.shape == (64,)
 
 
 def test_single_sample_shapes(val_dataset: COCOCaptionDataset) -> None:
