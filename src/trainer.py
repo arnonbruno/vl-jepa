@@ -423,23 +423,49 @@ class VL_JEPA_Trainer:
         self.optimizer = optim.AdamW(param_groups, lr=learning_rate, betas=(0.9, 0.95))
         self.scaler = _make_grad_scaler(device)
 
-        # Warmup + cosine scheduler
+        # Warmup + cosine scheduler (per param group; encoder group uses constant scale)
         self.warmup_steps = warmup_steps
         self.max_steps = max_steps
         self._step = 0
         self._skipped_batches = 0
 
-        def lr_lambda(current_step):
-            if current_step < warmup_steps:
-                return float(current_step) / float(max(1, warmup_steps))
-            progress = float(current_step - warmup_steps) / float(max(1, max_steps - warmup_steps))
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+        self.scheduler = optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            self._lr_lambdas_for_optimizer(),
+        )
 
         # Loss tracking
         self.running_loss = 0.0
         self.running_steps = 0
+
+    def _main_lr_lambda(self, current_step: int) -> float:
+        if current_step < self.warmup_steps:
+            return float(current_step) / float(max(1, self.warmup_steps))
+        progress = float(current_step - self.warmup_steps) / float(
+            max(1, self.max_steps - self.warmup_steps)
+        )
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    @staticmethod
+    def _encoder_lr_lambda(_current_step: int) -> float:
+        """Keep encoder unfreeze LR at its configured base (no warmup/cosine)."""
+        return 1.0
+
+    def _lr_lambdas_for_optimizer(self) -> list:
+        n_groups = len(self.optimizer.param_groups)
+        lambdas: list = [self._main_lr_lambda] * n_groups
+        # Unfrozen encoder params are appended via add_param_group (5th+ group).
+        if n_groups > 4:
+            lambdas[-1] = self._encoder_lr_lambda
+        return lambdas
+
+    def _rebuild_scheduler(self) -> None:
+        last_epoch = getattr(self.scheduler, 'last_epoch', -1)
+        self.scheduler = optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            self._lr_lambdas_for_optimizer(),
+            last_epoch=last_epoch,
+        )
 
     def _maybe_unfreeze_vision(self, epoch: Optional[int]) -> None:
         if self._vision_unfrozen:
@@ -465,6 +491,7 @@ class VL_JEPA_Trainer:
                 'weight_decay': self.optimizer.param_groups[0].get('weight_decay', 0.0),
                 'lr': self.encoder_unfreeze_lr,
             })
+            self._rebuild_scheduler()
             print(
                 f"  -> Unfroze last {self.unfreeze_vision_blocks} vision blocks at epoch {epoch} "
                 f"({len(new_params)} tensors, lr={self.encoder_unfreeze_lr:.2e})"
