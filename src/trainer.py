@@ -438,6 +438,11 @@ class VL_JEPA_Trainer:
         self.running_loss = 0.0
         self.running_steps = 0
 
+        # Gradient accumulation state. Gradients accumulate across micro-batches
+        # until step_optimizer=True triggers an optimizer update.
+        self._accum_counter = 0
+        self._last_grad_norm = 0.0
+
     def _main_lr_lambda(self, current_step: int) -> float:
         if current_step < self.warmup_steps:
             return float(current_step) / float(max(1, self.warmup_steps))
@@ -698,12 +703,40 @@ class VL_JEPA_Trainer:
         """Sync batch norm if using DataParallel (no-op for now)."""
         pass
 
-    def _backward_and_step(self, loss: torch.Tensor) -> Tuple[bool, float]:
-        """Backward, clip, and optimizer step. Returns (success, grad_norm)."""
-        self.optimizer.zero_grad(set_to_none=True)
+    def _backward_and_step(
+        self,
+        loss: torch.Tensor,
+        accumulation_steps: int = 1,
+        step_optimizer: bool = True,
+    ) -> Tuple[bool, float]:
+        """Backward (accumulating), then clip + optimizer step when requested.
+
+        Gradients accumulate across micro-batches. ``zero_grad`` runs only when a
+        new accumulation window starts; the optimizer/scheduler/EMA updates run
+        only when ``step_optimizer`` is True. The micro-batch loss is scaled by
+        ``1 / accumulation_steps`` so the summed gradient matches a full batch.
+
+        Returns (success, grad_norm). For pure-accumulation calls (no optimizer
+        step) success reflects only that backward ran and grad_norm is the last
+        computed value.
+        """
+        accumulation_steps = max(1, int(accumulation_steps))
+
+        if self._accum_counter == 0:
+            self.optimizer.zero_grad(set_to_none=True)
+
+        scaled_loss = loss / accumulation_steps
+        if self.scaler is not None:
+            self.scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
+        self._accum_counter += 1
+
+        if not step_optimizer:
+            # Still inside the accumulation window; defer the optimizer update.
+            return True, self._last_grad_norm
 
         if self.scaler is not None:
-            self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
@@ -713,8 +746,10 @@ class VL_JEPA_Trainer:
             grad_norm_val = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
             if not math.isfinite(grad_norm_val):
                 self.optimizer.zero_grad(set_to_none=True)
+                self._accum_counter = 0
                 self.scaler.update()
                 _clamp_grad_scaler_scale(self.scaler)
+                self._last_grad_norm = grad_norm_val
                 return False, grad_norm_val
 
             self.scaler.step(self.optimizer)
@@ -722,7 +757,6 @@ class VL_JEPA_Trainer:
             _clamp_grad_scaler_scale(self.scaler)
             self.optimizer._opt_called = True
         else:
-            loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 self.max_grad_norm,
@@ -731,10 +765,13 @@ class VL_JEPA_Trainer:
             grad_norm_val = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
             if not math.isfinite(grad_norm_val):
                 self.optimizer.zero_grad(set_to_none=True)
+                self._accum_counter = 0
+                self._last_grad_norm = grad_norm_val
                 return False, grad_norm_val
 
             self.optimizer.step()
 
+        self._accum_counter = 0
         self._clamp_stability_params()
         self.scheduler.step()
         self._step += 1
@@ -744,6 +781,7 @@ class VL_JEPA_Trainer:
         if not self.use_cached_embeddings:
             self.model.momentum_update()
 
+        self._last_grad_norm = grad_norm_val
         return True, grad_norm_val
 
     def train_step(
@@ -757,8 +795,16 @@ class VL_JEPA_Trainer:
         local_patch_emb: Optional[torch.Tensor] = None,
         global_patch_emb: Optional[torch.Tensor] = None,
         language_emb: Optional[torch.Tensor] = None,
+        accumulation_steps: int = 1,
+        step_optimizer: bool = True,
     ) -> Dict[str, float]:
-        """Single training step with proper JEPA loss."""
+        """Single training step with proper JEPA loss.
+
+        With gradient accumulation, set ``accumulation_steps`` to the window size
+        and ``step_optimizer=True`` only on the final micro-batch of each window
+        (or the last batch of the epoch). Gradients accumulate across micro-batch
+        calls and the optimizer/scheduler/EMA update only fires on the step call.
+        """
         self.model.train()
         self._maybe_unfreeze_vision(epoch)
 
@@ -846,7 +892,9 @@ class VL_JEPA_Trainer:
                 **skip_kw,
             )
 
-        ok, grad_norm = self._backward_and_step(loss)
+        ok, grad_norm = self._backward_and_step(
+            loss, accumulation_steps=accumulation_steps, step_optimizer=step_optimizer,
+        )
         if not ok:
             return self._skipped_metrics(
                 'non_finite_grad',

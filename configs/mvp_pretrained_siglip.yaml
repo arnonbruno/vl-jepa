@@ -6,16 +6,17 @@ model:
   text_mask_ratio: 0.0
   predictor_layers: 4
   momentum_tau: 0.996
-  vision_backbone: vit_base_patch16_224.mae
+  vision_backbone: vit_base_patch16_clip_224.openai
   text_backbone: distilbert-base-uncased
   freeze_encoders: true
-  projection_dim: 256
+  projection_dim: 512
   contrastive_loss: siglip
   contrastive_on_global: true
 
 training:
-  epochs: 10
+  epochs: 50
   batch_size: 32
+  gradient_accumulation_steps: 8  # effective batch = 256
   learning_rate: 1.0e-4
   weight_decay: 0.05
   warmup_steps: 500
@@ -26,8 +27,8 @@ training:
   phase_training: true
   gradient_checkpointing: true
   unfreeze_after_epoch: 5
-  unfreeze_vision_blocks: 2
-  encoder_unfreeze_lr: 1.0e-5
+  unfreeze_vision_blocks: 4
+  encoder_unfreeze_lr: 5.0e-5
   max_grad_norm: 1.0
   memory_bank_size: 0
 

@@ -351,6 +351,42 @@ def test_gradient_clipping_caps_norm():
     print(f"  ✓ Post-clip grad norm {float(post_clip_norm):.4f} <= {max_norm}")
 
 
+def test_gradient_accumulation_defers_optimizer_step():
+    """Accumulation should step the optimizer only on the final micro-batch."""
+    print("Testing gradient accumulation...")
+    model = _make_model()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trainer = VL_JEPA_Trainer(
+        model, device, learning_rate=1e-3, warmup_steps=0, max_steps=100,
+        alpha=0.0, beta=1.0,
+    )
+
+    images = torch.randn(4, 3, IMAGE_SIZE, IMAGE_SIZE, device=device)
+    input_ids = torch.randint(0, VOCAB_SIZE, (4, SEQ_LEN), device=device)
+
+    accum = 4
+    weight_before = model.vision_proj.weight.detach().clone()
+
+    # First accum-1 micro-batches must NOT advance the optimizer.
+    for i in range(accum - 1):
+        metrics = trainer.train_step(
+            images, input_ids, accumulation_steps=accum, step_optimizer=False,
+        )
+        assert not metrics.get('skipped')
+        assert trainer._step == 0, f"optimizer stepped early at micro-batch {i}"
+        assert torch.equal(model.vision_proj.weight.detach(), weight_before)
+
+    # Final micro-batch triggers the optimizer step.
+    metrics = trainer.train_step(
+        images, input_ids, accumulation_steps=accum, step_optimizer=True,
+    )
+    assert not metrics.get('skipped')
+    assert trainer._step == 1, "optimizer should step once per accumulation window"
+    assert trainer._accum_counter == 0
+    assert not torch.equal(model.vision_proj.weight.detach(), weight_before)
+    print("  ✓ Optimizer steps once per accumulation window")
+
+
 def test_momentum_update():
     """Test that momentum update works (target != context at init)."""
     print("Testing momentum update...")
@@ -732,6 +768,7 @@ if __name__ == '__main__':
         ("SigLIP Loss", test_siglip_contrastive_loss_is_finite),
         ("Contrastive Gradients", test_contrastive_projection_gradients_flow),
         ("Gradient Clipping", test_gradient_clipping_caps_norm),
+        ("Gradient Accumulation", test_gradient_accumulation_defers_optimizer_step),
         ("Momentum Update", test_momentum_update),
         ("Capped Momentum Schedule", test_momentum_schedule_capped),
         ("Non-finite Batch Skip", test_trainer_skips_non_finite_batch),

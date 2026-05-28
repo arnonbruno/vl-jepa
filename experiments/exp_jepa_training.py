@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -137,12 +138,18 @@ def _resolve_max_steps(
     train_cfg: Dict[str, Any],
     train_batches: int,
 ) -> int:
-    """Derive total optimizer steps from epochs × train batches when unset."""
+    """Derive total optimizer steps from epochs × optimizer steps/epoch when unset.
+
+    With gradient accumulation, one optimizer step spans ``accum`` micro-batches,
+    so the cosine LR/EMA horizon is measured in optimizer steps, not micro-batches.
+    """
     max_steps = train_cfg.get("max_steps")
     if max_steps is not None:
         return int(max_steps)
     epochs = int(train_cfg.get("epochs", 1))
-    return epochs * max(1, train_batches)
+    accum = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
+    steps_per_epoch = max(1, math.ceil(train_batches / accum))
+    return epochs * steps_per_epoch
 
 
 def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
@@ -277,6 +284,13 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
         default=training.get('max_grad_norm', 1.0),
         help='Global gradient norm clip (stabilizes student-student contrastive)',
     )
+    parser.add_argument(
+        '--gradient-accumulation-steps',
+        type=int,
+        default=training.get('gradient_accumulation_steps', 1),
+        help='Accumulate gradients over N micro-batches before an optimizer step '
+             '(effective batch = batch_size × N)',
+    )
     parser.add_argument('--log-interval', type=int, default=output.get('log_interval', 10),
                         help='Log every N batches')
     parser.add_argument('--checkpoint-interval', type=int,
@@ -360,6 +374,7 @@ def main() -> None:
             beta=args.beta,
             gamma=args.gamma,
             max_grad_norm=args.max_grad_norm,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
             output_dir=args.output_dir,
             log_interval=args.log_interval,
             checkpoint_interval=args.checkpoint_interval,
@@ -375,6 +390,8 @@ def main() -> None:
     coco_root = _expand_coco_root(args.coco_root)
     image_size = model_cfg["image_size"]
     batch_size = train_cfg["batch_size"]
+    accum_steps = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
+    train_cfg["gradient_accumulation_steps"] = accum_steps
 
     print("=" * 70)
     print("VL-JEPA v2 — Proper JEPA Training")
@@ -383,6 +400,10 @@ def main() -> None:
     print_config(cfg)
     print(f"  COCO root: {coco_root}")
     print(f"  Download missing archives: {args.download}")
+    print(
+        f"  Gradient accumulation: {accum_steps} step(s) "
+        f"→ effective batch size = {batch_size * accum_steps}"
+    )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nDevice: {device}")
@@ -614,6 +635,10 @@ def main() -> None:
                         graph_logged = True
 
                 t_fwd = time.time()
+                step_optimizer = (
+                    (batch_idx + 1) % accum_steps == 0
+                    or (batch_idx + 1) == train_batches
+                )
                 metrics = trainer.train_step(
                     images,
                     input_ids,
@@ -623,6 +648,8 @@ def main() -> None:
                     local_patch_emb=local,
                     global_patch_emb=global_emb,
                     language_emb=language_emb,
+                    accumulation_steps=accum_steps,
+                    step_optimizer=step_optimizer,
                 )
                 forward_time += time.time() - t_fwd
                 last_train_metrics = metrics
