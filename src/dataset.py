@@ -239,8 +239,22 @@ class COCOCaptionDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         self._tokenized_captions: List[List[Tuple[torch.Tensor, torch.Tensor]]] = []
         self._build_token_cache()
 
+    def _token_cache_path(self) -> Path:
+        return (
+            self.coco_root
+            / ".vl_jepa_token_cache"
+            / f"{self.split}_{self.max_caption_length}.pt"
+        )
+
     def _build_token_cache(self) -> None:
-        """Tokenize every caption variant once (batched per image for speed)."""
+        """Tokenize every caption variant once (batched per image; disk-cached)."""
+        cache_path = self._token_cache_path()
+        if cache_path.is_file():
+            cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+            if isinstance(cached, list) and len(cached) == len(self._coco):
+                self._tokenized_captions = cached
+                return
+
         for index in range(len(self._coco)):
             _, captions = self._coco[index]
             if not captions:
@@ -258,6 +272,9 @@ class COCOCaptionDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
             for cap_idx in range(input_ids.size(0)):
                 per_image.append((input_ids[cap_idx], attention_mask[cap_idx]))
             self._tokenized_captions.append(per_image)
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self._tokenized_captions, cache_path)
 
     def set_epoch(self, epoch: int) -> None:
         """Fix per-index caption RNG for this epoch (one caption per image)."""
