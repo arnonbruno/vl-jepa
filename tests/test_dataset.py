@@ -66,8 +66,11 @@ def test_val_dataset_length(val_dataset: COCOCaptionDataset) -> None:
 
 
 def test_pretokenized_caption_cache(val_dataset: COCOCaptionDataset) -> None:
-    assert len(val_dataset._tokenized_captions) == len(val_dataset)
-    for encodings in val_dataset._tokenized_captions[:20]:
+    cache_path = val_dataset._token_cache_path
+    assert cache_path.is_file()
+    cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+    assert len(cached) == len(val_dataset)
+    for encodings in cached[:20]:
         assert encodings
         input_ids, attention_mask = encodings[0]
         assert input_ids.shape == (64,)

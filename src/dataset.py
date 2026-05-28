@@ -44,11 +44,10 @@ _DEFAULT_PREFETCH_FACTOR = 4
 
 
 def resolve_num_workers(num_workers: Optional[int] = None) -> int:
-    """Pick a worker count suited to the host CPU (8–12 on typical 8-core boxes)."""
+    """Pick a worker count suited to the host CPU (default 4 when unset)."""
     if num_workers is not None and num_workers >= 0:
         return int(num_workers)
-    cpu_count = os.cpu_count() or 8
-    return min(12, max(4, cpu_count - 2))
+    return 4
 
 
 def build_dataloader_kwargs(
@@ -236,45 +235,73 @@ class COCOCaptionDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         self._coco = _load_coco_captions(
             self.coco_root, split, transform, download=download
         )
-        self._tokenized_captions: List[List[Tuple[torch.Tensor, torch.Tensor]]] = []
-        self._build_token_cache()
+        self._token_cache_path = self._disk_token_cache_path()
+        self._ensure_token_cache_on_disk()
 
-    def _token_cache_path(self) -> Path:
+    def _disk_token_cache_path(self) -> Path:
         return (
             self.coco_root
             / ".vl_jepa_token_cache"
             / f"{self.split}_{self.max_caption_length}.pt"
         )
 
-    def _build_token_cache(self) -> None:
-        """Tokenize every caption variant once (batched per image; disk-cached)."""
-        cache_path = self._token_cache_path()
+    def _tokenize_image_captions(
+        self, index: int
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        _, captions = self._coco[index]
+        if not captions:
+            captions = [""]
+        encoded = self.tokenizer(
+            list(captions),
+            max_length=self.max_caption_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        input_ids = encoded["input_ids"].to(dtype=torch.long)
+        attention_mask = encoded["attention_mask"].to(dtype=torch.long)
+        return [
+            (input_ids[cap_idx], attention_mask[cap_idx])
+            for cap_idx in range(input_ids.size(0))
+        ]
+
+    def _ensure_token_cache_on_disk(self) -> None:
+        """Build the on-disk token cache if missing; never load it into memory."""
+        cache_path = self._token_cache_path
         if cache_path.is_file():
             cached = torch.load(cache_path, map_location="cpu", weights_only=False)
             if isinstance(cached, list) and len(cached) == len(self._coco):
-                self._tokenized_captions = cached
                 return
 
+        tokenized: List[List[Tuple[torch.Tensor, torch.Tensor]]] = []
         for index in range(len(self._coco)):
-            _, captions = self._coco[index]
-            if not captions:
-                captions = [""]
-            encoded = self.tokenizer(
-                list(captions),
-                max_length=self.max_caption_length,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt",
-            )
-            input_ids = encoded["input_ids"].to(dtype=torch.long)
-            attention_mask = encoded["attention_mask"].to(dtype=torch.long)
-            per_image: List[Tuple[torch.Tensor, torch.Tensor]] = []
-            for cap_idx in range(input_ids.size(0)):
-                per_image.append((input_ids[cap_idx], attention_mask[cap_idx]))
-            self._tokenized_captions.append(per_image)
+            tokenized.append(self._tokenize_image_captions(index))
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self._tokenized_captions, cache_path)
+        torch.save(tokenized, cache_path)
+
+    def _load_token_cache(self) -> Optional[List[List[Tuple[torch.Tensor, torch.Tensor]]]]:
+        """Lazy per-process load of the disk cache (not pickled with the dataset)."""
+        if getattr(self, "_token_cache", None) is not None:
+            return self._token_cache
+        if getattr(self, "_token_cache_missing", False):
+            return None
+
+        cache_path = self._token_cache_path
+        if cache_path.is_file():
+            cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+            if isinstance(cached, list) and len(cached) == len(self._coco):
+                self._token_cache = cached
+                return self._token_cache
+
+        self._token_cache_missing = True
+        return None
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("_token_cache", None)
+        state.pop("_token_cache_missing", None)
+        return state
 
     def set_epoch(self, epoch: int) -> None:
         """Fix per-index caption RNG for this epoch (one caption per image)."""
@@ -285,7 +312,11 @@ class COCOCaptionDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         image, _ = self._coco[index]
-        tokenized = self._tokenized_captions[index]
+        cache = self._load_token_cache()
+        if cache is not None:
+            tokenized = cache[index]
+        else:
+            tokenized = self._tokenize_image_captions(index)
         rng = random.Random(self._epoch * 1_000_003 + index)
         cap_idx = rng.randrange(len(tokenized))
         input_ids, attention_mask = tokenized[cap_idx]
