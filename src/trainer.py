@@ -460,12 +460,14 @@ class VL_JEPA_Trainer:
         return lambdas
 
     def _rebuild_scheduler(self) -> None:
-        last_epoch = getattr(self.scheduler, 'last_epoch', -1)
+        # Fresh scheduler: new param groups lack initial_lr required for last_epoch >= 0.
+        steps_done = self._step
         self.scheduler = optim.lr_scheduler.LambdaLR(
             self.optimizer,
             self._lr_lambdas_for_optimizer(),
-            last_epoch=last_epoch,
         )
+        for _ in range(steps_done):
+            self.scheduler.step()
 
     def _maybe_unfreeze_vision(self, epoch: Optional[int]) -> None:
         if self._vision_unfrozen:
@@ -490,6 +492,7 @@ class VL_JEPA_Trainer:
                 'params': new_params,
                 'weight_decay': self.optimizer.param_groups[0].get('weight_decay', 0.0),
                 'lr': self.encoder_unfreeze_lr,
+                'initial_lr': self.encoder_unfreeze_lr,
             })
             self._rebuild_scheduler()
             print(
