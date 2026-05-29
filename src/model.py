@@ -30,6 +30,11 @@ try:
 except ImportError:  # pragma: no cover - dataset already depends on transformers
     DistilBertModel = None
 
+try:
+    import open_clip
+except ImportError:  # pragma: no cover - exercised only when openclip path is used
+    open_clip = None
+
 
 LOGIT_SCALE_MIN = math.log(1.0 / 100.0)
 LOGIT_SCALE_MAX = math.log(100.0)
@@ -493,6 +498,130 @@ class TimmVisionEncoder(nn.Module):
         return feats
 
 
+def _create_openclip_model(model_name: str, pretrained: Optional[str]):
+    """Instantiate an open_clip model (vision + text) with a clear error path."""
+    if open_clip is None:
+        raise ImportError(
+            "open_clip_torch is required for the openclip backbone "
+            "(`pip install open_clip_torch`)."
+        )
+    model, _, _ = open_clip.create_model_and_transforms(
+        model_name, pretrained=pretrained,
+    )
+    return model
+
+
+class OpenCLIPVisionEncoder(nn.Module):
+    """open_clip ViT vision tower wrapped with the JEPA patch-masking contract.
+
+    Mirrors :class:`TimmVisionEncoder`: exposes ``hidden_dim``, ``num_patches``,
+    ``grid_size`` and a learnable ``mask_token`` and applies the mask at the
+    patch-embedding stage (conv1 -> mask -> +pos -> transformer -> ln_post).
+    """
+
+    def __init__(
+        self,
+        model_name: str = "ViT-B-16",
+        pretrained: Optional[str] = "openai",
+        *,
+        image_size: int = 224,
+        freeze: bool = True,
+        gradient_checkpointing: bool = False,
+        shared_model=None,
+    ):
+        super().__init__()
+        model = shared_model if shared_model is not None else _create_openclip_model(
+            model_name, pretrained,
+        )
+        visual = getattr(model, "visual", None)
+        if visual is None or not hasattr(visual, "conv1"):
+            raise ValueError(
+                f"open_clip model {model_name!r} does not expose a ViT-style "
+                "visual.conv1 patch embedding required by OpenCLIPVisionEncoder."
+            )
+        self.visual = visual
+        self.model_name = model_name
+
+        conv1 = visual.conv1
+        kernel = conv1.kernel_size
+        self.patch_size = int(kernel[0] if isinstance(kernel, tuple) else kernel)
+        self.hidden_dim = int(conv1.out_channels)
+        self.image_size = image_size
+        self.grid_size = image_size // self.patch_size
+        self.num_patches = self.grid_size ** 2
+
+        # Learnable [MASK] patch embedding (kept outside ``visual`` so it stays
+        # trainable even when the pretrained tower is frozen).
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
+        nn.init.normal_(self.mask_token, std=0.02)
+
+        # Aliases used by VL_JEPA.unfreeze_vision_last_blocks.
+        self.blocks = visual.transformer.resblocks
+        self.final_norm = visual.ln_post
+
+        self.set_gradient_checkpointing(gradient_checkpointing)
+
+        if freeze:
+            for p in self.visual.parameters():
+                p.requires_grad = False
+
+    def set_gradient_checkpointing(self, enable: bool = True) -> None:
+        self.visual.transformer.grad_checkpointing = bool(enable)
+
+    def _pos_embed_for_grid(self, grid_h: int, grid_w: int) -> torch.Tensor:
+        """Return (1, 1 + grid_h*grid_w, D) positional embeddings, interpolated."""
+        pos = self.visual.positional_embedding  # (1 + N0, D)
+        cls_pos = pos[:1]
+        patch_pos = pos[1:]
+        n0 = patch_pos.shape[0]
+        g0 = int(round(math.sqrt(n0)))
+        if grid_h == g0 and grid_w == g0:
+            return pos.unsqueeze(0)
+        patch_pos = patch_pos.reshape(1, g0, g0, self.hidden_dim).permute(0, 3, 1, 2)
+        patch_pos = F.interpolate(
+            patch_pos.float(), size=(grid_h, grid_w), mode='bicubic', align_corners=False,
+        )
+        patch_pos = torch.nan_to_num(patch_pos, nan=0.0, posinf=0.0, neginf=0.0)
+        patch_pos = (
+            patch_pos.permute(0, 2, 3, 1)
+            .reshape(grid_h * grid_w, self.hidden_dim)
+            .to(cls_pos.dtype)
+        )
+        return torch.cat([cls_pos, patch_pos], dim=0).unsqueeze(0)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        visual = self.visual
+        bsz = x.size(0)
+
+        feats = visual.conv1(x)                      # (B, D, gh, gw)
+        grid_h, grid_w = feats.shape[-2], feats.shape[-1]
+        num_tokens = grid_h * grid_w
+        feats = feats.reshape(bsz, self.hidden_dim, num_tokens).permute(0, 2, 1)
+
+        if mask is not None:
+            if mask.shape != (bsz, num_tokens):
+                raise ValueError(
+                    f"Expected mask shape {(bsz, num_tokens)}, got {tuple(mask.shape)}"
+                )
+            masked = self.mask_token.to(dtype=feats.dtype).expand(bsz, num_tokens, -1)
+            feats = torch.where(mask.unsqueeze(-1), masked, feats)
+
+        cls = visual.class_embedding.to(feats.dtype).view(1, 1, -1).expand(bsz, 1, -1)
+        feats = torch.cat([cls, feats], dim=1)        # (B, N+1, D)
+        feats = feats + self._pos_embed_for_grid(grid_h, grid_w).to(feats.dtype)
+
+        if hasattr(visual, "patch_dropout"):
+            feats = visual.patch_dropout(feats)
+        feats = visual.ln_pre(feats)
+        feats = visual.transformer(feats)             # batch_first
+        feats = visual.ln_post(feats)
+        return feats
+
+
 # ---------------------------------------------------------------------------
 # Language Encoder — processes text tokens
 # ---------------------------------------------------------------------------
@@ -588,6 +717,79 @@ class HFLanguageEncoder(nn.Module):
     ) -> torch.Tensor:
         out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         return out.last_hidden_state
+
+
+class OpenCLIPLanguageEncoder(nn.Module):
+    """open_clip text tower returning the full token sequence (B, S, D).
+
+    Pooling (mean over valid tokens) happens downstream in VL_JEPA, so we keep
+    every token's hidden state rather than the EOT-pooled vector open_clip uses.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "ViT-B-16",
+        pretrained: Optional[str] = "openai",
+        *,
+        freeze: bool = True,
+        gradient_checkpointing: bool = False,
+        shared_model=None,
+    ):
+        super().__init__()
+        model = shared_model if shared_model is not None else _create_openclip_model(
+            model_name, pretrained,
+        )
+        if not hasattr(model, "token_embedding") or not hasattr(model, "transformer"):
+            raise ValueError(
+                f"open_clip model {model_name!r} does not expose a text tower "
+                "(token_embedding/transformer) required by OpenCLIPLanguageEncoder."
+            )
+        self.model_name = model_name
+        self.token_embedding = model.token_embedding
+        self.positional_embedding = model.positional_embedding
+        self.transformer = model.transformer
+        self.ln_final = model.ln_final
+
+        attn_mask = getattr(model, "attn_mask", None)
+        if attn_mask is not None:
+            self.register_buffer("attn_mask", attn_mask.clone(), persistent=False)
+        else:  # pragma: no cover - all stock CLIP text towers ship a causal mask
+            self.attn_mask = None
+
+        width = getattr(self.transformer, "width", None)
+        self.hidden_dim = int(width or self.token_embedding.embedding_dim)
+        self.max_positions = int(self.positional_embedding.shape[0])
+
+        self.set_gradient_checkpointing(gradient_checkpointing)
+
+        if freeze:
+            for p in self.parameters():
+                p.requires_grad = False
+
+    def set_gradient_checkpointing(self, enable: bool = True) -> None:
+        self.transformer.grad_checkpointing = bool(enable)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        seq_len = input_ids.size(1)
+        if seq_len > self.max_positions:
+            raise ValueError(
+                f"{self.model_name} text tower supports up to {self.max_positions} "
+                f"tokens, got sequence length {seq_len}."
+            )
+        x = self.token_embedding(input_ids)                       # (B, S, D)
+        x = x + self.positional_embedding[:seq_len].to(x.dtype)
+
+        attn_mask = self.attn_mask
+        if attn_mask is not None:
+            attn_mask = attn_mask[:seq_len, :seq_len].to(device=x.device, dtype=x.dtype)
+
+        x = self.transformer(x, attn_mask=attn_mask)              # batch_first
+        x = self.ln_final(x)
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +902,8 @@ class VL_JEPA(nn.Module):
                  freeze_encoders: bool = True,
                  projection_dim: int = 256,
                  contrastive_loss: str = "infonce",
+                 openclip_model: str = "ViT-B-16",
+                 openclip_pretrained: Optional[str] = "openai",
                  gradient_checkpointing: bool = False):
         super().__init__()
 
@@ -711,9 +915,26 @@ class VL_JEPA(nn.Module):
         self.freeze_encoders = freeze_encoders
         self.projection_dim = projection_dim
         self.contrastive_loss = contrastive_loss.lower()
+        self.openclip_model = openclip_model
+        self.openclip_pretrained = openclip_pretrained
+
+        # Share a single open_clip model between vision/text towers so both halves
+        # stay weight-aligned and weights are only instantiated once.
+        shared_openclip = None
+        if self.vision_backbone == "openclip" or self.text_backbone == "openclip":
+            shared_openclip = _create_openclip_model(openclip_model, openclip_pretrained)
 
         # Context encoder (student)
-        if self.vision_backbone == "custom":
+        if self.vision_backbone == "openclip":
+            self.context_encoder = OpenCLIPVisionEncoder(
+                openclip_model,
+                openclip_pretrained,
+                image_size=image_size,
+                freeze=freeze_encoders,
+                gradient_checkpointing=gradient_checkpointing,
+                shared_model=shared_openclip,
+            )
+        elif self.vision_backbone == "custom":
             self.context_encoder = VisionEncoder(
                 hidden_dim,
                 patch_size,
@@ -743,7 +964,15 @@ class VL_JEPA(nn.Module):
         )
 
         # Language encoder
-        if self.text_backbone == "custom":
+        if self.text_backbone == "openclip":
+            self.language_encoder = OpenCLIPLanguageEncoder(
+                openclip_model,
+                openclip_pretrained,
+                freeze=freeze_encoders,
+                gradient_checkpointing=gradient_checkpointing,
+                shared_model=shared_openclip,
+            )
+        elif self.text_backbone == "custom":
             self.language_encoder = LanguageEncoder(hidden_dim=hidden_dim)
         else:
             self.language_encoder = HFLanguageEncoder(
@@ -806,6 +1035,11 @@ class VL_JEPA(nn.Module):
         if hasattr(self.context_encoder, "backbone"):
             blocks = getattr(self.context_encoder.backbone, "blocks", None)
             norm = getattr(self.context_encoder.backbone, "norm", None)
+            if norm is not None:
+                tail_modules.append(norm)
+        elif hasattr(self.context_encoder, "visual"):
+            blocks = getattr(self.context_encoder, "blocks", None)
+            norm = getattr(self.context_encoder, "final_norm", None)
             if norm is not None:
                 tail_modules.append(norm)
         elif hasattr(self.context_encoder, "transformer"):

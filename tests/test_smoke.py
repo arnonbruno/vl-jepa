@@ -15,10 +15,28 @@ import os
 
 from src.model import (
     VL_JEPA, VisionEncoder, LanguageEncoder, Predictor, MemoryBank,
+    OpenCLIPVisionEncoder, OpenCLIPLanguageEncoder,
     LOGIT_SCALE_MAX, block_patch_mask, compute_jepa_loss, make_multicrop_views,
     sigmoid_contrastive_loss,
 )
 import pytest
+
+try:
+    import open_clip  # noqa: F401
+    _HAS_OPEN_CLIP = True
+except ImportError:
+    _HAS_OPEN_CLIP = False
+
+# open_clip's stock ViT-B-16 tower is fixed-dim; tests use random weights
+# (pretrained=None) so they stay fast and network-free.
+OPENCLIP_MODEL = "ViT-B-16"
+OPENCLIP_IMAGE_SIZE = 224
+OPENCLIP_PATCH = 16
+OPENCLIP_NUM_PATCHES = (OPENCLIP_IMAGE_SIZE // OPENCLIP_PATCH) ** 2
+OPENCLIP_VISION_DIM = 768
+OPENCLIP_TEXT_DIM = 512
+OPENCLIP_VOCAB = 49408
+OPENCLIP_SEQ_LEN = 32
 
 from src.trainer import (
     CheckpointError,
@@ -747,6 +765,84 @@ def test_joint_embedding():
     print(f"  ✓ Language embedding: {language_proj.shape} (normalized ✓)")
 
 
+@pytest.mark.skipif(not _HAS_OPEN_CLIP, reason="open_clip_torch not installed")
+def test_openclip_vision_encoder_shapes():
+    """OpenCLIP vision encoder mirrors the (B, N+1, D) patch-sequence contract."""
+    print("Testing OpenCLIPVisionEncoder shapes...")
+    encoder = OpenCLIPVisionEncoder(
+        OPENCLIP_MODEL, pretrained=None, image_size=OPENCLIP_IMAGE_SIZE, freeze=False,
+    )
+    assert encoder.hidden_dim == OPENCLIP_VISION_DIM
+    assert encoder.num_patches == OPENCLIP_NUM_PATCHES
+    assert encoder.patch_size == OPENCLIP_PATCH
+    assert 'mask_token' in dict(encoder.named_parameters())
+
+    x = torch.randn(2, 3, OPENCLIP_IMAGE_SIZE, OPENCLIP_IMAGE_SIZE)
+    mask = block_patch_mask(2, OPENCLIP_NUM_PATCHES, mask_ratio=0.75)
+    out = encoder(x, mask)
+    assert out.shape == (2, OPENCLIP_NUM_PATCHES + 1, OPENCLIP_VISION_DIM), out.shape
+
+    # Smaller (local-crop) resolution must interpolate positional embeddings.
+    out_local = encoder(torch.randn(2, 3, 96, 96), mask=None)
+    assert out_local.shape == (2, (96 // OPENCLIP_PATCH) ** 2 + 1, OPENCLIP_VISION_DIM)
+    print(f"  ✓ OpenCLIP vision output shape: {out.shape}")
+
+
+@pytest.mark.skipif(not _HAS_OPEN_CLIP, reason="open_clip_torch not installed")
+def test_openclip_language_encoder_shapes():
+    """OpenCLIP text encoder returns the full (B, S, D) token sequence."""
+    print("Testing OpenCLIPLanguageEncoder shapes...")
+    encoder = OpenCLIPLanguageEncoder(OPENCLIP_MODEL, pretrained=None, freeze=False)
+    assert encoder.hidden_dim == OPENCLIP_TEXT_DIM
+
+    input_ids = torch.randint(0, OPENCLIP_VOCAB, (2, OPENCLIP_SEQ_LEN))
+    attention_mask = torch.ones(2, OPENCLIP_SEQ_LEN, dtype=torch.long)
+    out = encoder(input_ids, attention_mask)
+    assert out.shape == (2, OPENCLIP_SEQ_LEN, OPENCLIP_TEXT_DIM), out.shape
+    print(f"  ✓ OpenCLIP language output shape: {out.shape}")
+
+
+@pytest.mark.skipif(not _HAS_OPEN_CLIP, reason="open_clip_torch not installed")
+def test_openclip_vl_jepa_forward():
+    """Full VL-JEPA forward + loss + backward on the openclip backbone."""
+    print("Testing VL-JEPA (openclip) forward + loss...")
+    model = VL_JEPA(
+        hidden_dim=OPENCLIP_VISION_DIM,
+        patch_size=OPENCLIP_PATCH,
+        image_size=OPENCLIP_IMAGE_SIZE,
+        predictor_layers=1,
+        vision_backbone="openclip",
+        text_backbone="openclip",
+        openclip_model=OPENCLIP_MODEL,
+        openclip_pretrained=None,
+        freeze_encoders=False,
+        projection_dim=512,
+        contrastive_loss="siglip",
+    )
+    # Vision tower drives JEPA hidden dim; text tower keeps its own width.
+    assert model.hidden_dim == OPENCLIP_VISION_DIM
+    assert model.language_hidden_dim == OPENCLIP_TEXT_DIM
+
+    images = torch.randn(2, 3, OPENCLIP_IMAGE_SIZE, OPENCLIP_IMAGE_SIZE)
+    input_ids = torch.randint(0, OPENCLIP_VOCAB, (2, OPENCLIP_SEQ_LEN))
+    attention_mask = torch.ones(2, OPENCLIP_SEQ_LEN, dtype=torch.long)
+
+    outputs = model(images, input_ids, attention_mask)
+    assert outputs['predicted_patches'].shape == (2, OPENCLIP_NUM_PATCHES + 1, OPENCLIP_VISION_DIM)
+    assert outputs['target_patches'].shape == (2, OPENCLIP_NUM_PATCHES + 1, OPENCLIP_VISION_DIM)
+    assert outputs['patch_mask'].shape == (2, OPENCLIP_NUM_PATCHES)
+    assert outputs['vision_proj'].shape == (2, 512)
+    assert outputs['language_proj'].shape == (2, 512)
+
+    loss_dict = compute_jepa_loss(
+        outputs, alpha=0.1, beta=0.9, gamma=0.01, label_smoothing=0.05,
+    )
+    assert torch.isfinite(loss_dict['total_loss'])
+    loss_dict['total_loss'].backward()
+    assert model.vision_pred_head.weight.grad is not None
+    print(f"  ✓ OpenCLIP VL-JEPA loss finite: {loss_dict['total_loss']:.4f}")
+
+
 if __name__ == '__main__':
     print("=" * 60)
     print("VL-JEPA Tests (v2 — Fixed JEPA)")
@@ -784,6 +880,9 @@ if __name__ == '__main__':
         ("Corrupt Checkpoint Reject", test_load_checkpoint_raises_on_corrupt_file),
         ("Checkpoint Metadata", test_load_checkpoint_returns_metadata),
         ("Masked Patch Loss", test_masked_patches_contribute_to_loss),
+        ("OpenCLIP Vision Shapes", test_openclip_vision_encoder_shapes),
+        ("OpenCLIP Language Shapes", test_openclip_language_encoder_shapes),
+        ("OpenCLIP VL-JEPA Forward", test_openclip_vl_jepa_forward),
     ]
 
     passed = 0

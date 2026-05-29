@@ -209,7 +209,13 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
     parser.add_argument('--vision-backbone', type=str, default=model.get('vision_backbone', 'custom'),
                         help='Vision backbone name ("custom" or a timm model)')
     parser.add_argument('--text-backbone', type=str, default=model.get('text_backbone', 'custom'),
-                        help='Text backbone name ("custom" or a HuggingFace model)')
+                        help='Text backbone name ("custom", a HuggingFace model, or "openclip")')
+    parser.add_argument('--openclip-model', type=str,
+                        default=model.get('openclip_model', 'ViT-B-16'),
+                        help='open_clip architecture name (e.g. ViT-B-16) for openclip backbones')
+    parser.add_argument('--openclip-pretrained', type=str,
+                        default=model.get('openclip_pretrained', 'openai'),
+                        help='open_clip pretrained tag (e.g. openai); see open_clip.list_pretrained()')
     parser.add_argument('--freeze-encoders', action=argparse.BooleanOptionalAction,
                         default=model.get('freeze_encoders', True),
                         help='Freeze vision/text encoders')
@@ -362,6 +368,8 @@ def main() -> None:
             text_mask_ratio=args.text_mask_ratio,
             vision_backbone=args.vision_backbone,
             text_backbone=args.text_backbone,
+            openclip_model=args.openclip_model,
+            openclip_pretrained=args.openclip_pretrained,
             freeze_encoders=args.freeze_encoders,
             projection_dim=args.projection_dim,
             contrastive_loss=args.contrastive_loss,
@@ -433,6 +441,8 @@ def main() -> None:
         text_mask_ratio=model_cfg.get("text_mask_ratio", 0.0),
         vision_backbone=model_cfg.get("vision_backbone", "custom"),
         text_backbone=model_cfg.get("text_backbone", "custom"),
+        openclip_model=model_cfg.get("openclip_model", "ViT-B-16"),
+        openclip_pretrained=model_cfg.get("openclip_pretrained", "openai"),
         freeze_encoders=model_cfg.get("freeze_encoders", True),
         projection_dim=model_cfg.get("projection_dim", 256),
         contrastive_loss=model_cfg.get("contrastive_loss", "infonce"),

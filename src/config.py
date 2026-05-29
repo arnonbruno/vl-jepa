@@ -70,6 +70,8 @@ def overrides_from_cli(**kwargs: Any) -> Dict[str, Any]:
         "text_mask_ratio": (model, "text_mask_ratio"),
         "vision_backbone": (model, "vision_backbone"),
         "text_backbone": (model, "text_backbone"),
+        "openclip_model": (model, "openclip_model"),
+        "openclip_pretrained": (model, "openclip_pretrained"),
         "freeze_encoders": (model, "freeze_encoders"),
         "projection_dim": (model, "projection_dim"),
         "contrastive_loss": (model, "contrastive_loss"),
