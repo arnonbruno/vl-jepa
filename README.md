@@ -15,7 +15,19 @@ VL-JEPA learns joint vision-language representations by:
 2. **Aligning** image and text in a shared projection space (SigLIP sigmoid loss).
 3. **Regularizing** embedding variance (VICReg-style) to prevent collapse.
 
-This implementation uses **pretrained frozen encoders** (timm CLIP-pretrained ViT-B/16 + HuggingFace DistilBERT) as a starting point, with **phased training** that gradually introduces JEPA reconstruction after contrastive alignment is established. The vision backbone starts from multimodally-aligned CLIP features (pretrained on 400M image-text pairs) rather than reconstruction-pretrained MAE features, giving the model a strong vision-language prior from the outset.
+This implementation uses **pretrained frozen encoders** as a starting point, with **phased training** that gradually introduces JEPA reconstruction after contrastive alignment is established. Two encoder paths are supported:
+
+- **Hybrid (timm CLIP ViT-B/16 + DistilBERT)** — the original path. The vision tower is multimodally-aligned, but the DistilBERT text CLS was never trained for sentence retrieval, which caps fine-grained ranking.
+- **End-to-end OpenCLIP (`configs/openclip_vitb16.yaml`)** — both towers come from CLIP's 400M-pair pretraining, so vision and text are *already aligned*. The caption pipeline automatically switches to CLIP's BPE tokenizer (vocab 49408, SOT/EOT) and CLIP image normalization — feeding DistilBERT ids into the CLIP text tower would silently destroy the alignment.
+
+### Breaking the ~25% R@1 ceiling
+
+Two earlier runs (timm CLIP + DistilBERT) both plateaued at ~25% R@1 despite R@5≈52% / R@10≈66% and 78–92% in-batch NCE@1 — the right answer was in the top-10 but never ranked #1. That signature (in-batch accuracy saturated, global Recall@1 stuck) points at the *encoders* and the *negatives*, not optimization. The fixes:
+
+1. **OpenCLIP end-to-end** — replaces the weak DistilBERT CLS with CLIP's aligned text tower (the largest structural lever). Enabled by the tokenizer fix above.
+2. **Hard-negative mining** (`loss.hard_negative_weight`) — a VSE++ max-violation hinge that only penalizes the single hardest in-batch negative, directly sharpening top-1 once in-batch accuracy saturates.
+3. **More data** (`src/image_text_dataset.py`, `experiments/download_cc3m.py`) — infrastructure to pretrain on CC3M/CC12M before fine-tuning on COCO (the highest long-term lever; COCO's 118K images are seen ~50× per run).
+4. **Higher resolution** — set `model.image_size: 384`; the OpenCLIP vision tower interpolates its positional embeddings automatically.
 
 ---
 
@@ -73,11 +85,13 @@ This implementation uses **pretrained frozen encoders** (timm CLIP-pretrained Vi
 ### Loss
 
 ```python
-L = α · L_mse + β · L_siglip + γ · L_var
+L = α · L_mse + β · L_siglip + γ · L_var + δ · L_hardneg
 
-L_mse:    MSE(predicted_patches, target_patches) on masked positions only
-L_siglip: pairwise sigmoid contrastive (no softmax dependency on batch size)
-L_var:    VICReg variance on vision_proj_raw and language_proj_raw
+L_mse:     MSE(predicted_patches, target_patches) on masked positions only
+L_siglip:  pairwise sigmoid contrastive (no softmax dependency on batch size)
+L_var:     VICReg variance on vision_proj_raw and language_proj_raw
+L_hardneg: VSE++ max-violation hinge on the hardest in-batch negative (δ defaults
+           to 0; set loss.hard_negative_weight > 0 to sharpen Recall@1)
 ```
 
 ### Phased Training
@@ -159,6 +173,32 @@ python experiments/exp_jepa_training.py \
   --fresh
 ```
 
+### End-to-end OpenCLIP (recommended for breaking the ceiling)
+
+```bash
+python experiments/exp_jepa_training.py \
+  --config configs/openclip_vitb16.yaml \
+  --epochs 30 \
+  --fresh
+```
+
+This uses aligned CLIP vision+text towers, the CLIP BPE tokenizer (selected
+automatically from `text_backbone: openclip`), and hard-negative mining
+(`hard_negative_weight: 0.2`). Add `--hard-negative-weight 0` to ablate it.
+
+### Pretraining on CC3M before COCO
+
+```bash
+# 1. Fetch the caption/URL TSV (small) and print the img2dataset command (images)
+python experiments/download_cc3m.py download-tsv --dataset cc3m --out data/cc3m
+python experiments/download_cc3m.py make-img2dataset --tsv data/cc3m/cc3m.tsv --out data/cc3m/images
+# 2. After img2dataset finishes, build the <image>\t<caption> manifest
+python experiments/download_cc3m.py build-manifest --images data/cc3m/images --out data/cc3m/train.tsv
+```
+
+`src.image_text_dataset.ImageTextPairDataset` then trains on the manifest with
+the same model/trainer code (shares the caption tokenizer + image transforms).
+
 ### Full training with phased schedule
 
 ```bash
@@ -189,6 +229,9 @@ python experiments/exp_jepa_training.py \
 | `--gradient-checkpointing` | false | Reduce VRAM at cost of speed |
 | `--unfreeze-after-epoch` | 5 | Epoch to unfreeze the last 4 vision blocks (`encoder_unfreeze_lr=2e-5`) |
 | `--label-smoothing` | 0.05 | SigLIP target smoothing (anti-overfit) |
+| `--hard-negative-weight` | 0.0 | VSE++ hardest-negative ranking weight (δ); sharpens Recall@1 |
+| `--hard-negative-margin` | 0.2 | Margin for the hard-negative hinge |
+| `--text-backbone openclip` | — | Use CLIP's aligned text tower + BPE tokenizer |
 | `--resume` | — | Resume from checkpoint |
 | `--fresh` | — | Start from scratch |
 
@@ -199,18 +242,24 @@ python experiments/exp_jepa_training.py \
 ```
 vl-jepa/
 ├── src/
-│   ├── model.py          # VL-JEPA, TimmVisionEncoder, HFLanguageEncoder, SigLIP loss
-│   ├── trainer.py        # Training loop, EMA, AMP, retrieval metrics
-│   ├── dataset.py        # COCO 2017 + DistilBERT tokenizer
-│   └── config.py         # YAML loader
+│   ├── model.py              # VL-JEPA, Timm/OpenCLIP encoders, SigLIP + VSE++ losses
+│   ├── trainer.py            # Training loop, EMA, AMP, retrieval metrics
+│   ├── dataset.py            # COCO 2017 + DistilBERT/CLIP tokenizer (CaptionTokenizer)
+│   ├── image_text_dataset.py # Generic CC3M/CC12M manifest dataset
+│   ├── cached_dataset.py     # Precomputed frozen-encoder embeddings
+│   └── config.py             # YAML loader
 ├── experiments/
-│   └── exp_jepa_training.py
+│   ├── exp_jepa_training.py
+│   └── download_cc3m.py      # CC3M/CC12M TSV + manifest preparation
 ├── configs/
 │   ├── default.yaml
-│   └── mvp_pretrained_siglip.yaml
+│   ├── mvp_pretrained_siglip.yaml
+│   └── openclip_vitb16.yaml  # end-to-end OpenCLIP backbone
 ├── tests/
 │   ├── test_smoke.py
 │   ├── test_dataset.py
+│   ├── test_image_text_dataset.py
+│   ├── test_cached_dataset.py
 │   └── test_alignment_overfit.py
 ├── INVESTIGATION.md      # Debugging history
 ├── SOTA_RESEARCH_GPT.md  # SOTA research findings

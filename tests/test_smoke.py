@@ -17,7 +17,7 @@ from src.model import (
     VL_JEPA, VisionEncoder, LanguageEncoder, Predictor, MemoryBank,
     OpenCLIPVisionEncoder, OpenCLIPLanguageEncoder,
     LOGIT_SCALE_MAX, block_patch_mask, compute_jepa_loss, make_multicrop_views,
-    sigmoid_contrastive_loss,
+    sigmoid_contrastive_loss, hard_negative_ranking_loss,
 )
 import pytest
 
@@ -321,6 +321,68 @@ def test_siglip_contrastive_loss_is_finite():
     assert torch.isfinite(loss)
     assert 0.0 <= acc.item() <= 1.0
     print(f"  ✓ SigLIP loss finite: {loss:.4f}, acc={acc:.2%}")
+
+
+def test_hard_negative_loss_zero_when_perfectly_separated():
+    """Perfectly aligned pairs (positives far above negatives) give ~zero hinge."""
+    print("Testing hard-negative loss on separable batch...")
+    # Orthogonal one-hot rows: diagonal sim = 1, off-diagonal = 0, margin 0.2.
+    proj = torch.eye(4)
+    loss = hard_negative_ranking_loss(proj, proj, margin=0.2)
+    assert loss.item() == 0.0, loss.item()
+
+    # Collapsed embeddings: every row identical -> negatives are exactly as
+    # close as positives, so each hinge equals the margin.
+    row = torch.nn.functional.normalize(torch.randn(1, HIDDEN_DIM), dim=-1)
+    collapsed = row.expand(4, HIDDEN_DIM).contiguous()
+    loss_hard = hard_negative_ranking_loss(collapsed, collapsed, margin=0.2)
+    assert abs(loss_hard.item() - 2 * 0.2) < 1e-5, loss_hard.item()
+    print(f"  ✓ separable={loss.item():.3f}, collapsed={loss_hard.item():.3f}")
+
+
+def test_hard_negative_single_sample_is_zero():
+    """A batch of one has no negatives -> loss must be exactly zero."""
+    proj = torch.nn.functional.normalize(torch.randn(1, HIDDEN_DIM), dim=-1)
+    assert hard_negative_ranking_loss(proj, proj).item() == 0.0
+
+
+def test_compute_jepa_loss_hard_negative_weight_adds_term():
+    """Enabling the hard-negative weight changes the total loss and flows grads."""
+    print("Testing hard-negative weight in compute_jepa_loss...")
+    model = _make_model(contrastive_loss='siglip')
+    images = torch.randn(4, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (4, SEQ_LEN))
+
+    outputs = model(images, input_ids)
+    base = compute_jepa_loss(outputs, alpha=0.0, beta=1.0, gamma=0.0)
+    with_hn = compute_jepa_loss(
+        outputs, alpha=0.0, beta=1.0, gamma=0.0,
+        hard_negative_weight=0.5, hard_negative_margin=0.2,
+    )
+    assert 'hard_neg_loss' in with_hn
+    assert torch.isfinite(with_hn['total_loss'])
+    # The hard-negative term is non-negative; total should not be below the base.
+    assert with_hn['total_loss'].item() >= base['total_loss'].item() - 1e-6
+    with_hn['total_loss'].backward()
+    assert model.vision_proj.weight.grad is not None
+    print(f"  ✓ base={base['total_loss']:.4f}, +hardneg={with_hn['total_loss']:.4f}")
+
+
+def test_trainer_hard_negative_weight_runs():
+    """Trainer with hard_negative_weight > 0 produces a finite step."""
+    print("Testing trainer hard-negative path...")
+    model = _make_model(contrastive_loss='siglip')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trainer = VL_JEPA_Trainer(
+        model, device, learning_rate=1e-4, warmup_steps=0, max_steps=10,
+        alpha=0.0, beta=1.0, hard_negative_weight=0.3,
+    )
+    images = torch.randn(4, 3, IMAGE_SIZE, IMAGE_SIZE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (4, SEQ_LEN))
+    metrics = trainer.train_step(images, input_ids)
+    assert not metrics.get('skipped')
+    assert math.isfinite(metrics['total_loss'])
+    print(f"  ✓ trainer hard-negative step finite: {metrics['total_loss']:.4f}")
 
 
 def test_contrastive_projection_gradients_flow():
@@ -862,6 +924,10 @@ if __name__ == '__main__':
         ("Padded Small Crop", test_padded_small_crop_forward_is_finite),
         ("Memory Bank Disabled", test_memory_bank_size_zero_disables_queue),
         ("SigLIP Loss", test_siglip_contrastive_loss_is_finite),
+        ("Hard-negative Separable", test_hard_negative_loss_zero_when_perfectly_separated),
+        ("Hard-negative Single Sample", test_hard_negative_single_sample_is_zero),
+        ("Hard-negative in Loss", test_compute_jepa_loss_hard_negative_weight_adds_term),
+        ("Hard-negative Trainer", test_trainer_hard_negative_weight_runs),
         ("Contrastive Gradients", test_contrastive_projection_gradients_flow),
         ("Gradient Clipping", test_gradient_clipping_caps_norm),
         ("Gradient Accumulation", test_gradient_accumulation_defers_optimizer_step),

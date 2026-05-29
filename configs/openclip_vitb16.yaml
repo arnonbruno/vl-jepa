@@ -1,3 +1,10 @@
+# End-to-end OpenCLIP backbone (vision + text both from CLIP's 400M-pair
+# pretraining). The caption pipeline auto-switches to CLIP's BPE tokenizer and
+# CLIP image-normalization because text_backbone == openclip — feeding
+# DistilBERT ids into the CLIP text tower would destroy the alignment.
+#
+# To trade VRAM for fine-grained spatial detail, bump image_size to 384; the
+# OpenCLIP vision tower interpolates its positional embeddings automatically.
 model:
   hidden_dim: 768
   patch_size: 16
@@ -32,6 +39,11 @@ loss:
   beta: 0.9
   gamma: 0.01
   label_smoothing: 0.05
+  # VSE++ hardest-negative ranking. The two prior runs both stalled at ~25% R@1
+  # with R@5≈52% — the answer was in the top-k but never ranked #1. This term
+  # only penalizes the single hardest in-batch negative, sharpening top-1.
+  hard_negative_weight: 0.2
+  hard_negative_margin: 0.2
 
 data:
   coco_root: ~/.cache/torch/hub/checkpoints
@@ -39,6 +51,7 @@ data:
   batch_size: 128
   num_workers: 8
   prefetch_factor: 4
+  # CLIP's text context length is 77; COCO captions fit comfortably in 64.
   max_caption_length: 64
 
 output:

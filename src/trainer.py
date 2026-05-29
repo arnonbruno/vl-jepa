@@ -345,6 +345,8 @@ class VL_JEPA_Trainer:
         beta: float = 0.5,         # InfoNCE weight
         gamma: float = 0.1,         # Variance regularization weight
         label_smoothing: float = 0.0,  # SigLIP target smoothing (anti-overfit)
+        hard_negative_weight: float = 0.0,  # delta: VSE++ hardest-negative ranking
+        hard_negative_margin: float = 0.2,
         momentum_tau: float = 0.996,
         momentum_tau_end: float = 1.0,
         momentum_schedule_steps: int = 15_000,
@@ -379,6 +381,8 @@ class VL_JEPA_Trainer:
         self.beta = beta
         self.gamma = gamma
         self.label_smoothing = float(label_smoothing)
+        self.hard_negative_weight = float(hard_negative_weight)
+        self.hard_negative_margin = float(hard_negative_margin)
         self.use_multi_crop = use_multi_crop
         self.global_crop_size = global_crop_size
         self.local_crop_size = local_crop_size
@@ -889,6 +893,8 @@ class VL_JEPA_Trainer:
             loss_dict = compute_jepa_loss(
                 outputs, self.alpha, self.beta, self.gamma, memory_bank=self.memory_bank,
                 label_smoothing=self.label_smoothing,
+                hard_negative_weight=self.hard_negative_weight,
+                hard_negative_margin=self.hard_negative_margin,
             )
             loss = loss_dict['total_loss']
 
@@ -991,6 +997,8 @@ class VL_JEPA_Trainer:
             loss_dict = compute_jepa_loss(
                 outputs, self.alpha, self.beta, self.gamma, memory_bank=self.memory_bank,
                 label_smoothing=self.label_smoothing,
+                hard_negative_weight=self.hard_negative_weight,
+                hard_negative_margin=self.hard_negative_margin,
             )
             if not self._loss_is_finite(loss_dict['total_loss'], loss_dict):
                 return {

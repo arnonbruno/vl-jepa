@@ -14,8 +14,89 @@ from torchvision.datasets import CocoCaptions
 from torchvision.datasets.utils import download_and_extract_archive
 from transformers import DistilBertTokenizer
 
+try:  # pragma: no cover - exercised only on the openclip text path
+    import open_clip
+except ImportError:  # pragma: no cover
+    open_clip = None
+
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+# CLIP image preprocessing stats (open_clip / OpenAI). The CLIP towers were
+# pretrained with these — using ImageNet stats would shift the input distribution
+# away from what the frozen encoder expects and degrade retrieval.
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+# Backbone tag that switches the text pipeline to CLIP's BPE tokenizer.
+_OPENCLIP_TEXT_BACKBONE = "openclip"
+
+
+def _is_openclip_text(text_backbone: Optional[str]) -> bool:
+    return (text_backbone or "").lower() == _OPENCLIP_TEXT_BACKBONE
+
+
+class CaptionTokenizer:
+    """Unified caption encoder for DistilBERT and CLIP (open_clip) tokenizers.
+
+    The two tokenizers are fundamentally different vocabularies (DistilBERT
+    WordPiece, 30522 ids vs CLIP byte-pair, 49408 ids with SOT/EOT markers).
+    Feeding DistilBERT ids into a CLIP text tower silently destroys the
+    pretrained alignment, so the tokenizer must match the text backbone.
+
+    Exposes a raw ``.tokenizer`` for callers that introspect it (e.g. tests
+    reading ``vocab_size``) and a single ``encode`` method returning
+    ``(input_ids, attention_mask)`` long tensors of shape ``(N, max_len)``.
+    """
+
+    def __init__(
+        self,
+        *,
+        text_backbone: str = "distilbert-base-uncased",
+        openclip_model: str = "ViT-B-16",
+        max_caption_length: int = 64,
+        tokenizer: Optional[Any] = None,
+    ) -> None:
+        self.kind = "clip" if _is_openclip_text(text_backbone) else "hf"
+        self.max_caption_length = int(max_caption_length)
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+        elif self.kind == "clip":
+            if open_clip is None:
+                raise CocoDatasetError(
+                    "open_clip_torch is required for the openclip text tokenizer "
+                    "(`pip install open_clip_torch`)."
+                )
+            self.tokenizer = open_clip.get_tokenizer(openclip_model)
+        else:
+            self.tokenizer = DistilBertTokenizer.from_pretrained(
+                "distilbert-base-uncased"
+            )
+
+    def encode(self, captions: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        texts = [c if isinstance(c, str) else "" for c in captions]
+        if not texts:
+            texts = [""]
+        if self.kind == "clip":
+            # open_clip tokenizer pads with 0 and forces EOT at the final kept
+            # position; build the padding mask from the non-zero ids.
+            input_ids = self.tokenizer(
+                texts, context_length=self.max_caption_length,
+            ).to(dtype=torch.long)
+            attention_mask = (input_ids != 0).to(dtype=torch.long)
+            return input_ids, attention_mask
+
+        encoded = self.tokenizer(
+            texts,
+            max_length=self.max_caption_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        return (
+            encoded["input_ids"].to(dtype=torch.long),
+            encoded["attention_mask"].to(dtype=torch.long),
+        )
 
 # COCO 2017 official archives (torchvision.datasets.utils)
 _COCO_ARCHIVES: Dict[str, Tuple[str, str]] = {
@@ -159,7 +240,13 @@ def ensure_coco_2017(
     return root
 
 
-def _build_image_transform(image_size: int, split: str) -> transforms.Compose:
+def _build_image_transform(
+    image_size: int,
+    split: str,
+    *,
+    mean: Tuple[float, float, float] = IMAGENET_MEAN,
+    std: Tuple[float, float, float] = IMAGENET_STD,
+) -> transforms.Compose:
     if split == "train":
         # Photometric + occlusion augmentation reduces overfitting: the model
         # otherwise sees near-identical pixels every epoch once the geometric
@@ -180,7 +267,7 @@ def _build_image_transform(image_size: int, split: str) -> transforms.Compose:
                 ),
                 transforms.RandomGrayscale(p=0.2),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=list(IMAGENET_MEAN), std=list(IMAGENET_STD)),
+                transforms.Normalize(mean=list(mean), std=list(std)),
                 transforms.RandomErasing(p=0.25, scale=(0.02, 0.20)),
             ]
         )
@@ -190,7 +277,7 @@ def _build_image_transform(image_size: int, split: str) -> transforms.Compose:
             transforms.Resize(image_size, antialias=True),
             transforms.CenterCrop(image_size),
             transforms.ToTensor(),
-            transforms.Normalize(mean=list(IMAGENET_MEAN), std=list(IMAGENET_STD)),
+            transforms.Normalize(mean=list(mean), std=list(std)),
         ]
     )
 
@@ -225,7 +312,9 @@ class COCOCaptionDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         image_size: int = 224,
         max_caption_length: int = 64,
         download: bool = True,
-        tokenizer: Optional[DistilBertTokenizer] = None,
+        tokenizer: Optional[Any] = None,
+        text_backbone: str = "distilbert-base-uncased",
+        openclip_model: str = "ViT-B-16",
     ) -> None:
         if split not in ("train", "val"):
             raise ValueError(f"split must be 'train' or 'val', got {split!r}")
@@ -233,15 +322,28 @@ class COCOCaptionDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         self.split = split
         self.image_size = image_size
         self.max_caption_length = max_caption_length
+        self.text_backbone = text_backbone
         self._epoch = 0
         self.coco_root = (
             _expand_path(coco_root) if coco_root is not None else _default_coco_root()
         )
 
-        self.tokenizer = tokenizer or DistilBertTokenizer.from_pretrained(
-            "distilbert-base-uncased"
+        self._encoder = CaptionTokenizer(
+            text_backbone=text_backbone,
+            openclip_model=openclip_model,
+            max_caption_length=max_caption_length,
+            tokenizer=tokenizer,
         )
-        transform = _build_image_transform(image_size, split)
+        # Keep the raw tokenizer exposed for callers/tests that introspect it.
+        self.tokenizer = self._encoder.tokenizer
+        # CLIP towers expect CLIP normalization; DistilBERT-paired CLIP-timm
+        # vision used ImageNet stats, so only switch when on the openclip path.
+        mean, std = (
+            (CLIP_MEAN, CLIP_STD)
+            if self._encoder.kind == "clip"
+            else (IMAGENET_MEAN, IMAGENET_STD)
+        )
+        transform = _build_image_transform(image_size, split, mean=mean, std=std)
         self._coco = _load_coco_captions(
             self.coco_root, split, transform, download=download
         )
@@ -249,11 +351,14 @@ class COCOCaptionDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         self._ensure_token_cache_on_disk()
 
     def _disk_token_cache_path(self) -> Path:
-        return (
-            self.coco_root
-            / ".vl_jepa_token_cache"
-            / f"{self.split}_{self.max_caption_length}.pt"
-        )
+        # Keep the historical filename for the DistilBERT (hf) path so existing
+        # caches are reused; only the CLIP path needs a distinct tag (different
+        # vocabulary, so the two caches must never collide).
+        if self._encoder.kind == "hf":
+            name = f"{self.split}_{self.max_caption_length}.pt"
+        else:
+            name = f"{self.split}_{self._encoder.kind}_{self.max_caption_length}.pt"
+        return self.coco_root / ".vl_jepa_token_cache" / name
 
     def _tokenize_image_captions(
         self, index: int
@@ -261,15 +366,7 @@ class COCOCaptionDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         _, captions = self._coco[index]
         if not captions:
             captions = [""]
-        encoded = self.tokenizer(
-            list(captions),
-            max_length=self.max_caption_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        input_ids = encoded["input_ids"].to(dtype=torch.long)
-        attention_mask = encoded["attention_mask"].to(dtype=torch.long)
+        input_ids, attention_mask = self._encoder.encode(list(captions))
         return [
             (input_ids[cap_idx], attention_mask[cap_idx])
             for cap_idx in range(input_ids.size(0))
@@ -342,8 +439,15 @@ def create_dataloaders(
     download: bool = True,
     prefetch_factor: int = _DEFAULT_PREFETCH_FACTOR,
     persistent_workers: bool = True,
+    text_backbone: str = "distilbert-base-uncased",
+    openclip_model: str = "ViT-B-16",
 ) -> Tuple[DataLoader, DataLoader]:
-    """Build train and validation DataLoaders for COCO 2017 captions."""
+    """Build train and validation DataLoaders for COCO 2017 captions.
+
+    ``text_backbone`` selects the caption tokenizer: ``"openclip"`` uses CLIP's
+    BPE tokenizer (required for the OpenCLIP text tower), anything else uses
+    DistilBERT.
+    """
     root = _expand_path(coco_root) if coco_root is not None else _default_coco_root()
     workers = resolve_num_workers(num_workers)
     loader_kwargs = build_dataloader_kwargs(
@@ -358,6 +462,8 @@ def create_dataloaders(
         image_size=image_size,
         max_caption_length=max_caption_length,
         download=download,
+        text_backbone=text_backbone,
+        openclip_model=openclip_model,
     )
     val_ds = COCOCaptionDataset(
         split="val",
@@ -366,6 +472,8 @@ def create_dataloaders(
         max_caption_length=max_caption_length,
         download=download,
         tokenizer=train_ds.tokenizer,
+        text_backbone=text_backbone,
+        openclip_model=openclip_model,
     )
 
     train_loader = DataLoader(

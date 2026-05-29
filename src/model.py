@@ -1356,6 +1356,41 @@ def variance_loss(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     return torch.mean(F.relu(1.0 - std))
 
 
+def hard_negative_ranking_loss(
+    vision_proj: torch.Tensor,
+    language_proj: torch.Tensor,
+    margin: float = 0.2,
+) -> torch.Tensor:
+    """VSE++ max-violation hinge over the hardest in-batch negative.
+
+    Standard in-batch contrastive losses spread their gradient across every
+    negative, so once a batch is "mostly" separated (high NCE@1) the hardest
+    negatives — the semantically similar captions/images that actually decide
+    Recall@1 — stop contributing. This term, from VSE++ (Faghri et al.), only
+    penalizes the single hardest negative per anchor, directly sharpening the
+    top-1 ranking that block in-batch softmax/sigmoid losses leave fuzzy.
+
+    Both projections are assumed L2-normalized, so ``v @ t.T`` is cosine
+    similarity. Returns 0 when the batch has no negatives (B <= 1).
+    """
+    batch_size = vision_proj.size(0)
+    if batch_size <= 1:
+        return vision_proj.new_zeros(())
+
+    sim = vision_proj.float() @ language_proj.float().T  # (B, B)
+    pos = sim.diagonal().view(batch_size, 1)             # (B, 1)
+    eye = torch.eye(batch_size, device=sim.device, dtype=torch.bool)
+
+    # image anchor -> hardest negative caption (compare against this image's positive)
+    cost_caption = (margin + sim - pos).clamp(min=0).masked_fill(eye, 0.0)
+    # caption anchor -> hardest negative image (compare against this caption's positive)
+    cost_image = (margin + sim - pos.view(1, batch_size)).clamp(min=0).masked_fill(eye, 0.0)
+
+    hardest_caption = cost_caption.max(dim=1).values  # (B,)
+    hardest_image = cost_image.max(dim=0).values       # (B,)
+    return (hardest_caption + hardest_image).mean()
+
+
 def sigmoid_contrastive_loss(
     vision_proj: torch.Tensor,
     language_proj: torch.Tensor,
@@ -1398,16 +1433,20 @@ def compute_jepa_loss(
     gamma: float = 0.1,       # weight for variance regularization (anti-collapse)
     memory_bank: Optional['MemoryBank'] = None,
     label_smoothing: float = 0.0,  # SigLIP target smoothing (anti-overfit)
+    hard_negative_weight: float = 0.0,  # delta: VSE++ hardest-negative ranking term
+    hard_negative_margin: float = 0.2,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute VL-JEPA loss:
 
-      L = α * L_mse + β * L_nce + γ * L_var
+      L = α * L_mse + β * L_nce + γ * L_var + δ * L_hardneg
 
     L_mse: MSE between predicted and target patch embeddings, averaged over
            masked positions only (skip [CLS] token at index 0).
-    L_nce: InfoNCE loss aligning vision and language [CLS] projections.
+    L_nce: InfoNCE/SigLIP loss aligning vision and language projections.
     L_var: VICReg-style variance loss on pre-normalized projections (prevents collapse).
+    L_hardneg: VSE++ max-violation hinge on the hardest in-batch negative,
+           sharpening Recall@1 once in-batch accuracy saturates (δ defaults to 0).
     """
     predicted = outputs['predicted_patches']   # (B, N+1, D)
     target = outputs['target_patches']          # (B, N+1, D), detached
@@ -1479,13 +1518,27 @@ def compute_jepa_loss(
     language_raw = outputs['language_proj_raw'].float()
     var_loss = (variance_loss(vision_raw) + variance_loss(language_raw)) / 2
 
+    # ---- Hard-negative ranking (VSE++ max-violation) ----
+    if hard_negative_weight > 0.0:
+        hard_neg_loss = hard_negative_ranking_loss(
+            vision_proj, language_proj, margin=hard_negative_margin,
+        )
+    else:
+        hard_neg_loss = vision_proj.new_zeros(())
+
     # ---- Total ----
-    total_loss = alpha * mse_masked + beta * nce_loss + gamma * var_loss
+    total_loss = (
+        alpha * mse_masked
+        + beta * nce_loss
+        + gamma * var_loss
+        + hard_negative_weight * hard_neg_loss
+    )
 
     return {
         'mse_loss': mse_masked,
         'nce_loss': nce_loss,
         'var_loss': var_loss,
+        'hard_neg_loss': hard_neg_loss,
         'total_loss': total_loss,
         'logit_scale': scale.detach(),
         'nce_acc': nce_acc,

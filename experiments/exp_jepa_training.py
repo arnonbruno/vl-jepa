@@ -287,6 +287,13 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
     parser.add_argument('--label-smoothing', type=float,
                         default=loss.get('label_smoothing', 0.0),
                         help='SigLIP target label smoothing (anti-overfit)')
+    parser.add_argument('--hard-negative-weight', type=float,
+                        default=loss.get('hard_negative_weight', 0.0),
+                        help='VSE++ hardest-negative ranking weight (delta); '
+                             'sharpens Recall@1 once in-batch accuracy saturates')
+    parser.add_argument('--hard-negative-margin', type=float,
+                        default=loss.get('hard_negative_margin', 0.2),
+                        help='Margin for the hard-negative ranking hinge')
     parser.add_argument('--encoder-unfreeze-lr', type=float,
                         default=training.get('encoder_unfreeze_lr', 1e-5),
                         help='LR for unfrozen vision encoder blocks')
@@ -391,6 +398,8 @@ def main() -> None:
             beta=args.beta,
             gamma=args.gamma,
             label_smoothing=args.label_smoothing,
+            hard_negative_weight=args.hard_negative_weight,
+            hard_negative_margin=args.hard_negative_margin,
             encoder_unfreeze_lr=args.encoder_unfreeze_lr,
             unfreeze_vision_blocks=args.unfreeze_vision_blocks,
             max_grad_norm=args.max_grad_norm,
@@ -476,7 +485,15 @@ def main() -> None:
             max_caption_length=args.max_caption_length,
             download=args.download,
             prefetch_factor=args.prefetch_factor,
+            text_backbone=model_cfg.get("text_backbone", "distilbert-base-uncased"),
+            openclip_model=model_cfg.get("openclip_model", "ViT-B-16"),
         )
+        tok_kind = (
+            "CLIP BPE"
+            if (model_cfg.get("text_backbone", "") or "").lower() == "openclip"
+            else "DistilBERT"
+        )
+        print(f"  Caption tokenizer: {tok_kind}")
     print(f"  DataLoader: num_workers={workers}, prefetch_factor={args.prefetch_factor}, "
           f"pin_memory={torch.cuda.is_available()}, persistent_workers={workers > 0}")
 
@@ -520,6 +537,8 @@ def main() -> None:
         beta=loss_cfg["beta"],
         gamma=loss_cfg.get("gamma", 0.1),
         label_smoothing=loss_cfg.get("label_smoothing", 0.0),
+        hard_negative_weight=loss_cfg.get("hard_negative_weight", 0.0),
+        hard_negative_margin=loss_cfg.get("hard_negative_margin", 0.2),
         max_grad_norm=train_cfg.get("max_grad_norm", 1.0),
         memory_bank_size=train_cfg.get("memory_bank_size", 65536),
         unfreeze_after_epoch=train_cfg.get("unfreeze_after_epoch"),

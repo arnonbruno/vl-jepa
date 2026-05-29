@@ -98,6 +98,8 @@ def overrides_from_cli(**kwargs: Any) -> Dict[str, Any]:
         "beta": (loss, "beta"),
         "gamma": (loss, "gamma"),
         "label_smoothing": (loss, "label_smoothing"),
+        "hard_negative_weight": (loss, "hard_negative_weight"),
+        "hard_negative_margin": (loss, "hard_negative_margin"),
         "encoder_unfreeze_lr": (training, "encoder_unfreeze_lr"),
         "unfreeze_vision_blocks": (training, "unfreeze_vision_blocks"),
         "samples": (data, "samples"),
