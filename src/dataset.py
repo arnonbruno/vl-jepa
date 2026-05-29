@@ -161,24 +161,34 @@ def ensure_coco_2017(
 
 def _build_image_transform(image_size: int, split: str) -> transforms.Compose:
     if split == "train":
-        image_ops = [
-            transforms.RandomResizedCrop(
-                image_size,
-                scale=(0.50, 1.00),
-                ratio=(0.75, 1.3333),
-                antialias=True,
-            ),
-            transforms.RandomHorizontalFlip(p=0.5),
-        ]
-    else:
-        image_ops = [
-            transforms.Resize(image_size, antialias=True),
-            transforms.CenterCrop(image_size),
-        ]
+        # Photometric + occlusion augmentation reduces overfitting: the model
+        # otherwise sees near-identical pixels every epoch once the geometric
+        # crop/flip stops being novel. Color jitter / grayscale break colour
+        # shortcuts; RandomErasing (applied post-normalize on the tensor) acts
+        # as patch-level cutout.
+        return transforms.Compose(
+            [
+                transforms.RandomResizedCrop(
+                    image_size,
+                    scale=(0.50, 1.00),
+                    ratio=(0.75, 1.3333),
+                    antialias=True,
+                ),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomApply(
+                    [transforms.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8
+                ),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=list(IMAGENET_MEAN), std=list(IMAGENET_STD)),
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.20)),
+            ]
+        )
 
     return transforms.Compose(
         [
-            *image_ops,
+            transforms.Resize(image_size, antialias=True),
+            transforms.CenterCrop(image_size),
             transforms.ToTensor(),
             transforms.Normalize(mean=list(IMAGENET_MEAN), std=list(IMAGENET_STD)),
         ]

@@ -278,6 +278,15 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
                         help='InfoNCE loss weight')
     parser.add_argument('--gamma', type=float, default=loss.get('gamma', 0.1),
                         help='Variance regularization weight (anti-collapse)')
+    parser.add_argument('--label-smoothing', type=float,
+                        default=loss.get('label_smoothing', 0.0),
+                        help='SigLIP target label smoothing (anti-overfit)')
+    parser.add_argument('--encoder-unfreeze-lr', type=float,
+                        default=training.get('encoder_unfreeze_lr', 1e-5),
+                        help='LR for unfrozen vision encoder blocks')
+    parser.add_argument('--unfreeze-vision-blocks', type=int,
+                        default=training.get('unfreeze_vision_blocks', 2),
+                        help='Number of last vision blocks to unfreeze')
     parser.add_argument(
         '--max-grad-norm',
         type=float,
@@ -373,6 +382,9 @@ def main() -> None:
             alpha=args.alpha,
             beta=args.beta,
             gamma=args.gamma,
+            label_smoothing=args.label_smoothing,
+            encoder_unfreeze_lr=args.encoder_unfreeze_lr,
+            unfreeze_vision_blocks=args.unfreeze_vision_blocks,
             max_grad_norm=args.max_grad_norm,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             output_dir=args.output_dir,
@@ -497,6 +509,7 @@ def main() -> None:
         alpha=loss_cfg["alpha"],
         beta=loss_cfg["beta"],
         gamma=loss_cfg.get("gamma", 0.1),
+        label_smoothing=loss_cfg.get("label_smoothing", 0.0),
         max_grad_norm=train_cfg.get("max_grad_norm", 1.0),
         memory_bank_size=train_cfg.get("memory_bank_size", 65536),
         unfreeze_after_epoch=train_cfg.get("unfreeze_after_epoch"),

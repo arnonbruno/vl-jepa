@@ -256,12 +256,17 @@ def _unpack_cached_batch(
 
 
 def loss_weights_for_epoch(epoch: int) -> Tuple[float, float, float]:
-    """Return phase-training weights for a 1-based epoch number."""
-    if epoch <= 5:
+    """Return phase-training (alpha, beta, gamma) weights for a 1-based epoch.
+
+    Phase A (warmup): contrastive-only so the projection heads stabilize.
+    Phase B onward: a gentle JEPA prediction weight is mixed in. The MSE term
+    regularizes the (partially unfrozen) vision encoder toward spatially
+    predictable features instead of pure contrastive shortcuts, which helps
+    curb the val-loss overfitting seen once vision unfreezes.
+    """
+    if epoch <= 3:
         return 0.0, 1.0, 0.01
-    if epoch <= 20:
-        return 0.2, 0.8, 0.01
-    return 0.3, 0.7, 0.01
+    return 0.1, 0.9, 0.01
 
 
 @torch.no_grad()
@@ -339,6 +344,7 @@ class VL_JEPA_Trainer:
         alpha: float = 0.5,        # MSE weight
         beta: float = 0.5,         # InfoNCE weight
         gamma: float = 0.1,         # Variance regularization weight
+        label_smoothing: float = 0.0,  # SigLIP target smoothing (anti-overfit)
         momentum_tau: float = 0.996,
         momentum_tau_end: float = 1.0,
         momentum_schedule_steps: int = 15_000,
@@ -372,6 +378,7 @@ class VL_JEPA_Trainer:
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
+        self.label_smoothing = float(label_smoothing)
         self.use_multi_crop = use_multi_crop
         self.global_crop_size = global_crop_size
         self.local_crop_size = local_crop_size
@@ -881,6 +888,7 @@ class VL_JEPA_Trainer:
 
             loss_dict = compute_jepa_loss(
                 outputs, self.alpha, self.beta, self.gamma, memory_bank=self.memory_bank,
+                label_smoothing=self.label_smoothing,
             )
             loss = loss_dict['total_loss']
 
@@ -982,6 +990,7 @@ class VL_JEPA_Trainer:
             )
             loss_dict = compute_jepa_loss(
                 outputs, self.alpha, self.beta, self.gamma, memory_bank=self.memory_bank,
+                label_smoothing=self.label_smoothing,
             )
             if not self._loss_is_finite(loss_dict['total_loss'], loss_dict):
                 return {

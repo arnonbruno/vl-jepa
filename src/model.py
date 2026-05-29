@@ -1127,8 +1127,15 @@ def sigmoid_contrastive_loss(
     language_proj: torch.Tensor,
     logit_scale: torch.Tensor,
     logit_bias: torch.Tensor,
+    label_smoothing: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """SigLIP-style pairwise sigmoid contrastive loss."""
+    """SigLIP-style pairwise sigmoid contrastive loss.
+
+    ``label_smoothing`` softens the hard +1/-1 sign targets: each pair is treated
+    as correct with probability ``1 - label_smoothing`` and flipped with
+    probability ``label_smoothing``. This discourages overconfident logits and
+    acts as a regularizer when the contrastive head starts to overfit.
+    """
     batch_size = vision_proj.size(0)
     scale = logit_scale.float().clamp(LOGIT_SCALE_MIN, LOGIT_SCALE_MAX).exp()
     logits = vision_proj.float() @ language_proj.float().T
@@ -1136,7 +1143,13 @@ def sigmoid_contrastive_loss(
 
     labels = -torch.ones_like(logits)
     labels.diagonal().fill_(1.0)
-    loss = -F.logsigmoid(labels * logits).sum() / batch_size
+    ls = float(label_smoothing)
+    if ls > 0.0:
+        log_pos = F.logsigmoid(labels * logits)
+        log_neg = F.logsigmoid(-labels * logits)
+        loss = -((1.0 - ls) * log_pos + ls * log_neg).sum() / batch_size
+    else:
+        loss = -F.logsigmoid(labels * logits).sum() / batch_size
 
     target = torch.arange(batch_size, device=logits.device)
     i2t_acc = (logits.argmax(dim=1) == target).float().mean()
@@ -1150,6 +1163,7 @@ def compute_jepa_loss(
     beta: float = 0.5,        # weight for InfoNCE contrastive loss
     gamma: float = 0.1,       # weight for variance regularization (anti-collapse)
     memory_bank: Optional['MemoryBank'] = None,
+    label_smoothing: float = 0.0,  # SigLIP target smoothing (anti-overfit)
 ) -> Dict[str, torch.Tensor]:
     """
     Compute VL-JEPA loss:
@@ -1201,6 +1215,7 @@ def compute_jepa_loss(
             language_proj,
             logit_scale,
             outputs.get('logit_bias', torch.tensor(-10.0, device=vision_proj.device)),
+            label_smoothing=label_smoothing,
         )
     elif loss_type == 'infonce':
         labels = torch.arange(batch_size, device=vision_proj.device)

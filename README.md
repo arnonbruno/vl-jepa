@@ -84,9 +84,14 @@ L_var:    VICReg variance on vision_proj_raw and language_proj_raw
 
 | Phase | Epochs | α (MSE) | β (SigLIP) | γ (Var) | What happens |
 |-------|--------|---------|------------|---------|--------------|
-| A | 1-5 | 0.0 | 1.0 | 0.01 | Alignment only, frozen encoders |
-| B | 6-20 | 0.2 | 0.8 | 0.01 | Add JEPA MSE, unfreeze last 4 vision blocks (epoch 5, `encoder_unfreeze_lr=5e-5`) |
-| C | 21+ | 0.3 | 0.7 | 0.01 | Full training |
+| A | 1-3 | 0.0 | 1.0 | 0.01 | Alignment only, frozen encoders |
+| B | 4+ | 0.1 | 0.9 | 0.01 | Add gentle JEPA MSE; unfreeze last 4 vision blocks (epoch 5, `encoder_unfreeze_lr=2e-5`) |
+
+The contrastive head also uses SigLIP label smoothing (`loss.label_smoothing`, default
+0.05) and the train image pipeline adds colour jitter / grayscale / random erasing to
+curb overfitting. The training micro-batch is 128 (× 2 grad-accum = effective 256); a
+larger *real* batch is what increases SigLIP in-batch negatives, since accumulation
+averages independent per-micro-batch sigmoid losses.
 
 ---
 
@@ -182,7 +187,8 @@ python experiments/exp_jepa_training.py \
 | `--contrastive-loss` | `siglip` | Loss type: `siglip` or `infonce` |
 | `--phase-training` | false | Use phased α/β/γ schedule |
 | `--gradient-checkpointing` | false | Reduce VRAM at cost of speed |
-| `--unfreeze-after-epoch` | 5 | Epoch to unfreeze the last 4 vision blocks (`encoder_unfreeze_lr=5e-5`) |
+| `--unfreeze-after-epoch` | 5 | Epoch to unfreeze the last 4 vision blocks (`encoder_unfreeze_lr=2e-5`) |
+| `--label-smoothing` | 0.05 | SigLIP target smoothing (anti-overfit) |
 | `--resume` | — | Resume from checkpoint |
 | `--fresh` | — | Start from scratch |
 

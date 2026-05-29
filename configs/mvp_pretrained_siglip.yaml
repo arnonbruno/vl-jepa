@@ -15,10 +15,14 @@ model:
 
 training:
   epochs: 50
-  batch_size: 32
-  gradient_accumulation_steps: 8  # effective batch = 256
+  # Larger real micro-batch = more SigLIP in-batch negatives. Gradient
+  # accumulation averages independent per-micro-batch sigmoid losses, so it does
+  # NOT add negatives; only the true forward batch does. Effective batch stays
+  # 256 (128 x 2) to keep the LR/EMA step horizon unchanged.
+  batch_size: 128
+  gradient_accumulation_steps: 2  # effective batch = 256, 4x more negatives/step
   learning_rate: 1.0e-4
-  weight_decay: 0.05
+  weight_decay: 0.1  # stronger regularization to counter overfitting
   warmup_steps: 500
   max_steps: null
   use_multi_crop: true
@@ -28,19 +32,20 @@ training:
   gradient_checkpointing: true
   unfreeze_after_epoch: 5
   unfreeze_vision_blocks: 4
-  encoder_unfreeze_lr: 5.0e-5
+  encoder_unfreeze_lr: 2.0e-5  # gentler fine-tuning; overfitting began at unfreeze
   max_grad_norm: 1.0
   memory_bank_size: 0
 
 loss:
-  alpha: 0.0
-  beta: 1.0
+  alpha: 0.1   # enable JEPA MSE prediction (regularizes the vision encoder)
+  beta: 0.9    # contrastive
   gamma: 0.01
+  label_smoothing: 0.05  # soften SigLIP +1/-1 targets to reduce overconfidence
 
 data:
   coco_root: ~/.cache/torch/hub/checkpoints
   image_size: 224
-  batch_size: 32
+  batch_size: 128
   num_workers: 8
   prefetch_factor: 4
   max_caption_length: 64
