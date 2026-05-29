@@ -15,7 +15,7 @@ VL-JEPA learns joint vision-language representations by:
 2. **Aligning** image and text in a shared projection space (SigLIP sigmoid loss).
 3. **Regularizing** embedding variance (VICReg-style) to prevent collapse.
 
-This implementation uses **pretrained frozen encoders** (timm MAE ViT-B/16 + HuggingFace DistilBERT) as a starting point, with **phased training** that gradually introduces JEPA reconstruction after contrastive alignment is established.
+This implementation uses **pretrained frozen encoders** (timm CLIP-pretrained ViT-B/16 + HuggingFace DistilBERT) as a starting point, with **phased training** that gradually introduces JEPA reconstruction after contrastive alignment is established. The vision backbone starts from multimodally-aligned CLIP features (pretrained on 400M image-text pairs) rather than reconstruction-pretrained MAE features, giving the model a strong vision-language prior from the outset.
 
 ---
 
@@ -31,7 +31,7 @@ This implementation uses **pretrained frozen encoders** (timm MAE ViT-B/16 + Hug
            ▼                                              ▼
   ┌────────────────────┐                       ┌────────────────────┐
   │  Context encoder   │  75% block-masked     │  Language encoder  │
-  │  (timm MAE ViT-B)  │  local/global views   │  (DistilBERT)      │
+  │ (timm CLIP ViT-B)  │  local/global views   │  (DistilBERT)      │
   │  frozen, 86M params│                       │  frozen, 66M params│
   └─────────┬──────────┘                       └─────────┬──────────┘
             │                                            │
@@ -43,8 +43,8 @@ This implementation uses **pretrained frozen encoders** (timm MAE ViT-B/16 + Hug
             MSE (masked patches)│                        │
                                 ▼                        ▼
   ┌────────────────────┐              ┌──────────────────────────────────┐
-  │  Target encoder    │◄── EMA τ ────│  Projection heads (MLP)         │
-  │  (frozen teacher)  │   0.996→1.0  │  768 → 256, L2-normalized       │
+  │  Target encoder    │◄── EMA τ ────  │  Projection heads (MLP)         │
+  │  (frozen teacher)  │   0.996→1.0  │  768 → 512, L2-normalized       │
   │  full-image patches│              │  Global CLS → vision_proj       │
   └────────────────────┘              └───────────────┬──────────────────┘
                                                       │
@@ -62,11 +62,11 @@ This implementation uses **pretrained frozen encoders** (timm MAE ViT-B/16 + Hug
 
 | Component | Role | Details |
 |-----------|------|---------|
-| **Context encoder** | Student ViT; encodes masked/cropped images | timm MAE ViT-B/16, frozen in phase A |
+| **Context encoder** | Student ViT; encodes masked/cropped images | timm CLIP ViT-B/16 (`openai`), frozen in phase A |
 | **Target encoder** | EMA copy of context encoder; stop-gradient patch targets | Same weights, τ cosine 0.996→1.0 |
 | **Predictor** | Lightweight transformer; predicts teacher patch embeddings | 4 layers |
 | **Language encoder** | Text encoder | DistilBERT (frozen), mean pooling |
-| **Projection heads** | 2-layer MLP: LayerNorm→Linear→GELU→Linear→L2 | 768→256, 10× base LR |
+| **Projection heads** | 2-layer MLP: LayerNorm→Linear→GELU→Linear→L2 | 768→512, 10× base LR |
 | **SigLIP loss** | Pairwise sigmoid contrastive loss | No softmax, works at small batches |
 | **Variance reg** | VICReg-style std ≥ 1 on pre-norm projections | γ = 0.01 |
 
@@ -85,12 +85,25 @@ L_var:    VICReg variance on vision_proj_raw and language_proj_raw
 | Phase | Epochs | α (MSE) | β (SigLIP) | γ (Var) | What happens |
 |-------|--------|---------|------------|---------|--------------|
 | A | 1-5 | 0.0 | 1.0 | 0.01 | Alignment only, frozen encoders |
-| B | 6-20 | 0.2 | 0.8 | 0.01 | Add JEPA MSE, unfreeze last encoder blocks |
+| B | 6-20 | 0.2 | 0.8 | 0.01 | Add JEPA MSE, unfreeze last 4 vision blocks (epoch 5, `encoder_unfreeze_lr=5e-5`) |
 | C | 21+ | 0.3 | 0.7 | 0.01 | Full training |
 
 ---
 
-## Results (RTX 3090, COCO 2017, 1 epoch)
+## Results (CLIP backbone, COCO 2017, epoch 16)
+
+Current metrics with the CLIP-pretrained ViT-B/16 backbone and gradient accumulation:
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| **i2t R@1** | ~24% | Image→text retrieval (vs MAE baseline: 14.7% after 22 epochs) |
+| **t2i R@1** | ~25% | Text→image retrieval |
+| **NCE@1** | ~92% | In-batch retrieval accuracy |
+| **Val Loss** | 0.77 | — |
+
+The CLIP backbone reaches ~24-25% R@1 by epoch 16, well above the MAE baseline's 14.7% R@1 after 22 epochs — the multimodally-aligned starting features converge faster and higher.
+
+### Early SigLIP baseline (RTX 3090, COCO 2017, 1 epoch)
 
 | Metric | Value | Notes |
 |--------|-------|-------|
@@ -148,6 +161,7 @@ python experiments/exp_jepa_training.py \
   --config configs/mvp_pretrained_siglip.yaml \
   --epochs 30 \
   --batch-size 8 \
+  --gradient-accumulation-steps 8 \
   --phase-training \
   --gradient-checkpointing \
   --unfreeze-after-epoch 5 \
@@ -160,14 +174,15 @@ python experiments/exp_jepa_training.py \
 |----------|---------|-------------|
 | `--config` | `configs/default.yaml` | YAML training config |
 | `--epochs` | 15 | Training epochs |
-| `--batch-size` | 8 | Batch size |
+| `--batch-size` | 8 | Batch size (per accumulation step) |
+| `--gradient-accumulation-steps` | 8 | Steps to accumulate before optimizer step; effective batch size = `batch_size × accumulation_steps` |
 | `--lr` | 1e-4 | Peak learning rate |
-| `--vision-backbone` | `vit_base_patch16_224.mae` | timm vision model |
+| `--vision-backbone` | `vit_base_patch16_clip_224.openai` | timm vision model (CLIP-pretrained ViT-B/16) |
 | `--text-backbone` | `distilbert-base-uncased` | HuggingFace text model |
 | `--contrastive-loss` | `siglip` | Loss type: `siglip` or `infonce` |
 | `--phase-training` | false | Use phased α/β/γ schedule |
 | `--gradient-checkpointing` | false | Reduce VRAM at cost of speed |
-| `--unfreeze-after-epoch` | — | Epoch to unfreeze encoder blocks |
+| `--unfreeze-after-epoch` | 5 | Epoch to unfreeze the last 4 vision blocks (`encoder_unfreeze_lr=5e-5`) |
 | `--resume` | — | Resume from checkpoint |
 | `--fresh` | — | Start from scratch |
 
