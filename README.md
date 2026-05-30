@@ -22,12 +22,19 @@ This implementation uses **pretrained frozen encoders** as a starting point, wit
 
 ### Breaking the ~25% R@1 ceiling
 
-Two earlier runs (timm CLIP + DistilBERT) both plateaued at ~25% R@1 despite R@5≈52% / R@10≈66% and 78–92% in-batch NCE@1 — the right answer was in the top-10 but never ranked #1. That signature (in-batch accuracy saturated, global Recall@1 stuck) points at the *encoders* and the *negatives*, not optimization. The fixes:
+Three runs — including the OpenCLIP end-to-end one — all plateaued at the **same** 25–26% R@1 despite R@5≈54% / R@10≈68% and ~92% in-batch NCE@1, with val loss still falling. The fact that a CLIP-initialized model couldn't beat its *own zero-shot* baseline (CLIP ViT-B/16 alone scores ~30%+ t2i R@1 on COCO 5K) was the giveaway: **the pretrained cross-modal alignment was being discarded**, so every run relearned alignment from scratch on 118K COCO images and capped at the same place. Two concrete bugs:
 
-1. **OpenCLIP end-to-end** — replaces the weak DistilBERT CLS with CLIP's aligned text tower (the largest structural lever). Enabled by the tokenizer fix above.
-2. **Hard-negative mining** (`loss.hard_negative_weight`) — a VSE++ max-violation hinge that only penalizes the single hardest in-batch negative, directly sharpening top-1 once in-batch accuracy saturates.
-3. **More data** (`src/image_text_dataset.py`, `experiments/download_cc3m.py`) — infrastructure to pretrain on CC3M/CC12M before fine-tuning on COCO (the highest long-term lever; COCO's 118K images are seen ~50× per run).
-4. **Higher resolution** — set `model.image_size: 384`; the OpenCLIP vision tower interpolates its positional embeddings automatically.
+1. **Text was mean-pooled over a causal transformer.** CLIP's text representation lives in the **EOT token** — the only position that attends to the whole sentence under the causal mask. Mean-pooling all token states throws CLIP's pretrained text embedding away.
+2. **CLIP's native projection matrices were never used.** The vision tower stopped at `ln_post` (never applying `visual.proj`, 768→512) and the text tower never applied `text_projection` (512→512). Instead two **randomly-initialized MLP heads** relearned the projection from scratch — discarding the exact matrices CLIP trained on 400M pairs.
+
+**The fix** (`configs/openclip_vitb16_aligned.yaml`): `model.text_pool: eot` + `model.projection_type: clip`. The joint projection is a single linear layer **seeded from CLIP's native `visual.proj` / `text_projection`**, and text is pooled at the EOT token. Together these make the joint embedding *exactly* equal CLIP's `encode_image` / `encode_text` at initialization (verified in `tests/test_smoke.py::test_clip_proj_plus_eot_matches_openclip_encode`), so training **starts at CLIP zero-shot quality** and fine-tunes upward instead of relearning alignment from zero. The trainer auto-drops the 10× projection LR to the base LR for CLIP-seeded projections so the first steps don't blow the pretrained matrices away.
+
+Earlier/secondary levers (still available):
+
+- **OpenCLIP end-to-end** — replaces the weak DistilBERT CLS with CLIP's aligned text tower. Enabled by the CLIP-tokenizer switch.
+- **Hard-negative mining** (`loss.hard_negative_weight`) — a VSE++ max-violation hinge on the hardest in-batch negative. Disabled (`0.0`) in the aligned config to isolate the alignment fix; re-enable (e.g. `0.05`) once the aligned baseline is established.
+- **More data** (`src/image_text_dataset.py`, `experiments/download_cc3m.py`) — pretrain on CC3M/CC12M before COCO (COCO's 118K images are seen ~50× per run).
+- **Higher resolution** — set `model.image_size: 384`; the OpenCLIP vision tower interpolates its positional embeddings automatically.
 
 ---
 
@@ -77,8 +84,8 @@ Two earlier runs (timm CLIP + DistilBERT) both plateaued at ~25% R@1 despite R@5
 | **Context encoder** | Student ViT; encodes masked/cropped images | timm CLIP ViT-B/16 (`openai`), frozen in phase A |
 | **Target encoder** | EMA copy of context encoder; stop-gradient patch targets | Same weights, τ cosine 0.996→1.0 |
 | **Predictor** | Lightweight transformer; predicts teacher patch embeddings | 4 layers |
-| **Language encoder** | Text encoder | DistilBERT (frozen), mean pooling |
-| **Projection heads** | 2-layer MLP: LayerNorm→Linear→GELU→Linear→L2 | 768→512, 10× base LR |
+| **Language encoder** | Text encoder | DistilBERT (mean pool) or OpenCLIP text tower (EOT pool with `text_pool: eot`) |
+| **Projection heads** | `mlp`: LayerNorm→Linear→GELU→Linear→L2 (random, 10× LR). `clip`: single linear **seeded from CLIP `visual.proj`/`text_projection`** (base LR) | 768→512 / 512→512, L2-normalized |
 | **SigLIP loss** | Pairwise sigmoid contrastive loss | No softmax, works at small batches |
 | **Variance reg** | VICReg-style std ≥ 1 on pre-norm projections | γ = 0.01 |
 
@@ -173,18 +180,22 @@ python experiments/exp_jepa_training.py \
   --fresh
 ```
 
-### End-to-end OpenCLIP (recommended for breaking the ceiling)
+### End-to-end OpenCLIP, CLIP-aligned (recommended for breaking the ceiling)
 
 ```bash
 python experiments/exp_jepa_training.py \
-  --config configs/openclip_vitb16.yaml \
-  --epochs 30 \
+  --config configs/openclip_vitb16_aligned.yaml \
+  --epochs 50 \
   --fresh
 ```
 
-This uses aligned CLIP vision+text towers, the CLIP BPE tokenizer (selected
-automatically from `text_backbone: openclip`), and hard-negative mining
-(`hard_negative_weight: 0.2`). Add `--hard-negative-weight 0` to ablate it.
+This starts from CLIP's *aligned* joint space via `projection_type: clip`
+(linear projection seeded from `visual.proj`/`text_projection`) and
+`text_pool: eot` (CLIP end-of-text pooling). Both are required to recover
+CLIP's pretrained alignment; the CLI flags `--projection-type` and
+`--text-pool` expose them. The older `configs/openclip_vitb16.yaml` (random
+MLP projection + mean pooling + `hard_negative_weight: 0.2`) is kept for
+reference and still works unchanged.
 
 ### Pretraining on CC3M before COCO
 
@@ -225,6 +236,8 @@ python experiments/exp_jepa_training.py \
 | `--vision-backbone` | `vit_base_patch16_clip_224.openai` | timm vision model (CLIP-pretrained ViT-B/16) |
 | `--text-backbone` | `distilbert-base-uncased` | HuggingFace text model |
 | `--contrastive-loss` | `siglip` | Loss type: `siglip` or `infonce` |
+| `--projection-type` | `mlp` | `mlp` (random MLP head) or `clip` (linear seeded from CLIP `visual.proj`/`text_projection`) |
+| `--text-pool` | `mean` | `mean` over valid tokens or `eot` (CLIP end-of-text token; required to recover CLIP alignment) |
 | `--phase-training` | false | Use phased α/β/γ schedule |
 | `--gradient-checkpointing` | false | Reduce VRAM at cost of speed |
 | `--unfreeze-after-epoch` | 5 | Epoch to unfreeze the last 4 vision blocks (`encoder_unfreeze_lr=2e-5`) |
@@ -254,7 +267,8 @@ vl-jepa/
 ├── configs/
 │   ├── default.yaml
 │   ├── mvp_pretrained_siglip.yaml
-│   └── openclip_vitb16.yaml  # end-to-end OpenCLIP backbone
+│   ├── openclip_vitb16.yaml          # end-to-end OpenCLIP (random MLP proj, mean pool)
+│   └── openclip_vitb16_aligned.yaml  # CLIP-aligned: clip projection + EOT pooling
 ├── tests/
 │   ├── test_smoke.py
 │   ├── test_dataset.py

@@ -423,12 +423,18 @@ class VL_JEPA_Trainer:
             else:
                 decay_params.append(p)
 
+        # Randomly-initialized MLP projection heads need a higher LR (10x) to
+        # learn alignment from scratch. CLIP-seeded linear projections already
+        # encode the pretrained alignment, so they fine-tune at the base LR —
+        # a 10x LR would blow the pretrained matrices away in the first steps.
+        proj_lr_scale = 1.0 if getattr(model, 'projection_type', 'mlp') == 'clip' else 10.0
+
         param_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': no_decay_params, 'weight_decay': 0.0},
             {'params': predictor_params, 'weight_decay': weight_decay, 'lr': learning_rate * 20.0},
-            # Projection heads need higher LR for contrastive learning
-            {'params': proj_params, 'weight_decay': weight_decay, 'lr': learning_rate * 10.0},
+            # Projection heads (LR scaled by backbone alignment, see above)
+            {'params': proj_params, 'weight_decay': weight_decay, 'lr': learning_rate * proj_lr_scale},
         ]
 
         self.optimizer = optim.AdamW(param_groups, lr=learning_rate, betas=(0.9, 0.95))

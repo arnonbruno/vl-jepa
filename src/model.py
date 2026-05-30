@@ -876,6 +876,49 @@ class ProjectionHead(nn.Module):
         return F.normalize(self.raw(x), p=2, dim=-1, eps=1e-6)
 
 
+class LinearProjection(nn.Module):
+    """Single bias-free linear projection into the joint embedding space.
+
+    Unlike :class:`ProjectionHead` (a randomly-initialized MLP), this can be
+    seeded with CLIP's pretrained image/text projection matrices so the joint
+    space *starts* aligned (i.e. at CLIP zero-shot quality) instead of being
+    relearned from scratch on a small downstream dataset. CLIP computes its
+    embedding as ``x @ proj`` where ``proj`` is ``(in_dim, out_dim)``; an
+    ``nn.Linear`` stores weight as ``(out_dim, in_dim)`` and computes
+    ``x @ weight.T``, so we copy ``proj.T`` into the linear weight.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int = 512,
+        init_weight: Optional[torch.Tensor] = None,
+    ):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim, bias=False)
+        if init_weight is not None:
+            if tuple(init_weight.shape) != (in_dim, out_dim):
+                raise ValueError(
+                    f"CLIP projection init expected shape {(in_dim, out_dim)}, "
+                    f"got {tuple(init_weight.shape)}"
+                )
+            with torch.no_grad():
+                self.linear.weight.copy_(
+                    init_weight.t().to(self.linear.weight.dtype)
+                )
+
+    @property
+    def weight(self) -> torch.nn.Parameter:
+        """Compatibility shim mirroring :class:`ProjectionHead.weight`."""
+        return self.linear.weight
+
+    def raw(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.raw(x), p=2, dim=-1, eps=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # VL-JEPA: Joint Embedding Predictive Architecture
 # ---------------------------------------------------------------------------
@@ -904,6 +947,8 @@ class VL_JEPA(nn.Module):
                  contrastive_loss: str = "infonce",
                  openclip_model: str = "ViT-B-16",
                  openclip_pretrained: Optional[str] = "openai",
+                 projection_type: str = "mlp",
+                 text_pool: str = "mean",
                  gradient_checkpointing: bool = False):
         super().__init__()
 
@@ -917,6 +962,13 @@ class VL_JEPA(nn.Module):
         self.contrastive_loss = contrastive_loss.lower()
         self.openclip_model = openclip_model
         self.openclip_pretrained = openclip_pretrained
+        # "mlp": randomly-initialized projection MLP (legacy default).
+        # "clip": single linear seeded from CLIP's native proj matrices so the
+        #         joint space begins aligned. "eot"/"mean" select text pooling;
+        #         CLIP's text representation lives in the EOT token, so "eot" is
+        #         required to recover CLIP's pretrained text-image alignment.
+        self.projection_type = (projection_type or "mlp").lower()
+        self.text_pool = (text_pool or "mean").lower()
 
         # Share a single open_clip model between vision/text towers so both halves
         # stay weight-aligned and weights are only instantiated once.
@@ -986,8 +1038,32 @@ class VL_JEPA(nn.Module):
                     p.requires_grad = False
 
         # Projections to joint space
-        self.vision_proj = ProjectionHead(self.hidden_dim, projection_dim)
-        self.language_proj = ProjectionHead(self.language_hidden_dim, projection_dim)
+        if self.projection_type == "clip":
+            if shared_openclip is None:
+                raise ValueError(
+                    "projection_type='clip' requires the openclip vision+text "
+                    "backbones (set vision_backbone=text_backbone='openclip')."
+                )
+            vis_native = getattr(shared_openclip.visual, "proj", None)
+            txt_native = getattr(shared_openclip, "text_projection", None)
+            if vis_native is None or txt_native is None:
+                raise ValueError(
+                    f"open_clip model {openclip_model!r} does not expose "
+                    "visual.proj / text_projection for projection_type='clip'."
+                )
+            # CLIP projects both modalities to its shared embed_dim; align the
+            # joint projection_dim to it so the seeded weights load exactly.
+            embed_dim = int(vis_native.shape[1])
+            self.projection_dim = embed_dim
+            self.vision_proj = LinearProjection(
+                self.hidden_dim, embed_dim, init_weight=vis_native.detach(),
+            )
+            self.language_proj = LinearProjection(
+                self.language_hidden_dim, embed_dim, init_weight=txt_native.detach(),
+            )
+        else:
+            self.vision_proj = ProjectionHead(self.hidden_dim, projection_dim)
+            self.language_proj = ProjectionHead(self.language_hidden_dim, projection_dim)
 
         # Student prediction head and EMA teacher head define the MSE loss space.
         # Applying a head on only one side makes the predictor/teacher spaces asymmetric.
@@ -1000,9 +1076,11 @@ class VL_JEPA(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # projection heads with smaller init
-        nn.init.xavier_uniform_(self.vision_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.language_proj.weight, gain=0.1)
+        # Projection heads with smaller init. CLIP-seeded linear projections keep
+        # their pretrained weights — re-initializing would discard the alignment.
+        if self.projection_type != "clip":
+            nn.init.xavier_uniform_(self.vision_proj.weight, gain=0.1)
+            nn.init.xavier_uniform_(self.language_proj.weight, gain=0.1)
         nn.init.xavier_uniform_(self.vision_pred_head.weight, gain=0.1)
 
     @torch.no_grad()
@@ -1068,6 +1146,36 @@ class VL_JEPA(nn.Module):
             mask_token.requires_grad = True
             toggled += 1
         return toggled
+
+    def _pool_language(
+        self,
+        language_emb: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Pool token-level text states into a single sentence embedding.
+
+        ``mean`` averages valid tokens (legacy). ``eot`` selects the end-of-text
+        token — the last valid position — which is where CLIP's causal text
+        tower concentrates its pretrained, image-aligned representation. The EOT
+        index is the last non-pad token, i.e. ``attention_mask.sum(1) - 1``.
+        """
+        if self.text_pool == "eot":
+            if attention_mask is not None:
+                idx = attention_mask.long().sum(dim=1).clamp(min=1) - 1
+            else:
+                idx = torch.full(
+                    (language_emb.size(0),),
+                    language_emb.size(1) - 1,
+                    device=language_emb.device,
+                    dtype=torch.long,
+                )
+            gather_idx = idx.view(-1, 1, 1).expand(-1, 1, language_emb.size(-1))
+            return language_emb.gather(1, gather_idx).squeeze(1)
+
+        if attention_mask is not None:
+            mask_float = attention_mask.unsqueeze(-1).to(language_emb.dtype)
+            return (language_emb * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1.0)
+        return language_emb.mean(dim=1)
 
     def forward(
         self,
@@ -1139,11 +1247,7 @@ class VL_JEPA(nn.Module):
         # Use the full-image student CLS for image-text alignment; the local
         # masked context stays reserved for JEPA patch prediction.
         vision_cls = global_student_emb[:, 0, :]   # (B, D)
-        if attention_mask is not None:
-            mask_float = attention_mask.unsqueeze(-1).float()
-            language_cls = (language_emb * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1.0)
-        else:
-            language_cls = language_emb.mean(dim=1)
+        language_cls = self._pool_language(language_emb, attention_mask)
 
         vision_proj_raw = self.vision_proj.raw(vision_cls)
         language_proj_raw = self.language_proj.raw(language_cls)
@@ -1205,11 +1309,7 @@ class VL_JEPA(nn.Module):
         language_emb = language_emb.float()
 
         vision_cls = global_student_emb[:, 0, :]
-        if attention_mask is not None:
-            mask_float = attention_mask.unsqueeze(-1).float()
-            language_cls = (language_emb * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1.0)
-        else:
-            language_cls = language_emb.mean(dim=1)
+        language_cls = self._pool_language(language_emb, attention_mask)
 
         vision_proj_raw = self.vision_proj.raw(vision_cls)
         language_proj_raw = self.language_proj.raw(language_cls)
@@ -1256,11 +1356,7 @@ class VL_JEPA(nn.Module):
         """Project precomputed encoder outputs to the joint embedding space."""
         vision_cls = vision_patch_emb[:, 0, :].float()
         language_emb = language_emb.float()
-        if attention_mask is not None:
-            mask_float = attention_mask.unsqueeze(-1).float()
-            language_cls = (language_emb * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1.0)
-        else:
-            language_cls = language_emb.mean(dim=1)
+        language_cls = self._pool_language(language_emb, attention_mask)
 
         vision_proj = self.vision_proj(vision_cls)
         language_proj = self.language_proj(language_cls)

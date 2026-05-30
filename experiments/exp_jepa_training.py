@@ -221,6 +221,14 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
                         help='Freeze vision/text encoders')
     parser.add_argument('--projection-dim', type=int, default=model.get('projection_dim', 256),
                         help='Joint embedding projection dimension')
+    parser.add_argument('--projection-type', choices=('mlp', 'clip'),
+                        default=model.get('projection_type', 'mlp'),
+                        help='Joint projection head: "mlp" (random init) or "clip" '
+                             '(linear seeded from CLIP visual.proj/text_projection)')
+    parser.add_argument('--text-pool', choices=('mean', 'eot'),
+                        default=model.get('text_pool', 'mean'),
+                        help='Text pooling: "mean" over valid tokens or "eot" '
+                             '(CLIP end-of-text token; required to recover CLIP alignment)')
     parser.add_argument('--contrastive-loss', choices=('infonce', 'siglip'),
                         default=model.get('contrastive_loss', 'infonce'),
                         help='Contrastive loss type')
@@ -379,6 +387,8 @@ def main() -> None:
             openclip_pretrained=args.openclip_pretrained,
             freeze_encoders=args.freeze_encoders,
             projection_dim=args.projection_dim,
+            projection_type=args.projection_type,
+            text_pool=args.text_pool,
             contrastive_loss=args.contrastive_loss,
             predictor_layers=args.predictor_layers,
             momentum_tau=args.momentum_tau,
@@ -455,6 +465,8 @@ def main() -> None:
         freeze_encoders=model_cfg.get("freeze_encoders", True),
         projection_dim=model_cfg.get("projection_dim", 256),
         contrastive_loss=model_cfg.get("contrastive_loss", "infonce"),
+        projection_type=model_cfg.get("projection_type", "mlp"),
+        text_pool=model_cfg.get("text_pool", "mean"),
     )
     if train_cfg.get("gradient_checkpointing", False):
         model.set_gradient_checkpointing(True)

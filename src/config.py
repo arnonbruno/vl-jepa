@@ -74,6 +74,8 @@ def overrides_from_cli(**kwargs: Any) -> Dict[str, Any]:
         "openclip_pretrained": (model, "openclip_pretrained"),
         "freeze_encoders": (model, "freeze_encoders"),
         "projection_dim": (model, "projection_dim"),
+        "projection_type": (model, "projection_type"),
+        "text_pool": (model, "text_pool"),
         "contrastive_loss": (model, "contrastive_loss"),
         "predictor_layers": (model, "predictor_layers"),
         "momentum_tau": (model, "momentum_tau"),

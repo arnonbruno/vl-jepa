@@ -13,9 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import tempfile
 import os
 
+import torch.nn.functional as F
+
 from src.model import (
     VL_JEPA, VisionEncoder, LanguageEncoder, Predictor, MemoryBank,
-    OpenCLIPVisionEncoder, OpenCLIPLanguageEncoder,
+    OpenCLIPVisionEncoder, OpenCLIPLanguageEncoder, LinearProjection,
     LOGIT_SCALE_MAX, block_patch_mask, compute_jepa_loss, make_multicrop_views,
     sigmoid_contrastive_loss, hard_negative_ranking_loss,
 )
@@ -905,6 +907,186 @@ def test_openclip_vl_jepa_forward():
     print(f"  ✓ OpenCLIP VL-JEPA loss finite: {loss_dict['total_loss']:.4f}")
 
 
+def test_linear_projection_reproduces_clip_matmul():
+    """LinearProjection seeded with a CLIP matrix computes exactly x @ proj."""
+    print("Testing LinearProjection CLIP-matrix seeding...")
+    in_dim, out_dim = 8, 5
+    proj = torch.randn(in_dim, out_dim)
+    head = LinearProjection(in_dim, out_dim, init_weight=proj)
+
+    # weight stored transposed; raw output equals the native x @ proj.
+    assert torch.allclose(head.weight, proj.t(), atol=1e-6)
+    x = torch.randn(4, in_dim)
+    assert torch.allclose(head.raw(x), x @ proj, atol=1e-5)
+    # forward is the L2-normalized projection.
+    expected = F.normalize(x @ proj, p=2, dim=-1, eps=1e-6)
+    assert torch.allclose(head(x), expected, atol=1e-5)
+    print("  ✓ LinearProjection reproduces x @ proj and normalizes")
+
+
+def test_eot_pooling_selects_last_valid_token():
+    """text_pool='eot' returns the last non-pad token state, not a mean."""
+    print("Testing EOT text pooling...")
+    model = _make_model(text_pool="eot")
+    assert model.text_pool == "eot"
+
+    b, seq, dim = 3, 6, HIDDEN_DIM
+    language_emb = torch.randn(b, seq, dim)
+    # Varying caption lengths -> EOT at positions 4, 2, 5.
+    attention_mask = torch.zeros(b, seq, dtype=torch.long)
+    lengths = [5, 3, 6]
+    for i, length in enumerate(lengths):
+        attention_mask[i, :length] = 1
+
+    pooled = model._pool_language(language_emb, attention_mask)
+    for i, length in enumerate(lengths):
+        assert torch.allclose(pooled[i], language_emb[i, length - 1]), i
+    print("  ✓ EOT pooling selects the last valid token per sample")
+
+
+def test_mean_pooling_unchanged_default():
+    """Default text_pool='mean' still averages over valid tokens."""
+    print("Testing mean pooling default...")
+    model = _make_model()
+    assert model.text_pool == "mean"
+
+    language_emb = torch.randn(2, 4, HIDDEN_DIM)
+    attention_mask = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 1]], dtype=torch.long)
+    pooled = model._pool_language(language_emb, attention_mask)
+    expected0 = language_emb[0, :2].mean(dim=0)
+    expected1 = language_emb[1].mean(dim=0)
+    assert torch.allclose(pooled[0], expected0, atol=1e-5)
+    assert torch.allclose(pooled[1], expected1, atol=1e-5)
+    print("  ✓ Mean pooling averages valid tokens")
+
+
+@pytest.mark.skipif(not _HAS_OPEN_CLIP, reason="open_clip_torch not installed")
+def test_clip_projection_seeds_native_matrices():
+    """projection_type='clip' seeds the joint projection from CLIP's matrices."""
+    print("Testing CLIP-native projection seeding...")
+    model = VL_JEPA(
+        hidden_dim=OPENCLIP_VISION_DIM,
+        patch_size=OPENCLIP_PATCH,
+        image_size=OPENCLIP_IMAGE_SIZE,
+        predictor_layers=1,
+        vision_backbone="openclip",
+        text_backbone="openclip",
+        openclip_model=OPENCLIP_MODEL,
+        openclip_pretrained=None,
+        freeze_encoders=True,
+        projection_dim=512,
+        projection_type="clip",
+        text_pool="eot",
+        contrastive_loss="siglip",
+    )
+    assert isinstance(model.vision_proj, LinearProjection)
+    assert isinstance(model.language_proj, LinearProjection)
+    assert model.projection_dim == 512
+    # Vision projection weight must equal the tower's native visual.proj (T).
+    native_vis = model.context_encoder.visual.proj
+    assert torch.allclose(model.vision_proj.weight, native_vis.t(), atol=1e-6)
+    print("  ✓ CLIP vision/text projection matrices loaded into LinearProjection")
+
+
+@pytest.mark.skipif(not _HAS_OPEN_CLIP, reason="open_clip_torch not installed")
+def test_clip_proj_plus_eot_matches_openclip_encode():
+    """EOT pooling + CLIP linear projection reproduce open_clip's encoders.
+
+    This is the crux of the fix: the joint embedding must equal CLIP's own
+    image/text embedding (pre-normalize) so training *starts* aligned instead
+    of relearning alignment from scratch through a random MLP + mean pooling.
+    """
+    print("Testing equivalence to open_clip encode_image/encode_text...")
+    import open_clip
+
+    m = open_clip.create_model(OPENCLIP_MODEL, pretrained=None)
+    m.eval()
+    tokenizer = open_clip.get_tokenizer(OPENCLIP_MODEL)
+    captions = ["a photo of a cat on a mat", "dog"]
+    # open_clip's encode_text adds the full 77-length positional embedding
+    # (no slicing), so the reference must use CLIP's native context length.
+    ids = tokenizer(captions, context_length=77).long()
+    attention_mask = (ids != 0).long()
+    images = torch.randn(2, 3, OPENCLIP_IMAGE_SIZE, OPENCLIP_IMAGE_SIZE)
+
+    with torch.no_grad():
+        ref_img = m.encode_image(images)
+        ref_txt = m.encode_text(ids)
+
+        # Vision: our encoder (ln_post applied) CLS @ native proj.
+        vis_enc = OpenCLIPVisionEncoder(
+            OPENCLIP_MODEL, pretrained=None, freeze=True, shared_model=m,
+        )
+        vis_enc.eval()
+        vis_proj = LinearProjection(
+            OPENCLIP_VISION_DIM, 512, init_weight=m.visual.proj,
+        )
+        cls = vis_enc(images)[:, 0, :]
+        ours_img = vis_proj.raw(cls)
+
+        # Text: our encoder (ln_final applied) EOT token @ native text_projection.
+        txt_enc = OpenCLIPLanguageEncoder(
+            OPENCLIP_MODEL, pretrained=None, freeze=True, shared_model=m,
+        )
+        txt_enc.eval()
+        txt_proj = LinearProjection(
+            OPENCLIP_TEXT_DIM, 512, init_weight=m.text_projection,
+        )
+        lang_emb = txt_enc(ids, attention_mask)
+        eot_idx = attention_mask.sum(dim=1) - 1
+        gather_idx = eot_idx.view(-1, 1, 1).expand(-1, 1, lang_emb.size(-1))
+        eot = lang_emb.gather(1, gather_idx).squeeze(1)
+        ours_txt = txt_proj.raw(eot)
+
+    assert torch.allclose(ours_img, ref_img, atol=1e-4), (ours_img - ref_img).abs().max()
+    assert torch.allclose(ours_txt, ref_txt, atol=1e-4), (ours_txt - ref_txt).abs().max()
+    print("  ✓ Joint embedding matches open_clip encode_image/encode_text")
+
+
+@pytest.mark.skipif(not _HAS_OPEN_CLIP, reason="open_clip_torch not installed")
+def test_clip_projection_vl_jepa_forward_and_backward():
+    """VL-JEPA(projection_type=clip) vision path == CLIP image embedding; grads flow."""
+    print("Testing VL-JEPA clip-projection forward/backward...")
+    model = VL_JEPA(
+        hidden_dim=OPENCLIP_VISION_DIM,
+        patch_size=OPENCLIP_PATCH,
+        image_size=OPENCLIP_IMAGE_SIZE,
+        predictor_layers=1,
+        vision_backbone="openclip",
+        text_backbone="openclip",
+        openclip_model=OPENCLIP_MODEL,
+        openclip_pretrained=None,
+        freeze_encoders=False,
+        projection_dim=512,
+        projection_type="clip",
+        text_pool="eot",
+        contrastive_loss="siglip",
+    )
+    model.eval()
+    images = torch.randn(2, 3, OPENCLIP_IMAGE_SIZE, OPENCLIP_IMAGE_SIZE)
+    ids = torch.randint(1, OPENCLIP_VOCAB, (2, OPENCLIP_SEQ_LEN))
+    attention_mask = torch.ones(2, OPENCLIP_SEQ_LEN, dtype=torch.long)
+
+    with torch.no_grad():
+        outputs = model(images, ids, attention_mask)
+        ref = F.normalize(
+            model.context_encoder(images)[:, 0, :] @ model.context_encoder.visual.proj,
+            p=2, dim=-1, eps=1e-6,
+        )
+    assert outputs['vision_proj'].shape == (2, 512)
+    assert outputs['language_proj'].shape == (2, 512)
+    assert torch.allclose(outputs['vision_proj'], ref, atol=1e-4)
+
+    model.train()
+    outputs = model(images, ids, attention_mask)
+    loss = compute_jepa_loss(outputs, alpha=0.1, beta=0.9, gamma=0.0)['total_loss']
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.vision_proj.weight.grad is not None
+    assert model.language_proj.weight.grad is not None
+    print("  ✓ VL-JEPA clip-projection vision path matches CLIP; gradients flow")
+
+
 if __name__ == '__main__':
     print("=" * 60)
     print("VL-JEPA Tests (v2 — Fixed JEPA)")
@@ -949,6 +1131,12 @@ if __name__ == '__main__':
         ("OpenCLIP Vision Shapes", test_openclip_vision_encoder_shapes),
         ("OpenCLIP Language Shapes", test_openclip_language_encoder_shapes),
         ("OpenCLIP VL-JEPA Forward", test_openclip_vl_jepa_forward),
+        ("LinearProjection CLIP Seed", test_linear_projection_reproduces_clip_matmul),
+        ("EOT Pooling", test_eot_pooling_selects_last_valid_token),
+        ("Mean Pooling Default", test_mean_pooling_unchanged_default),
+        ("CLIP Projection Seeding", test_clip_projection_seeds_native_matrices),
+        ("CLIP Proj == open_clip encode", test_clip_proj_plus_eot_matches_openclip_encode),
+        ("CLIP Proj VL-JEPA Fwd/Bwd", test_clip_projection_vl_jepa_forward_and_backward),
     ]
 
     passed = 0
