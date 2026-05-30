@@ -358,6 +358,7 @@ class VL_JEPA_Trainer:
         memory_bank_size: int = 65536,
         unfreeze_after_epoch: Optional[int] = None,
         unfreeze_vision_blocks: int = 2,
+        unfreeze_text_blocks: int = 0,
         encoder_unfreeze_lr: float = 1e-5,
         check_finite: bool = True,
         nan_diagnostics_dir: Optional[Union[str, Path]] = None,
@@ -390,6 +391,7 @@ class VL_JEPA_Trainer:
         self.max_grad_norm = max_grad_norm
         self.unfreeze_after_epoch = unfreeze_after_epoch
         self.unfreeze_vision_blocks = max(1, int(unfreeze_vision_blocks))
+        self.unfreeze_text_blocks = max(0, int(unfreeze_text_blocks))
         self.encoder_unfreeze_lr = float(encoder_unfreeze_lr)
         self._vision_unfrozen = False
 
@@ -427,7 +429,11 @@ class VL_JEPA_Trainer:
         # learn alignment from scratch. CLIP-seeded linear projections already
         # encode the pretrained alignment, so they fine-tune at the base LR —
         # a 10x LR would blow the pretrained matrices away in the first steps.
-        proj_lr_scale = 1.0 if getattr(model, 'projection_type', 'mlp') == 'clip' else 10.0
+        proj_lr_scale = (
+            1.0
+            if getattr(model, 'projection_type', 'mlp') in ('clip', 'clip_residual')
+            else 10.0
+        )
 
         param_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
@@ -499,8 +505,11 @@ class VL_JEPA_Trainer:
         if epoch < int(self.unfreeze_after_epoch):
             return
 
-        toggled = self.model.unfreeze_vision_last_blocks(self.unfreeze_vision_blocks)
-        if toggled <= 0:
+        vision_toggled = self.model.unfreeze_vision_last_blocks(self.unfreeze_vision_blocks)
+        text_toggled = 0
+        if self.unfreeze_text_blocks > 0:
+            text_toggled = self.model.unfreeze_text_last_blocks(self.unfreeze_text_blocks)
+        if vision_toggled <= 0 and text_toggled <= 0:
             self._vision_unfrozen = True
             return
 
@@ -516,9 +525,12 @@ class VL_JEPA_Trainer:
                 'lr': self.encoder_unfreeze_lr,
             })
             self._rebuild_scheduler()
+            text_msg = (
+                f" + {self.unfreeze_text_blocks} text blocks" if text_toggled > 0 else ""
+            )
             print(
-                f"  -> Unfroze last {self.unfreeze_vision_blocks} vision blocks at epoch {epoch} "
-                f"({len(new_params)} tensors, lr={self.encoder_unfreeze_lr:.2e})"
+                f"  -> Unfroze last {self.unfreeze_vision_blocks} vision blocks{text_msg} "
+                f"at epoch {epoch} ({len(new_params)} tensors, lr={self.encoder_unfreeze_lr:.2e})"
             )
         self._vision_unfrozen = True
 

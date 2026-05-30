@@ -1,0 +1,79 @@
+# OpenCLIP ViT-B/16 end-to-end — v2: break the 43% R@1 over-training ceiling.
+#
+# Diagnosis (measured, not guessed — see experiments/diag_zeroshot.py):
+#   * The wiring is correct: a *fresh* VL-JEPA (frozen, clip proj, eot pool)
+#     reproduces raw open_clip zero-shot on COCO val 5K EXACTLY
+#     (i2t R@1 34.9% / t2i 30.2%). EOT pooling + CLIP-seeded projections work.
+#   * Training *does* help early (epoch 5: i2t 38.4% / t2i 43.0%) but then
+#     OVERFITS: through epoch 18 train NCE@1 climbs to ~98% while val R@1
+#     DECLINES (i2t 36.8% / t2i 41.0%) and val loss bottoms ~epoch 9 then rises.
+#     So 43% is an over-training ceiling, not a wiring/architecture wall.
+#
+# Three root causes and the v2 fixes:
+#   1. Text tower was frozen forever -> only vision adapted, so image features
+#      had to drift the whole distance to the pinned CLIP text space (and
+#      overfit). Fingerprint: t2i lifted +13 pts, i2t only +3.5.
+#      FIX: unfreeze_text_blocks 6 — adapt BOTH towers symmetrically and gently.
+#   2. The 50-epoch cosine never annealed in the useful window (LR sat near peak
+#      while the best checkpoint was epoch 3-5). FIX: epochs 16 so the cosine LR
+#      decays to ~0 around the point the old run started degrading.
+#   3. The fixed-rank CLIP linear projection cannot re-shape the joint space for
+#      COCO; the only lever left was encoder drift. FIX: projection_type
+#      clip_residual — CLIP-seeded linear + a zero-init residual MLP that starts
+#      as an exact identity (still CLIP zero-shot at step 0) and learns a
+#      non-linear alignment correction without disturbing the pretrained matrix.
+#   + hard_negative_weight 0.05: once in-batch sigmoid saturates (NCE@1->98%),
+#     the hardest negatives that actually decide R@1 stop contributing; the
+#     VSE++ max-violation hinge re-injects that top-1 gradient.
+model:
+  hidden_dim: 768
+  patch_size: 16
+  image_size: 224
+  mask_ratio: 0.75
+  text_mask_ratio: 0.0
+  predictor_layers: 4
+  momentum_tau: 0.996
+  vision_backbone: openclip
+  text_backbone: openclip
+  openclip_model: ViT-B-16
+  openclip_pretrained: openai
+  freeze_encoders: true
+  projection_dim: 512
+  projection_type: clip_residual   # CLIP-seeded linear + zero-init residual MLP
+  text_pool: eot
+  contrastive_loss: siglip
+  contrastive_on_global: true
+
+training:
+  epochs: 16              # short horizon so the cosine LR actually anneals
+  batch_size: 128
+  gradient_accumulation_steps: 2
+  learning_rate: 5.0e-5
+  weight_decay: 0.1
+  warmup_steps: 200
+  unfreeze_after_epoch: 2
+  unfreeze_vision_blocks: 6
+  unfreeze_text_blocks: 6   # NEW: adapt the text tower symmetrically with vision
+  encoder_unfreeze_lr: 1.0e-5
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+
+loss:
+  alpha: 0.05   # light JEPA MSE regularization on the vision encoder
+  beta: 1.0     # contrastive alignment dominates
+  gamma: 0.0
+  label_smoothing: 0.05
+  hard_negative_weight: 0.05   # sharpen R@1 once in-batch accuracy saturates
+  hard_negative_margin: 0.2
+
+data:
+  coco_root: ~/.cache/torch/hub/checkpoints
+  image_size: 224
+  num_workers: 8
+  prefetch_factor: 4
+  max_caption_length: 64
+
+output:
+  output_dir: experiments
+  log_interval: 10
+  checkpoint_interval: 4

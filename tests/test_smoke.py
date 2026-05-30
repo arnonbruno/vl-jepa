@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from src.model import (
     VL_JEPA, VisionEncoder, LanguageEncoder, Predictor, MemoryBank,
     OpenCLIPVisionEncoder, OpenCLIPLanguageEncoder, LinearProjection,
+    ResidualLinearProjection,
     LOGIT_SCALE_MAX, block_patch_mask, compute_jepa_loss, make_multicrop_views,
     sigmoid_contrastive_loss, hard_negative_ranking_loss,
 )
@@ -1043,6 +1044,142 @@ def test_clip_proj_plus_eot_matches_openclip_encode():
     print("  ✓ Joint embedding matches open_clip encode_image/encode_text")
 
 
+def test_residual_projection_is_identity_at_init():
+    """ResidualLinearProjection.raw == its CLIP-seeded linear at init (zero residual)."""
+    print("Testing residual projection identity-at-init...")
+    in_dim, out_dim = 8, 5
+    proj = torch.randn(in_dim, out_dim)
+    head = ResidualLinearProjection(in_dim, out_dim, init_weight=proj)
+
+    # Seeded matrix preserved and exposed via the .weight shim.
+    assert torch.allclose(head.weight, proj.t(), atol=1e-6)
+    x = torch.randn(4, in_dim)
+    # Zero-init residual output -> raw(x) starts exactly at the CLIP linear.
+    assert torch.allclose(head.raw(x), x @ proj, atol=1e-5)
+
+    # After a gradient step the residual must be able to move the output.
+    opt = torch.optim.SGD(head.parameters(), lr=1.0)
+    target = torch.randn(4, out_dim)
+    for _ in range(5):
+        opt.zero_grad()
+        loss = F.mse_loss(head.raw(x), target)
+        loss.backward()
+        opt.step()
+    assert not torch.allclose(head.raw(x), x @ proj, atol=1e-4)
+    print("  ✓ Residual projection starts at CLIP, then adapts")
+
+
+@pytest.mark.skipif(not _HAS_OPEN_CLIP, reason="open_clip_torch not installed")
+def test_clip_residual_projection_starts_at_clip_and_trains():
+    """projection_type='clip_residual' == CLIP image embedding at init; grads flow."""
+    print("Testing VL-JEPA clip_residual projection...")
+    model = VL_JEPA(
+        hidden_dim=OPENCLIP_VISION_DIM,
+        patch_size=OPENCLIP_PATCH,
+        image_size=OPENCLIP_IMAGE_SIZE,
+        predictor_layers=1,
+        vision_backbone="openclip",
+        text_backbone="openclip",
+        openclip_model=OPENCLIP_MODEL,
+        openclip_pretrained=None,
+        freeze_encoders=True,
+        projection_dim=512,
+        projection_type="clip_residual",
+        text_pool="eot",
+        contrastive_loss="siglip",
+    )
+    assert isinstance(model.vision_proj, ResidualLinearProjection)
+    assert isinstance(model.language_proj, ResidualLinearProjection)
+    assert model.projection_dim == 512
+
+    model.eval()
+    images = torch.randn(2, 3, OPENCLIP_IMAGE_SIZE, OPENCLIP_IMAGE_SIZE)
+    ids = torch.randint(1, OPENCLIP_VOCAB, (2, OPENCLIP_SEQ_LEN))
+    attention_mask = torch.ones(2, OPENCLIP_SEQ_LEN, dtype=torch.long)
+    with torch.no_grad():
+        outputs = model(images, ids, attention_mask)
+        ref = F.normalize(
+            model.context_encoder(images)[:, 0, :] @ model.context_encoder.visual.proj,
+            p=2, dim=-1, eps=1e-6,
+        )
+    # Zero-init residual -> joint vision embedding starts at plain CLIP.
+    assert torch.allclose(outputs['vision_proj'], ref, atol=1e-4)
+
+    model.train()
+    outputs = model(images, ids, attention_mask)
+    loss = compute_jepa_loss(outputs, alpha=0.1, beta=0.9, gamma=0.0)['total_loss']
+    assert torch.isfinite(loss)
+    loss.backward()
+    # Residual adapter must receive gradient.
+    assert model.vision_proj.residual[-1].weight.grad is not None
+    print("  ✓ clip_residual starts at CLIP zero-shot and trains")
+
+
+@pytest.mark.skipif(not _HAS_OPEN_CLIP, reason="open_clip_torch not installed")
+def test_unfreeze_text_last_blocks_toggles_params():
+    """unfreeze_text_last_blocks should make the last text blocks trainable."""
+    print("Testing text-tower unfreezing...")
+    model = VL_JEPA(
+        hidden_dim=OPENCLIP_VISION_DIM,
+        patch_size=OPENCLIP_PATCH,
+        image_size=OPENCLIP_IMAGE_SIZE,
+        predictor_layers=1,
+        vision_backbone="openclip",
+        text_backbone="openclip",
+        openclip_model=OPENCLIP_MODEL,
+        openclip_pretrained=None,
+        freeze_encoders=True,
+        projection_dim=512,
+        projection_type="clip",
+        text_pool="eot",
+        contrastive_loss="siglip",
+    )
+    before = sum(p.requires_grad for p in model.language_encoder.parameters())
+    toggled = model.unfreeze_text_last_blocks(2)
+    after = sum(p.requires_grad for p in model.language_encoder.parameters())
+
+    assert toggled > 0
+    assert after == before + toggled
+    # Idempotent: re-calling does not double-toggle already-trainable params.
+    assert model.unfreeze_text_last_blocks(2) == 0
+    print(f"  ✓ Text unfreeze toggled {toggled} tensors")
+
+
+@pytest.mark.skipif(not _HAS_OPEN_CLIP, reason="open_clip_torch not installed")
+def test_trainer_unfreezes_text_and_adds_param_group():
+    """Trainer unfreezes both towers at the configured epoch and registers them."""
+    print("Testing trainer symmetric text/vision unfreeze...")
+    model = VL_JEPA(
+        hidden_dim=OPENCLIP_VISION_DIM,
+        patch_size=OPENCLIP_PATCH,
+        image_size=OPENCLIP_IMAGE_SIZE,
+        predictor_layers=1,
+        vision_backbone="openclip",
+        text_backbone="openclip",
+        openclip_model=OPENCLIP_MODEL,
+        openclip_pretrained=None,
+        freeze_encoders=True,
+        projection_dim=512,
+        projection_type="clip",
+        text_pool="eot",
+        contrastive_loss="siglip",
+    )
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trainer = VL_JEPA_Trainer(
+        model, device, learning_rate=1e-4, warmup_steps=0, max_steps=100,
+        alpha=0.0, beta=1.0, unfreeze_after_epoch=1,
+        unfreeze_vision_blocks=2, unfreeze_text_blocks=2,
+    )
+    groups_before = len(trainer.optimizer.param_groups)
+    trainer._maybe_unfreeze_vision(epoch=1)
+    groups_after = len(trainer.optimizer.param_groups)
+
+    assert groups_after == groups_before + 1
+    text_trainable = sum(p.requires_grad for p in model.language_encoder.parameters())
+    assert text_trainable > 0
+    print(f"  ✓ Trainer unfroze text+vision ({text_trainable} text tensors trainable)")
+
+
 @pytest.mark.skipif(not _HAS_OPEN_CLIP, reason="open_clip_torch not installed")
 def test_clip_projection_vl_jepa_forward_and_backward():
     """VL-JEPA(projection_type=clip) vision path == CLIP image embedding; grads flow."""
@@ -1137,6 +1274,10 @@ if __name__ == '__main__':
         ("CLIP Projection Seeding", test_clip_projection_seeds_native_matrices),
         ("CLIP Proj == open_clip encode", test_clip_proj_plus_eot_matches_openclip_encode),
         ("CLIP Proj VL-JEPA Fwd/Bwd", test_clip_projection_vl_jepa_forward_and_backward),
+        ("Residual Proj Identity Init", test_residual_projection_is_identity_at_init),
+        ("CLIP Residual Proj", test_clip_residual_projection_starts_at_clip_and_trains),
+        ("Text Unfreeze Toggles", test_unfreeze_text_last_blocks_toggles_params),
+        ("Trainer Text+Vision Unfreeze", test_trainer_unfreezes_text_and_adds_param_group),
     ]
 
     passed = 0

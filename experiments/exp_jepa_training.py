@@ -221,10 +221,11 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
                         help='Freeze vision/text encoders')
     parser.add_argument('--projection-dim', type=int, default=model.get('projection_dim', 256),
                         help='Joint embedding projection dimension')
-    parser.add_argument('--projection-type', choices=('mlp', 'clip'),
+    parser.add_argument('--projection-type', choices=('mlp', 'clip', 'clip_residual'),
                         default=model.get('projection_type', 'mlp'),
-                        help='Joint projection head: "mlp" (random init) or "clip" '
-                             '(linear seeded from CLIP visual.proj/text_projection)')
+                        help='Joint projection head: "mlp" (random init), "clip" '
+                             '(linear seeded from CLIP visual.proj/text_projection), or '
+                             '"clip_residual" (CLIP linear + zero-init residual MLP adapter)')
     parser.add_argument('--text-pool', choices=('mean', 'eot'),
                         default=model.get('text_pool', 'mean'),
                         help='Text pooling: "mean" over valid tokens or "eot" '
@@ -308,6 +309,11 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
     parser.add_argument('--unfreeze-vision-blocks', type=int,
                         default=training.get('unfreeze_vision_blocks', 2),
                         help='Number of last vision blocks to unfreeze')
+    parser.add_argument('--unfreeze-text-blocks', type=int,
+                        default=training.get('unfreeze_text_blocks', 0),
+                        help='Number of last text-tower blocks to unfreeze '
+                             '(0 = keep text frozen). Symmetric adaptation lets '
+                             'both modalities meet in a downstream-aligned space')
     parser.add_argument(
         '--max-grad-norm',
         type=float,
@@ -412,6 +418,7 @@ def main() -> None:
             hard_negative_margin=args.hard_negative_margin,
             encoder_unfreeze_lr=args.encoder_unfreeze_lr,
             unfreeze_vision_blocks=args.unfreeze_vision_blocks,
+            unfreeze_text_blocks=args.unfreeze_text_blocks,
             max_grad_norm=args.max_grad_norm,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             output_dir=args.output_dir,
@@ -555,6 +562,7 @@ def main() -> None:
         memory_bank_size=train_cfg.get("memory_bank_size", 65536),
         unfreeze_after_epoch=train_cfg.get("unfreeze_after_epoch"),
         unfreeze_vision_blocks=train_cfg.get("unfreeze_vision_blocks", 2),
+        unfreeze_text_blocks=train_cfg.get("unfreeze_text_blocks", 0),
         encoder_unfreeze_lr=train_cfg.get("encoder_unfreeze_lr", 1e-5),
         use_multi_crop=train_cfg.get("use_multi_crop", False),
         global_crop_size=train_cfg.get("global_crop_size", model_cfg["image_size"]),

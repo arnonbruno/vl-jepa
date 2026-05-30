@@ -919,6 +919,66 @@ class LinearProjection(nn.Module):
         return F.normalize(self.raw(x), p=2, dim=-1, eps=1e-6)
 
 
+class ResidualLinearProjection(nn.Module):
+    """CLIP-seeded linear projection plus a zero-initialized residual MLP.
+
+    The plain CLIP-seeded :class:`LinearProjection` starts the joint space at
+    CLIP zero-shot quality but, being a single fixed-rank linear map, has little
+    spare capacity to *re-shape* the space toward the downstream (COCO)
+    distribution — it can only rotate/scale CLIP's existing directions. This is
+    the information bottleneck between "CLIP's space" and "the fine-tuned space":
+    COCO needs alignment corrections the frozen-rank linear cannot express, so
+    the only way to improve is to drift the encoders (which overfits).
+
+    The residual MLP operates on the already-projected vector and its final
+    layer is zero-initialized, so at init ``raw(x) == linear(x)`` exactly — the
+    model still *starts* at CLIP zero-shot — but it can learn a non-linear
+    correction in the joint space without disturbing the pretrained matrices.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int = 512,
+        init_weight: Optional[torch.Tensor] = None,
+        hidden_mult: int = 2,
+    ):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim, bias=False)
+        if init_weight is not None:
+            if tuple(init_weight.shape) != (in_dim, out_dim):
+                raise ValueError(
+                    f"CLIP projection init expected shape {(in_dim, out_dim)}, "
+                    f"got {tuple(init_weight.shape)}"
+                )
+            with torch.no_grad():
+                self.linear.weight.copy_(init_weight.t().to(self.linear.weight.dtype))
+
+        hidden = max(out_dim, int(out_dim * hidden_mult))
+        self.residual = nn.Sequential(
+            nn.LayerNorm(out_dim),
+            nn.Linear(out_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, out_dim),
+        )
+        # Zero-init the residual output so the adapter is an identity at init
+        # (raw(x) == linear(x)); training then learns the correction.
+        nn.init.zeros_(self.residual[-1].weight)
+        nn.init.zeros_(self.residual[-1].bias)
+
+    @property
+    def weight(self) -> torch.nn.Parameter:
+        """Compatibility shim mirroring :class:`LinearProjection.weight`."""
+        return self.linear.weight
+
+    def raw(self, x: torch.Tensor) -> torch.Tensor:
+        base = self.linear(x)
+        return base + self.residual(base)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.raw(x), p=2, dim=-1, eps=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # VL-JEPA: Joint Embedding Predictive Architecture
 # ---------------------------------------------------------------------------
@@ -964,9 +1024,14 @@ class VL_JEPA(nn.Module):
         self.openclip_pretrained = openclip_pretrained
         # "mlp": randomly-initialized projection MLP (legacy default).
         # "clip": single linear seeded from CLIP's native proj matrices so the
-        #         joint space begins aligned. "eot"/"mean" select text pooling;
-        #         CLIP's text representation lives in the EOT token, so "eot" is
-        #         required to recover CLIP's pretrained text-image alignment.
+        #         joint space begins aligned.
+        # "clip_residual": the CLIP-seeded linear plus a zero-initialized residual
+        #         MLP — starts identical to "clip" (CLIP zero-shot) but can learn a
+        #         non-linear alignment correction the fixed-rank linear cannot,
+        #         relieving the encoders from having to drift (and overfit) to
+        #         re-shape the joint space for COCO.
+        # "eot"/"mean" select text pooling; CLIP's text representation lives in
+        # the EOT token, so "eot" is required to recover CLIP's alignment.
         self.projection_type = (projection_type or "mlp").lower()
         self.text_pool = (text_pool or "mean").lower()
 
@@ -1038,11 +1103,11 @@ class VL_JEPA(nn.Module):
                     p.requires_grad = False
 
         # Projections to joint space
-        if self.projection_type == "clip":
+        if self.projection_type in ("clip", "clip_residual"):
             if shared_openclip is None:
                 raise ValueError(
-                    "projection_type='clip' requires the openclip vision+text "
-                    "backbones (set vision_backbone=text_backbone='openclip')."
+                    f"projection_type={self.projection_type!r} requires the openclip "
+                    "vision+text backbones (set vision_backbone=text_backbone='openclip')."
                 )
             vis_native = getattr(shared_openclip.visual, "proj", None)
             txt_native = getattr(shared_openclip, "text_projection", None)
@@ -1055,10 +1120,15 @@ class VL_JEPA(nn.Module):
             # joint projection_dim to it so the seeded weights load exactly.
             embed_dim = int(vis_native.shape[1])
             self.projection_dim = embed_dim
-            self.vision_proj = LinearProjection(
+            proj_cls = (
+                ResidualLinearProjection
+                if self.projection_type == "clip_residual"
+                else LinearProjection
+            )
+            self.vision_proj = proj_cls(
                 self.hidden_dim, embed_dim, init_weight=vis_native.detach(),
             )
-            self.language_proj = LinearProjection(
+            self.language_proj = proj_cls(
                 self.language_hidden_dim, embed_dim, init_weight=txt_native.detach(),
             )
         else:
@@ -1078,7 +1148,9 @@ class VL_JEPA(nn.Module):
     def _init_weights(self):
         # Projection heads with smaller init. CLIP-seeded linear projections keep
         # their pretrained weights — re-initializing would discard the alignment.
-        if self.projection_type != "clip":
+        # ``clip_residual`` also keeps the seeded matrix (its residual MLP is
+        # already zero-initialized to start as an identity correction).
+        if self.projection_type not in ("clip", "clip_residual"):
             nn.init.xavier_uniform_(self.vision_proj.weight, gain=0.1)
             nn.init.xavier_uniform_(self.language_proj.weight, gain=0.1)
         nn.init.xavier_uniform_(self.vision_pred_head.weight, gain=0.1)
@@ -1145,6 +1217,51 @@ class VL_JEPA(nn.Module):
         if isinstance(mask_token, torch.nn.Parameter) and not mask_token.requires_grad:
             mask_token.requires_grad = True
             toggled += 1
+        return toggled
+
+    def unfreeze_text_last_blocks(self, num_blocks: int = 2) -> int:
+        """Unfreeze the last ``num_blocks`` text-tower blocks (+ final norm).
+
+        The contrastive head can only adapt the joint space on one modality
+        while the other stays frozen. With the vision tower the only thing that
+        moves, the text embeddings are pinned at CLIP and image features must
+        drift the whole distance to meet them — which overfits. Letting the
+        text tower take a symmetric, gentle step lets *both* sides meet in a
+        downstream-aligned space. Mirrors :meth:`unfreeze_vision_last_blocks`.
+        """
+        enc = self.language_encoder
+        blocks = None
+        tail_modules = []
+        if hasattr(enc, "transformer") and hasattr(enc, "ln_final"):
+            # OpenCLIP text tower: transformer.resblocks + ln_final.
+            blocks = getattr(enc.transformer, "resblocks", None)
+            if blocks is None:
+                blocks = getattr(enc.transformer, "layers", None)
+            if getattr(enc, "ln_final", None) is not None:
+                tail_modules.append(enc.ln_final)
+        elif hasattr(enc, "bert"):
+            # HuggingFace DistilBERT: transformer.layer + final layer norm.
+            transformer = getattr(enc.bert, "transformer", None)
+            blocks = getattr(transformer, "layer", None) if transformer else None
+        elif hasattr(enc, "transformer"):
+            blocks = getattr(enc.transformer, "layers", None)
+            if getattr(enc, "layer_norm", None) is not None:
+                tail_modules.append(enc.layer_norm)
+
+        if blocks is None:
+            return 0
+        blocks = list(blocks)
+        if not blocks:
+            return 0
+        num_blocks = max(1, min(len(blocks), int(num_blocks)))
+        modules = blocks[-num_blocks:] + tail_modules
+
+        toggled = 0
+        for module in modules:
+            for param in module.parameters():
+                if not param.requires_grad:
+                    param.requires_grad = True
+                    toggled += 1
         return toggled
 
     def _pool_language(

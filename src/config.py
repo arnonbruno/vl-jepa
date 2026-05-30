@@ -104,6 +104,7 @@ def overrides_from_cli(**kwargs: Any) -> Dict[str, Any]:
         "hard_negative_margin": (loss, "hard_negative_margin"),
         "encoder_unfreeze_lr": (training, "encoder_unfreeze_lr"),
         "unfreeze_vision_blocks": (training, "unfreeze_vision_blocks"),
+        "unfreeze_text_blocks": (training, "unfreeze_text_blocks"),
         "samples": (data, "samples"),
         "seq_len": (data, "seq_len"),
         "data_dir": (data, "data_dir"),
