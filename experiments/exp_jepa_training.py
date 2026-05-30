@@ -327,6 +327,8 @@ def _build_parser(base_cfg: dict) -> argparse.ArgumentParser:
         help='Accumulate gradients over N micro-batches before an optimizer step '
              '(effective batch = batch_size × N)',
     )
+    parser.add_argument('--max-train-batches', type=int, default=None,
+                        help='Cap train batches per epoch (smoke testing; default: full epoch)')
     parser.add_argument('--log-interval', type=int, default=output.get('log_interval', 10),
                         help='Log every N batches')
     parser.add_argument('--checkpoint-interval', type=int,
@@ -570,7 +572,17 @@ def main() -> None:
         check_finite=not args.no_finite_checks,
         nan_diagnostics_dir=str(nan_diag_dir) if nan_diag_dir else None,
         use_cached_embeddings=use_cached,
+        use_model_ema=train_cfg.get("use_model_ema", False),
+        model_ema_decay=train_cfg.get("model_ema_decay", 0.999),
+        wise_ft_alpha=train_cfg.get("wise_ft_alpha", 1.0),
     )
+    if trainer.use_model_ema or trainer.wise_ft_alpha < 1.0:
+        print(
+            f"  Robust fine-tuning: model_ema={trainer.use_model_ema} "
+            f"(decay={train_cfg.get('model_ema_decay', 0.999)}), "
+            f"wise_ft_alpha={trainer.wise_ft_alpha} — retrieval is evaluated on "
+            "the EMA/WiSE-FT weights and the best checkpoint is selected on R@1."
+        )
 
     if use_cached and train_cfg.get("use_multi_crop", False):
         print(
@@ -639,8 +651,11 @@ def main() -> None:
 
     all_metrics: list[Dict[str, Any]] = []
     best_val_loss = float('inf')
+    best_retrieval = -1.0
     if resume_meta and resume_meta.get('val_loss') is not None:
         best_val_loss = float(resume_meta['val_loss'])
+    if resume_meta and resume_meta.get('retrieval_score') is not None:
+        best_retrieval = float(resume_meta['retrieval_score'])
 
     total_start = time.time()
     graph_logged = False
@@ -667,8 +682,11 @@ def main() -> None:
             }
             epoch_skipped = 0
 
+            epoch_batches = train_batches
+            if args.max_train_batches is not None:
+                epoch_batches = min(train_batches, args.max_train_batches)
             train_iter = iter(train_loader)
-            for batch_idx in range(train_batches):
+            for batch_idx in range(epoch_batches):
                 t_data = time.time()
                 try:
                     batch = next(train_iter)
@@ -699,7 +717,7 @@ def main() -> None:
                 t_fwd = time.time()
                 step_optimizer = (
                     (batch_idx + 1) % accum_steps == 0
-                    or (batch_idx + 1) == train_batches
+                    or (batch_idx + 1) == epoch_batches
                 )
                 metrics = trainer.train_step(
                     images,
@@ -776,9 +794,18 @@ def main() -> None:
             val_nce = val_metrics['nce_loss']
             val_loss = val_metrics['total_loss']
             val_nce_acc = val_metrics['nce_acc']
-            recall_metrics = retrieval_recall(
-                model, val_loader, device, use_cached_embeddings=use_cached,
-            )
+            # Evaluate retrieval on the robust (EMA/WiSE-FT) weights when enabled.
+            # This is a no-op for the legacy recipe (no EMA, wise_ft_alpha=1).
+            with trainer.eval_weights():
+                recall_metrics = retrieval_recall(
+                    model, val_loader, device, use_cached_embeddings=use_cached,
+                )
+            # Retrieval R@1 is the real objective; the SigLIP val loss keeps
+            # dropping while R@1 declines (overfitting), so selecting on val loss
+            # saves the *most* overfit model. Select on mean R@1 instead.
+            retrieval_score = (
+                recall_metrics['i2t_r1'] + recall_metrics['t2i_r1']
+            ) / 2
 
             gpu_mem = torch.cuda.max_memory_allocated() / 1e9 if device.type == 'cuda' else 0
             if device.type == 'cuda':
@@ -836,15 +863,23 @@ def main() -> None:
                         'train/momentum_tau', last_train_metrics['momentum_tau'], step,
                     )
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            best_val_loss = min(best_val_loss, val_loss)
+            if retrieval_score > best_retrieval:
+                best_retrieval = retrieval_score
                 ckpt_path = exp_dir / 'checkpoint_best.pt'
-                trainer.save_checkpoint(str(ckpt_path), {
-                    'epoch': epoch + 1,
-                    'val_loss': val_loss,
-                    'config': cfg,
-                })
-                print(f"  → Best model saved ({val_loss:.4f})")
+                # Persist the robust (EMA/WiSE-FT) weights so the saved best
+                # checkpoint matches the weights that produced this R@1.
+                with trainer.eval_weights():
+                    trainer.save_checkpoint(str(ckpt_path), {
+                        'epoch': epoch + 1,
+                        'val_loss': val_loss,
+                        'retrieval_score': retrieval_score,
+                        'config': cfg,
+                    })
+                print(
+                    f"  → Best model saved (mean R@1 {retrieval_score:.2%}, "
+                    f"val_loss {val_loss:.4f})"
+                )
 
             if (epoch + 1) % out_cfg["checkpoint_interval"] == 0:
                 ckpt_path = exp_dir / f'checkpoint_epoch{epoch+1}.pt'

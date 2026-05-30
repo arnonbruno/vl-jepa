@@ -43,12 +43,14 @@ OPENCLIP_SEQ_LEN = 32
 
 from src.trainer import (
     CheckpointError,
+    ModelEMA,
     VL_JEPA_Trainer,
     _GRAD_SCALER_GROWTH_INTERVAL,
     _MAX_GRAD_SCALER_SCALE,
     _make_grad_scaler,
     find_first_nonfinite_output,
     validate_checkpoint,
+    wise_ft_interpolate,
 )
 
 HIDDEN_DIM = 96
@@ -1222,6 +1224,127 @@ def test_clip_projection_vl_jepa_forward_and_backward():
     assert model.vision_proj.weight.grad is not None
     assert model.language_proj.weight.grad is not None
     print("  ✓ VL-JEPA clip-projection vision path matches CLIP; gradients flow")
+
+
+def _param_state_name(model, target_param) -> str:
+    """Return the state_dict/named_parameters key for a given parameter tensor."""
+    for name, param in model.named_parameters():
+        if param is target_param:
+            return name
+    raise AssertionError("target parameter not found in model")
+
+
+def test_model_ema_tracks_weights_with_decay():
+    """ModelEMA shadow moves toward updated weights by (1 - decay)."""
+    print("Testing ModelEMA decay tracking...")
+    model = _make_model()
+    ema = ModelEMA(model, decay=0.9)
+
+    target = model.vision_proj.weight
+    name = _param_state_name(model, target)
+    before = ema.shadow[name].clone()
+    with torch.no_grad():
+        target.add_(1.0)  # shift weights by +1
+    ema.update(model)
+
+    after = ema.shadow[name]
+    # shadow = 0.9 * before + 0.1 * (before + 1) = before + 0.1
+    expected = before + 0.1
+    assert torch.allclose(after, expected, atol=1e-5)
+    assert torch.isfinite(after).all()
+    print("  ✓ EMA shadow tracks weights by (1 - decay)")
+
+
+def test_wise_ft_interpolate_endpoints_and_midpoint():
+    """WiSE-FT returns zero-shot at alpha=0, fine-tuned at alpha=1, mean at 0.5."""
+    print("Testing WiSE-FT weight interpolation...")
+    zs = {'w': torch.zeros(3, 3), 'n': torch.tensor([1, 2, 3])}
+    ft = {'w': torch.ones(3, 3), 'n': torch.tensor([4, 5, 6])}
+
+    at0 = wise_ft_interpolate(zs, ft, 0.0)
+    at1 = wise_ft_interpolate(zs, ft, 1.0)
+    half = wise_ft_interpolate(zs, ft, 0.5)
+
+    assert torch.allclose(at0['w'], zs['w'])
+    assert torch.allclose(at1['w'], ft['w'])
+    assert torch.allclose(half['w'], torch.full((3, 3), 0.5))
+    # Non-float tensors are taken from the fine-tuned side, not interpolated.
+    assert torch.equal(half['n'], ft['n'])
+
+    with pytest.raises(ValueError):
+        wise_ft_interpolate(zs, ft, 1.5)
+    print("  ✓ WiSE-FT endpoints and midpoint correct")
+
+
+def test_trainer_model_ema_updates_on_optimizer_step():
+    """Enabling model EMA tracks a smoothed copy distinct from live weights."""
+    print("Testing trainer model-EMA updates...")
+    model = _make_model()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trainer = VL_JEPA_Trainer(
+        model, device, learning_rate=1e-2, warmup_steps=0, max_steps=100,
+        alpha=0.0, beta=1.0, use_model_ema=True, model_ema_decay=0.9,
+    )
+    assert trainer.model_ema is not None
+    name = _param_state_name(model, model.vision_proj.weight)
+    init_shadow = trainer.model_ema.shadow[name].clone()
+
+    images = torch.randn(4, 3, IMAGE_SIZE, IMAGE_SIZE, device=device)
+    input_ids = torch.randint(0, VOCAB_SIZE, (4, SEQ_LEN), device=device)
+    for _ in range(3):
+        assert not trainer.train_step(images, input_ids).get('skipped')
+
+    moved_shadow = trainer.model_ema.shadow[name]
+    live = dict(model.named_parameters())[name].detach()
+    # The EMA lags the live weights but must have moved off its init.
+    assert not torch.allclose(moved_shadow, init_shadow)
+    assert not torch.allclose(moved_shadow, live.cpu() if moved_shadow.device.type == 'cpu' else live)
+    print("  ✓ Model EMA tracks a smoothed, distinct weight copy")
+
+
+def test_trainer_eval_weights_swaps_then_restores():
+    """eval_weights() loads robust (EMA/WiSE-FT) weights then restores live ones."""
+    print("Testing eval_weights swap/restore...")
+    model = _make_model()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trainer = VL_JEPA_Trainer(
+        model, device, learning_rate=1e-2, warmup_steps=0, max_steps=100,
+        alpha=0.0, beta=1.0, use_model_ema=True, model_ema_decay=0.5,
+        wise_ft_alpha=0.5,
+    )
+    images = torch.randn(4, 3, IMAGE_SIZE, IMAGE_SIZE, device=device)
+    input_ids = torch.randint(0, VOCAB_SIZE, (4, SEQ_LEN), device=device)
+    for _ in range(3):
+        trainer.train_step(images, input_ids)
+
+    name = _param_state_name(model, model.vision_proj.weight)
+    live_before = dict(model.named_parameters())[name].detach().clone()
+    eval_state = trainer.build_eval_state_dict()
+    # Robust weights differ from the live (overfit-trajectory) weights.
+    assert not torch.allclose(eval_state[name].to(device), live_before)
+
+    with trainer.eval_weights():
+        inside = dict(model.named_parameters())[name].detach()
+        assert torch.allclose(inside, eval_state[name].to(device), atol=1e-5)
+    # Live weights restored exactly after the context exits.
+    after = dict(model.named_parameters())[name].detach()
+    assert torch.allclose(after, live_before, atol=1e-6)
+    print("  ✓ eval_weights swaps robust weights and restores live weights")
+
+
+def test_eval_weights_noop_without_robust_options():
+    """Without EMA/WiSE-FT, eval_weights is a transparent no-op."""
+    print("Testing eval_weights no-op default...")
+    model = _make_model()
+    device = torch.device('cpu')
+    trainer = VL_JEPA_Trainer(model, device, warmup_steps=0, max_steps=10)
+    assert trainer.model_ema is None
+    name = _param_state_name(model, model.vision_proj.weight)
+    before = dict(model.named_parameters())[name].detach().clone()
+    with trainer.eval_weights():
+        inside = dict(model.named_parameters())[name].detach()
+        assert torch.equal(inside, before)
+    print("  ✓ eval_weights is a no-op when robust fine-tuning is disabled")
 
 
 if __name__ == '__main__':

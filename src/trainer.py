@@ -41,6 +41,7 @@ _CHECKPOINT_STATE_KEYS = frozenset({
     'scheduler_state_dict',
     'scaler_state_dict',
     'memory_bank_state_dict',
+    'model_ema_state_dict',
     'step',
     'running_loss',
     'running_steps',
@@ -330,6 +331,82 @@ def retrieval_recall(
     return out
 
 
+class ModelEMA:
+    """Exponential moving average of *all* model tensors (params + buffers).
+
+    Fine-tuning a zero-shot CLIP model on a small dataset (COCO, 118K pairs)
+    drifts the weights away from the robust pretrained solution: retrieval R@1
+    peaks after a couple of epochs and then steadily declines even as the
+    contrastive training loss keeps falling (classic robustness loss, see
+    Wortsman et al. "Robust fine-tuning of zero-shot models", CVPR 2022).
+
+    Averaging the trajectory of weights (Polyak/EMA averaging) keeps a smoothed
+    set of parameters that does not chase the late-epoch overfitting, and is the
+    standard cheap remedy for the "peak-then-decline" pattern. We EMA every
+    floating-point tensor; integer buffers (e.g. token ids) are copied as-is.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        if not 0.0 < decay < 1.0:
+            raise ValueError(f"EMA decay must be in (0, 1), got {decay}")
+        self.decay = float(decay)
+        self.shadow: Dict[str, torch.Tensor] = {
+            name: tensor.detach().clone()
+            for name, tensor in model.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        decay = self.decay
+        for name, tensor in model.state_dict().items():
+            shadow = self.shadow.get(name)
+            if shadow is None:
+                self.shadow[name] = tensor.detach().clone()
+                continue
+            if tensor.is_floating_point():
+                shadow.mul_(decay).add_(tensor.detach(), alpha=1.0 - decay)
+            else:
+                shadow.copy_(tensor.detach())
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return {name: tensor.clone() for name, tensor in self.shadow.items()}
+
+    def load_state_dict(self, state: Dict[str, torch.Tensor]) -> None:
+        for name, tensor in state.items():
+            if name in self.shadow:
+                self.shadow[name].copy_(tensor.to(self.shadow[name].device))
+
+
+def wise_ft_interpolate(
+    zeroshot: Dict[str, torch.Tensor],
+    finetuned: Dict[str, torch.Tensor],
+    alpha: float,
+) -> Dict[str, torch.Tensor]:
+    """WiSE-FT weight-space ensemble: ``(1 - alpha) * zeroshot + alpha * finetuned``.
+
+    ``alpha=1`` returns the fine-tuned weights, ``alpha=0`` the zero-shot model.
+    Intermediate values recover the best-of-both-worlds robustness reported by
+    Wortsman et al. — they beat *every* individual fine-tuning checkpoint on the
+    target distribution at no extra training or inference cost. Only
+    floating-point tensors are interpolated; others are taken from ``finetuned``.
+    """
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"WiSE-FT alpha must be in [0, 1], got {alpha}")
+    out: Dict[str, torch.Tensor] = {}
+    for name, ft_tensor in finetuned.items():
+        zs_tensor = zeroshot.get(name)
+        if (
+            zs_tensor is not None
+            and ft_tensor.is_floating_point()
+            and zs_tensor.shape == ft_tensor.shape
+        ):
+            zs_tensor = zs_tensor.to(ft_tensor.device, ft_tensor.dtype)
+            out[name] = (1.0 - alpha) * zs_tensor + alpha * ft_tensor
+        else:
+            out[name] = ft_tensor.clone()
+    return out
+
+
 class VL_JEPA_Trainer:
     """Trainer for VL-JEPA with proper JEPA loss."""
 
@@ -363,10 +440,32 @@ class VL_JEPA_Trainer:
         check_finite: bool = True,
         nan_diagnostics_dir: Optional[Union[str, Path]] = None,
         use_cached_embeddings: bool = False,
+        use_model_ema: bool = False,
+        model_ema_decay: float = 0.999,
+        wise_ft_alpha: float = 1.0,
     ):
         self.model = model.to(device)
         self.device = device
         self.use_cached_embeddings = use_cached_embeddings
+
+        # ---- Robust fine-tuning state (model-weight EMA + WiSE-FT) ----
+        # These directly target the "R@1 peaks at epoch 3 then declines while
+        # the contrastive loss keeps falling" pattern: EMA smooths the weight
+        # trajectory and WiSE-FT interpolates back toward the robust zero-shot
+        # init. Both are no-ops at eval time unless explicitly enabled.
+        self.use_model_ema = bool(use_model_ema)
+        self.model_ema = (
+            ModelEMA(self.model, model_ema_decay) if self.use_model_ema else None
+        )
+        self.wise_ft_alpha = float(wise_ft_alpha)
+        # Snapshot the zero-shot init (CLIP-seeded weights) on CPU for WiSE-FT.
+        # Only needed when we will actually interpolate (alpha < 1).
+        self._zeroshot_state: Optional[Dict[str, torch.Tensor]] = None
+        if self.wise_ft_alpha < 1.0:
+            self._zeroshot_state = {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in self.model.state_dict().items()
+            }
         projection_dim = getattr(model, "projection_dim", model.hidden_dim)
         self.memory_bank = (
             MemoryBank(memory_bank_size, projection_dim, device)
@@ -810,6 +909,9 @@ class VL_JEPA_Trainer:
         if not self.use_cached_embeddings:
             self.model.momentum_update()
 
+        if self.model_ema is not None:
+            self.model_ema.update(self.model)
+
         self._last_grad_norm = grad_norm_val
         return True, grad_norm_val
 
@@ -1155,6 +1257,47 @@ class VL_JEPA_Trainer:
             raise ValueError("Cannot evaluate an empty validation loader")
         return {k: v / count for k, v in metrics_sum.items()}
 
+    def build_eval_state_dict(self) -> Dict[str, torch.Tensor]:
+        """Return the state dict to evaluate with (EMA + WiSE-FT applied).
+
+        Precedence: start from the EMA weights if model EMA is enabled, else the
+        live weights; then, if ``wise_ft_alpha < 1``, interpolate toward the
+        zero-shot init. This is the "robust" model that should be evaluated and
+        checkpointed instead of the raw last-step weights.
+        """
+        base = (
+            self.model_ema.state_dict()
+            if self.model_ema is not None
+            else self.model.state_dict()
+        )
+        if self._zeroshot_state is not None and self.wise_ft_alpha < 1.0:
+            base = wise_ft_interpolate(
+                self._zeroshot_state, base, self.wise_ft_alpha,
+            )
+        return base
+
+    @contextlib.contextmanager
+    def eval_weights(self):
+        """Temporarily load the robust (EMA/WiSE-FT) weights for evaluation.
+
+        Restores the live training weights on exit so training is unaffected.
+        A no-op when neither model EMA nor WiSE-FT is active.
+        """
+        if self.model_ema is None and (
+            self._zeroshot_state is None or self.wise_ft_alpha >= 1.0
+        ):
+            yield
+            return
+        live = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+        try:
+            eval_state = {
+                k: v.to(self.device) for k, v in self.build_eval_state_dict().items()
+            }
+            self.model.load_state_dict(eval_state, strict=False)
+            yield
+        finally:
+            self.model.load_state_dict(live, strict=False)
+
     def save_checkpoint(self, path: str, extra: Optional[Dict] = None):
         """Save full training state."""
         state = {
@@ -1164,6 +1307,9 @@ class VL_JEPA_Trainer:
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
             'memory_bank_state_dict': (
                 self.memory_bank.state_dict() if self.memory_bank is not None else None
+            ),
+            'model_ema_state_dict': (
+                self.model_ema.state_dict() if self.model_ema is not None else None
             ),
             'step': self._step,
             'running_loss': self.running_loss,
@@ -1209,6 +1355,8 @@ class VL_JEPA_Trainer:
         self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         if self.memory_bank is not None and checkpoint.get('memory_bank_state_dict') is not None:
             self.memory_bank.load_state_dict(checkpoint['memory_bank_state_dict'])
+        if self.model_ema is not None and checkpoint.get('model_ema_state_dict') is not None:
+            self.model_ema.load_state_dict(checkpoint['model_ema_state_dict'])
         if load_optimizer and 'optimizer_state_dict' in checkpoint:
             try:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
