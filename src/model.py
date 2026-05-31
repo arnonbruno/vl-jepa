@@ -48,6 +48,21 @@ def _checkpoint_module(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
         return checkpoint(module, x)
 
 
+def _pick_num_heads(hidden_dim: int) -> int:
+    """Choose a multi-head count that evenly divides ``hidden_dim``.
+
+    The predictor's transformer width is dictated by the vision backbone, so a
+    hardcoded ``nhead`` breaks on towers whose width is not divisible by it
+    (e.g. ViT-L's 1024 is not divisible by 12). Prefer 12 (preserves the legacy
+    ViT-B/768 and custom/96 behaviour), then standard ViT head counts, targeting
+    a ~64-dim head where possible.
+    """
+    for heads in (12, 16, 8, 10, 6, 4, 2, 1):
+        if hidden_dim % heads == 0:
+            return heads
+    return 1  # pragma: no cover - hidden_dim is always >= 1
+
+
 # ---------------------------------------------------------------------------
 # Masking utilities
 # ---------------------------------------------------------------------------
@@ -815,8 +830,8 @@ class Predictor(nn.Module):
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
-            nhead=12,
-            dim_feedforward=3072,
+            nhead=_pick_num_heads(hidden_dim),
+            dim_feedforward=4 * hidden_dim,
             batch_first=True,
             dropout=0.1,
             activation='gelu',

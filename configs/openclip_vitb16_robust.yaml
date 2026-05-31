@@ -74,8 +74,8 @@ loss:
 data:
   coco_root: ~/.cache/torch/hub/checkpoints
   image_size: 224
-  num_workers: 8
-  prefetch_factor: 4
+  num_workers: 4
+  prefetch_factor: 2
   max_caption_length: 64
 
 output:
