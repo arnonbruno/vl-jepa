@@ -392,6 +392,10 @@ def wise_ft_interpolate(
     """
     if not 0.0 <= alpha <= 1.0:
         raise ValueError(f"WiSE-FT alpha must be in [0, 1], got {alpha}")
+    # Interpolate entirely on CPU, one parameter at a time. This is an
+    # eval-time op (it can be slow), but for large backbones like ViT-L/14
+    # (~600M params) doing it on the GPU would hold three full copies of every
+    # tensor in VRAM at once and OOM on top of the live training memory.
     out: Dict[str, torch.Tensor] = {}
     for name, ft_tensor in finetuned.items():
         zs_tensor = zeroshot.get(name)
@@ -400,10 +404,11 @@ def wise_ft_interpolate(
             and ft_tensor.is_floating_point()
             and zs_tensor.shape == ft_tensor.shape
         ):
-            zs_tensor = zs_tensor.to(ft_tensor.device, ft_tensor.dtype)
-            out[name] = (1.0 - alpha) * zs_tensor + alpha * ft_tensor
+            ft_cpu = ft_tensor.detach().to("cpu", ft_tensor.dtype)
+            zs_cpu = zs_tensor.detach().to("cpu", ft_tensor.dtype)
+            out[name] = (1.0 - alpha) * zs_cpu + alpha * ft_cpu
         else:
-            out[name] = ft_tensor.clone()
+            out[name] = ft_tensor.detach().to("cpu").clone()
     return out
 
 
@@ -1265,11 +1270,16 @@ class VL_JEPA_Trainer:
         zero-shot init. This is the "robust" model that should be evaluated and
         checkpointed instead of the raw last-step weights.
         """
-        base = (
+        # Build the eval state on CPU. The interpolation and any large-backbone
+        # weight juggling happens off the GPU so it cannot OOM on top of the
+        # live training allocation; eval_weights() loads it back to the GPU
+        # parameter-by-parameter at the end.
+        src = (
             self.model_ema.state_dict()
             if self.model_ema is not None
             else self.model.state_dict()
         )
+        base = {k: v.detach().to("cpu") for k, v in src.items()}
         if self._zeroshot_state is not None and self.wise_ft_alpha < 1.0:
             base = wise_ft_interpolate(
                 self._zeroshot_state, base, self.wise_ft_alpha,
@@ -1288,12 +1298,13 @@ class VL_JEPA_Trainer:
         ):
             yield
             return
-        live = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+        # Snapshot the live weights on CPU so we don't keep a second full copy
+        # of the model in VRAM while evaluating. load_state_dict copies each
+        # parameter back in place, so the CPU->GPU transfer is one tensor at a
+        # time rather than a full GPU duplicate.
+        live = {k: v.detach().to("cpu").clone() for k, v in self.model.state_dict().items()}
         try:
-            eval_state = {
-                k: v.to(self.device) for k, v in self.build_eval_state_dict().items()
-            }
-            self.model.load_state_dict(eval_state, strict=False)
+            self.model.load_state_dict(self.build_eval_state_dict(), strict=False)
             yield
         finally:
             self.model.load_state_dict(live, strict=False)

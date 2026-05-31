@@ -31,7 +31,7 @@ model:
   contrastive_on_global: true
 
 training:
-  epochs: 16
+  epochs: 20
   batch_size: 64                   # ViT-L activations are ~2x ViT-B; 64 fits 24GB
   gradient_accumulation_steps: 4   # effective batch 256, matching the ViT-B run
   learning_rate: 4.0e-5
