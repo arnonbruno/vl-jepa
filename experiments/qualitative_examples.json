@@ -1,0 +1,312 @@
+{
+  "t2i": [
+    {
+      "caption": "A bunch of plates with food on them on a table.",
+      "gt_image_idx": 789,
+      "gt_image_id": 92053,
+      "vljepa_rank": 42,
+      "zeroshot_rank": 124,
+      "rank_delta": 82,
+      "vljepa_top5_image_ids": [
+        170670,
+        25986,
+        64084,
+        210520,
+        88040
+      ]
+    },
+    {
+      "caption": "A plate of broccoli, rice, meat and other vegetables",
+      "gt_image_idx": 37,
+      "gt_image_id": 3501,
+      "vljepa_rank": 30,
+      "zeroshot_rank": 47,
+      "rank_delta": 17,
+      "vljepa_top5_image_ids": [
+        447522,
+        29640,
+        62554,
+        61658,
+        15278
+      ]
+    },
+    {
+      "caption": "Two large elephants waiting to enter their shelter.",
+      "gt_image_idx": 3190,
+      "gt_image_id": 368961,
+      "vljepa_rank": 2,
+      "zeroshot_rank": 10,
+      "rank_delta": 8,
+      "vljepa_top5_image_ids": [
+        58384,
+        368961,
+        389316,
+        24919,
+        97230
+      ]
+    },
+    {
+      "caption": "Two men and woman opening boxes of pizza in a room.",
+      "gt_image_idx": 3251,
+      "gt_image_id": 376093,
+      "vljepa_rank": 7,
+      "zeroshot_rank": 14,
+      "rank_delta": 7,
+      "vljepa_top5_image_ids": [
+        287347,
+        113720,
+        179141,
+        156076,
+        12576
+      ]
+    },
+    {
+      "caption": "A black and white cat relaxing inside a laptop.",
+      "gt_image_idx": 18,
+      "gt_image_id": 1675,
+      "vljepa_rank": 1,
+      "zeroshot_rank": 2,
+      "rank_delta": 1,
+      "vljepa_top5_image_ids": [
+        1675,
+        174231,
+        119233,
+        80949,
+        399560
+      ]
+    },
+    {
+      "caption": "A group of people sitting around a table with laptops and notebooks.",
+      "gt_image_idx": 2649,
+      "gt_image_id": 306139,
+      "vljepa_rank": 2,
+      "zeroshot_rank": 3,
+      "rank_delta": 1,
+      "vljepa_top5_image_ids": [
+        9400,
+        306139,
+        450303,
+        13659,
+        486040
+      ]
+    },
+    {
+      "caption": "A giraffe standing in a field with a bird.",
+      "gt_image_idx": 2138,
+      "gt_image_id": 245513,
+      "vljepa_rank": 1,
+      "zeroshot_rank": 1,
+      "rank_delta": 0,
+      "vljepa_top5_image_ids": [
+        245513,
+        152870,
+        55072,
+        217614,
+        359781
+      ]
+    },
+    {
+      "caption": "A cat watches cars racing on a television.",
+      "gt_image_idx": 2099,
+      "gt_image_id": 240940,
+      "vljepa_rank": 1,
+      "zeroshot_rank": 1,
+      "rank_delta": 0,
+      "vljepa_top5_image_ids": [
+        240940,
+        98839,
+        131131,
+        533536,
+        77396
+      ]
+    },
+    {
+      "caption": "A man and woman posing for a picture in a sports bar.",
+      "gt_image_idx": 64,
+      "gt_image_id": 6763,
+      "vljepa_rank": 1,
+      "zeroshot_rank": 1,
+      "rank_delta": 0,
+      "vljepa_top5_image_ids": [
+        6763,
+        319100,
+        70739,
+        86956,
+        21167
+      ]
+    },
+    {
+      "caption": "Many people walk through a park as few kites fly in the air.",
+      "gt_image_idx": 1393,
+      "gt_image_id": 163057,
+      "vljepa_rank": 1,
+      "zeroshot_rank": 1,
+      "rank_delta": 0,
+      "vljepa_top5_image_ids": [
+        163057,
+        193245,
+        159399,
+        432898,
+        305317
+      ]
+    },
+    {
+      "caption": "Cleaning products are on the counter of the bathroom.",
+      "gt_image_idx": 325,
+      "gt_image_id": 34760,
+      "vljepa_rank": 3,
+      "zeroshot_rank": 1,
+      "rank_delta": -2,
+      "vljepa_top5_image_ids": [
+        241319,
+        492878,
+        34760,
+        197796,
+        239627
+      ]
+    },
+    {
+      "caption": "A hand with scissors cutting into some sheets of paper.",
+      "gt_image_idx": 2208,
+      "gt_image_id": 255483,
+      "vljepa_rank": 18,
+      "zeroshot_rank": 13,
+      "rank_delta": -5,
+      "vljepa_top5_image_ids": [
+        546826,
+        368982,
+        311180,
+        340930,
+        357501
+      ]
+    },
+    {
+      "caption": "there is a surfer at the beach riding waves in the ocean",
+      "gt_image_idx": 2537,
+      "gt_image_id": 292908,
+      "vljepa_rank": 29,
+      "zeroshot_rank": 21,
+      "rank_delta": -8,
+      "vljepa_top5_image_ids": [
+        393056,
+        441286,
+        364126,
+        199442,
+        561223
+      ]
+    },
+    {
+      "caption": "A couple of computer monitors sitting on top of a desk.",
+      "gt_image_idx": 1718,
+      "gt_image_id": 195918,
+      "vljepa_rank": 25,
+      "zeroshot_rank": 10,
+      "rank_delta": -15,
+      "vljepa_top5_image_ids": [
+        385719,
+        255165,
+        549674,
+        570782,
+        547144
+      ]
+    },
+    {
+      "caption": "A person is sitting at a keyboard near a microphone.",
+      "gt_image_idx": 3445,
+      "gt_image_id": 398905,
+      "vljepa_rank": 75,
+      "zeroshot_rank": 53,
+      "rank_delta": -22,
+      "vljepa_top5_image_ids": [
+        108026,
+        546717,
+        68765,
+        325838,
+        232684
+      ]
+    },
+    {
+      "caption": "A yellow sign that is at the top of a pole.",
+      "gt_image_idx": 838,
+      "gt_image_id": 98497,
+      "vljepa_rank": 78,
+      "zeroshot_rank": 35,
+      "rank_delta": -43,
+      "vljepa_top5_image_ids": [
+        185157,
+        522751,
+        571943,
+        484029,
+        523241
+      ]
+    }
+  ],
+  "i2t": [
+    {
+      "image_id": 1675,
+      "vljepa_top_captions": [
+        "A black and white cat relaxing inside a laptop.",
+        "A cat is sitting in a partially closed laptop.",
+        "A black and white cat laying across the keyboard of a laptop.",
+        "A cat is laying on top of a laptop computer.",
+        "A dark cat hiding in between a laptop."
+      ],
+      "vljepa_hit@k": true
+    },
+    {
+      "image_id": 3501,
+      "vljepa_top_captions": [
+        "A bowl holds soup with broccoli and other vegetables.",
+        "A bowl with rice, broccoli and a purple relish.",
+        "The meal in the bowl has rice and broccoli in it.",
+        "A bowl of a kind of vegetable stew on a table.",
+        "A plate of food with rice and beans, broccoli and meat."
+      ],
+      "vljepa_hit@k": true
+    },
+    {
+      "image_id": 6763,
+      "vljepa_top_captions": [
+        "A man and woman posing for a picture in a sports bar.",
+        "A man and woman hugging in a restaurant",
+        "A man and a women posing next to one another in front of a table.",
+        "A man and a woman posing together for a picture",
+        "A man standing next to a woman in a gray dress."
+      ],
+      "vljepa_hit@k": true
+    },
+    {
+      "image_id": 34760,
+      "vljepa_top_captions": [
+        "Blue bathroom with two white towels hanging by the shower.",
+        "A bathroom with a sink, tub, shower head and mirror.",
+        "A bathroom with a sink, shower, tub and a cabinet.",
+        "A bathroom sink, toilet and shower with the curtain half open.",
+        "A bathroom with a sink, towel rack and shower stall."
+      ],
+      "vljepa_hit@k": false
+    },
+    {
+      "image_id": 92053,
+      "vljepa_top_captions": [
+        "A bunch of food sitting on a table, with three beers on it.",
+        "there are two plates of food and a beer in the middle of the table",
+        "A plate of food and a drink on a table.",
+        "A plate filled with food sitting next to three glasses.",
+        "A variety of food on a table with a few drinks."
+      ],
+      "vljepa_hit@k": false
+    },
+    {
+      "image_id": 98497,
+      "vljepa_top_captions": [
+        "A sign with a person with a surfboard is near a building and palm trees.",
+        "a yellow sign of a person carrying a surf board",
+        "A traffic sign that has a picture of a man holding a surfboard on it.",
+        "A ROAD SIGN INDICATING SURFERS OUTSIDE A TEMPLE",
+        "There are a lot of surf boards leaning against the building."
+      ],
+      "vljepa_hit@k": true
+    }
+  ]
+}

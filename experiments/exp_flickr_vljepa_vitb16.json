@@ -1,0 +1,19 @@
+{
+  "backend": "VL-JEPA checkpoint: experiments/exp_jepa_768d_16ep/checkpoint_best.pt",
+  "num_images": 1000,
+  "results": {
+    "flickr1k": {
+      "i2t_r1": 76.8999993801117,
+      "t2i_r1": 61.59999966621399,
+      "i2t_r5": 92.59999990463257,
+      "t2i_r5": 85.01999974250793,
+      "i2t_r10": 95.3000009059906,
+      "t2i_r10": 91.33999943733215,
+      "i2t_medr": 1.0,
+      "t2i_medr": 1.0,
+      "i2t_meanr": 2.5479999780654907,
+      "t2i_meanr": 5.753200054168701,
+      "rsum": 502.75999903678894
+    }
+  }
+}

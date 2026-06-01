@@ -81,6 +81,9 @@ def _train_one(name: str, overrides: Dict[str, Any], args) -> Path:
     cfg = _deep_update(base, overrides)
     cfg.setdefault("output", {})["output_dir"] = str(out_dir)
     cfg["training"]["epochs"] = args.epochs
+    # Ablations only evaluate the best checkpoint; suppress periodic dumps so a
+    # multi-variant study does not exhaust disk with 3-9GB intermediates.
+    cfg["output"]["checkpoint_interval"] = args.epochs + 1
 
     cfg_path = out_dir / "config.yaml"
     cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
