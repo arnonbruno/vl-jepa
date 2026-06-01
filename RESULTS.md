@@ -154,13 +154,11 @@ component *helps*).
 | `mean_pool` | mean text pool (not CLIP EOT) | 41.84 | 30.88 | 341.02 | −49.34 |
 | `frozen` | encoders never unfrozen | 50.54 | 31.33 | 362.16 | −28.20 |
 | `no_robust` | no EMA, no WiSE-FT | 47.82 | 31.41 | 368.69 | −21.67 |
-|| `no_ema` | EMA off, WiSE-FT on | 52.44 | 35.73 | 388.05 | −2.31 |
-|| **`full`** | the complete robust recipe | 54.22 | 36.87 | **390.36** | — |
+| `no_wise_ft` | WiSE-FT off, EMA on | 50.94 | 34.45 | 383.20 | −7.16 |
+| `no_ema` | EMA off, WiSE-FT on | 52.44 | 35.73 | 388.05 | −2.31 |
+| **`full`** | the complete robust recipe | 54.22 | 36.87 | **390.36** | — |
+| `with_jepa` | + JEPA MSE (α=0.2) | 53.58 | 36.56 | 392.61 | +2.25 |
 | **`siglip`** | sigmoid loss (not InfoNCE) | **57.92** | **39.30** | **406.19** | **+15.83** |
-
-*(Two further decomposition variants — `no_wise_ft` and `with_jepa` — are
-planned by the harness; they isolate WiSE-FT alone and test re-adding the JEPA
-MSE objective.)*
 
 **Reading the ablation (component importance, largest lever first).**
 - **CLIP-native projection seeding is load-bearing (−154.7 rsum).** Swapping the
@@ -176,12 +174,11 @@ MSE objective.)*
   (`frozen`) reaches only 362.2; letting 6 vision + 6 text blocks adapt recovers
   +28.2, with the gain concentrated in **t2i** (31.33 → 36.87 R@1).
 - **The robustness core (EMA + WiSE-FT) adds ~22 rsum** *and* is what removes the
-  peak-then-collapse (§2, §7). `no_robust` is not catastrophic on this 5-epoch
-  budget (368.7) but loses the stability that matters over longer schedules.
-  Decomposing further: **WiSE-FT is the dominant lever** — dropping EMA alone
-  (`no_ema`) costs only −2.3 rsum (388.1 vs 390.4), while dropping both
-  (`no_robust`) costs −21.7. The interpolated weight average recovers ~19.4 rsum
-  that EMA alone does not provide.
+  peak-then-collapse (§2, §7). Decomposing: WiSE-FT alone costs −7.2 rsum
+  (`no_wise_ft`), EMA alone costs −2.3 (`no_ema`), but removing both costs
+  −21.7 (`no_robust`). The **+12.2 rsum interaction effect** (21.7 > 7.2 + 2.3)
+  shows the two techniques are complementary: EMA stabilizes the weight trajectory
+  that WiSE-FT interpolates, and neither alone captures the full benefit.
 - **The headline surprise — SigLIP loss beats InfoNCE by +15.8 rsum.** The base
   recipe picked InfoNCE (FP32 softmax-CE + MoCo memory bank) on the small-data
   intuition, yet simply switching to the **sigmoid (SigLIP) loss raises rsum to
@@ -192,8 +189,9 @@ MSE objective.)*
   recipe upgrade and the clearest lever for future runs.
 
 Component importance ranking (Δrsum magnitude): **projection seeding (154.7) ≫
-EOT pooling (49.3) > encoder unfreezing (28.2) > WiSE-FT (19.4) > EMA (2.3)**,
-with the loss function a **+15.8 free win** (InfoNCE → SigLIP).
+EOT pooling (49.3) > encoder unfreezing (28.2) > robustness core (21.7, with
++12.2 interaction) > JEPA MSE (+2.3)**, with the loss function a **+15.8 free
+win** (InfoNCE → SigLIP).
 
 ---
 
