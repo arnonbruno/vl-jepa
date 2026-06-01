@@ -50,12 +50,45 @@ CLIP ViT-L/14 zero-shot** (a 3.5x larger vision tower):
 1. **Measure correctly first.** The single highest-impact change was the proper
    evaluation protocol: it reveals the model was already SOTA-competitive and
    that the "ceiling" was an artifact. This is the methodological contribution.
-2. **Bigger encoder for absolute headroom.** ViT-L/14 zero-shot already reaches
+2. **Bigger encoder for marginal headroom.** ViT-L/14 zero-shot already reaches
    rsum 391.8; applying the *same* robust recipe on top of it (config:
    [`configs/openclip_vitl14_robust.yaml`](configs/openclip_vitl14_robust.yaml))
-   is the path to pushing absolute recall higher on a single RTX 3090. The model
-   code now supports ViT-L/14 end-to-end (adaptive predictor head count, grad
-   checkpointing, batch 64 + accumulation 4 = effective batch 256).
+   yields ~2pp additional gain but hits the same overfitting wall, confirming
+   the bottleneck is data, not capacity. The model code supports ViT-L/14
+   end-to-end (adaptive predictor head count, grad checkpointing, batch 64 +
+   accumulation 4 = effective batch 256).
+
+## ViT-L/14 scaling experiment
+
+A ViT-L/14 fine-tune was run for 8 epochs on COCO 118K with the same robust
+recipe. The bigger encoder provides modest headroom but the overfitting pattern
+returns — the model peaks at epoch 3-4 then declines, confirming that COCO's
+118K images are the binding constraint, not encoder capacity.
+
+### Training-loop recall (non-standard, single-caption protocol)
+
+| Epoch | t2i R@1 | i2t R@1 | val loss |
+|---|---|---|---|
+| 1 | 36.0 | 39.9 | 1.8757 |
+| 2 | 37.6 | 40.4 | 1.4489 |
+| **3** | **38.1** | 40.9 | 1.3277 |
+| 4 | 37.1 | **41.0** | 1.3754 |
+| 5 | 36.8 | 40.0 | 1.3079 |
+| 6 | 36.4 | 40.3 | 1.3285 |
+| 7 | 35.8 | 40.1 | 1.3070 |
+| 8 | 35.6 | 39.9 | 1.2211 |
+
+Best: t2i 38.1% (E3), i2t 41.0% (E4). +1.7pp / +2.4pp over ViT-B/16 best.
+
+**Key finding:** ViT-L/14 peaks ~2pp above ViT-B/16 then declines on the same
+schedule. The robust recipe (WiSE-FT + EMA) slows the collapse but cannot
+prevent it at this data scale. ViT-L/14 also required a CPU-side WiSE-FT
+interpolation fix (3 copies of ~600M params exceeded 24GB VRAM during eval).
+
+**Implication for the paper:** The ceiling is data-driven, not capacity-driven.
+Breaking past ~38% t2i / ~41% i2t on COCO requires either (a) more data
+(CC3M/CC12M pretraining), (b) cross-dataset generalization (Flickr30K), or
+(c) a fundamentally different approach (cross-attention, hard negative mining).
 
 ## AAAI narrative
 
