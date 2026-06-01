@@ -156,19 +156,29 @@ def main() -> None:
             args.max_images = 500
 
     names = args.only or list(ABLATIONS.keys())
-    rows: List[Dict[str, Any]] = []
+    out_dir = ROOT / "experiments" / "ablations"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_json = out_dir / "ablation_results.json"
+
+    # Merge with any previously collected variants so an incremental
+    # ``--only`` run never clobbers earlier results.
+    existing: Dict[str, Dict[str, Any]] = {}
+    if results_json.is_file():
+        for r in json.loads(results_json.read_text()):
+            existing[r["name"]] = r
+
     for name in names:
         if name not in ABLATIONS:
             raise SystemExit(f"Unknown ablation {name!r}. Choices: {list(ABLATIONS)}")
         print(f"\n{'=' * 70}\nABLATION: {name}\n{'=' * 70}")
         ckpt = _train_one(name, ABLATIONS[name], args)
         metrics = _eval_one(name, ckpt, args)
-        rows.append({"name": name, "metrics": metrics})
+        existing[name] = {"name": name, "metrics": metrics}
 
+    # Order by the canonical ablation grid for a stable, readable table.
+    rows = [existing[n] for n in ABLATIONS if n in existing]
     table = _markdown_table(rows)
-    out_dir = ROOT / "experiments" / "ablations"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "ablation_results.json").write_text(json.dumps(rows, indent=2))
+    results_json.write_text(json.dumps(rows, indent=2))
     (out_dir / "ablation_results.md").write_text(table)
     print(f"\n{'=' * 70}\nAblation results\n{'=' * 70}\n{table}")
     print(f"Saved to {out_dir / 'ablation_results.md'}")

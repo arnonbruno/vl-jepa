@@ -1,0 +1,52 @@
+model:
+  hidden_dim: 768
+  patch_size: 16
+  image_size: 224
+  mask_ratio: 0.75
+  text_mask_ratio: 0.0
+  predictor_layers: 4
+  momentum_tau: 0.996
+  vision_backbone: openclip
+  text_backbone: openclip
+  openclip_model: ViT-B-16
+  openclip_pretrained: openai
+  freeze_encoders: true
+  projection_dim: 512
+  projection_type: clip_residual
+  text_pool: eot
+  contrastive_loss: infonce
+  contrastive_on_global: true
+training:
+  epochs: 5
+  batch_size: 256
+  gradient_accumulation_steps: 1
+  learning_rate: 5.0e-05
+  weight_decay: 0.5
+  warmup_steps: 200
+  unfreeze_after_epoch: 2
+  unfreeze_vision_blocks: 6
+  unfreeze_text_blocks: 6
+  encoder_unfreeze_lr: 1.0e-05
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  memory_bank_size: 16384
+  use_model_ema: true
+  model_ema_decay: 0.999
+  wise_ft_alpha: 1.0
+loss:
+  alpha: 0.0
+  beta: 1.0
+  gamma: 0.0
+  label_smoothing: 0.0
+  hard_negative_weight: 0.0
+  hard_negative_margin: 0.2
+data:
+  coco_root: ~/.cache/torch/hub/checkpoints
+  image_size: 224
+  num_workers: 4
+  prefetch_factor: 2
+  max_caption_length: 64
+output:
+  output_dir: /var/mnt/DATA/OpenClaw/workspace/vl-jepa/experiments/ablations/no_wise_ft
+  log_interval: 10
+  checkpoint_interval: 6

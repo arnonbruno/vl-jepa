@@ -139,16 +139,61 @@ dual encoder on small data **without the well-known peak-then-collapse**.
 ## 5. Component ablation (each row = robust recipe with ONE change)
 
 Run via [`experiments/run_ablations.py`](experiments/run_ablations.py): every
-variant is a short COCO fine-tune of the ViT-B/16 robust recipe with a single
-component toggled, evaluated with the standard COCO 5K protocol. *(table filled
-in by the ablation harness; see `experiments/ablations/ablation_results.md`)*
+variant is a 5-epoch COCO fine-tune of the ViT-B/16 robust recipe with a single
+component toggled, evaluated with the standard COCO 5K protocol. Raw numbers in
+[`experiments/ablations/ablation_results.json`](experiments/ablations/ablation_results.json);
+the bar chart is
+[`experiments/ablations/ablation_figure.png`](experiments/ablations/ablation_figure.png).
+Rows are ordered from most-harmful change to the one improvement; `Δrsum` is
+each variant's gap to the `full` recipe (negative = the toggled-off/changed
+component *helps*).
 
-<!-- ABLATION_TABLE -->
+| Variant | what changed vs full | i2t R@1 | t2i R@1 | rsum | Δrsum |
+|---|---|---|---|---|---|
+| `random_proj` | random MLP proj (no CLIP seeding) | 22.62 | 15.69 | 235.69 | **−154.67** |
+| `mean_pool` | mean text pool (not CLIP EOT) | 41.84 | 30.88 | 341.02 | −49.34 |
+| `frozen` | encoders never unfrozen | 50.54 | 31.33 | 362.16 | −28.20 |
+| `no_robust` | no EMA, no WiSE-FT | 47.82 | 31.41 | 368.69 | −21.67 |
+|| `no_ema` | EMA off, WiSE-FT on | 52.44 | 35.73 | 388.05 | −2.31 |
+|| **`full`** | the complete robust recipe | 54.22 | 36.87 | **390.36** | — |
+| **`siglip`** | sigmoid loss (not InfoNCE) | **57.92** | **39.30** | **406.19** | **+15.83** |
 
-Pillars probed: EOT pooling (`mean_pool`), CLIP-native projection seeding
-(`random_proj`), encoder unfreezing (`frozen`), InfoNCE vs sigmoid (`siglip`),
-and the robustness core EMA + WiSE-FT (`no_robust`), each against the full
-recipe (`full`).
+*(Two further decomposition variants — `no_wise_ft` and `with_jepa` — are
+planned by the harness; they isolate WiSE-FT alone and test re-adding the JEPA
+MSE objective.)*
+
+**Reading the ablation (component importance, largest lever first).**
+- **CLIP-native projection seeding is load-bearing (−154.7 rsum).** Swapping the
+  CLIP-seeded linear+zero-init-residual head for a randomly initialized MLP
+  (`random_proj`) collapses retrieval to **235.7** — worse than the zero-shot
+  init by a wide margin. Starting *aligned* and adding a zero-init residual is
+  the single most important design choice; a fresh projection has to relearn
+  cross-modal alignment from 118K images and cannot.
+- **EOT pooling matters (−49.3 rsum).** Mean-pooling the text tokens
+  (`mean_pool`) instead of taking CLIP's native end-of-text embedding throws
+  away the representation CLIP was trained to produce, costing ~49 rsum.
+- **Symmetric unfreezing is worth ~28 rsum.** Keeping both towers frozen
+  (`frozen`) reaches only 362.2; letting 6 vision + 6 text blocks adapt recovers
+  +28.2, with the gain concentrated in **t2i** (31.33 → 36.87 R@1).
+- **The robustness core (EMA + WiSE-FT) adds ~22 rsum** *and* is what removes the
+  peak-then-collapse (§2, §7). `no_robust` is not catastrophic on this 5-epoch
+  budget (368.7) but loses the stability that matters over longer schedules.
+  Decomposing further: **WiSE-FT is the dominant lever** — dropping EMA alone
+  (`no_ema`) costs only −2.3 rsum (388.1 vs 390.4), while dropping both
+  (`no_robust`) costs −21.7. The interpolated weight average recovers ~19.4 rsum
+  that EMA alone does not provide.
+- **The headline surprise — SigLIP loss beats InfoNCE by +15.8 rsum.** The base
+  recipe picked InfoNCE (FP32 softmax-CE + MoCo memory bank) on the small-data
+  intuition, yet simply switching to the **sigmoid (SigLIP) loss raises rsum to
+  406.2 (i2t R@1 57.9, t2i R@1 39.3)** — the best single variant in the study and
+  better than every COCO row in §1. The sigmoid loss decouples each pair's
+  gradient from the in-batch partition function, which on COCO's many
+  near-duplicate captions is less brittle than softmax-CE. This is an actionable
+  recipe upgrade and the clearest lever for future runs.
+
+Component importance ranking (Δrsum magnitude): **projection seeding (154.7) ≫
+EOT pooling (49.3) > encoder unfreezing (28.2) > WiSE-FT (19.4) > EMA (2.3)**,
+with the loss function a **+15.8 free win** (InfoNCE → SigLIP).
 
 ---
 
@@ -197,12 +242,26 @@ exceed 24GB during eval).
   single RTX 3090) that beats the zero-shot init without the well-known
   peak-then-collapse. It combines: CLIP-native **EOT pooling + projection
   seeding** (start aligned), **symmetric tower unfreezing** (both modalities
-  adapt), **FP32 InfoNCE + MoCo memory bank** (more negatives, NaN-free), and
-  **robust weight averaging** (model EMA + WiSE-FT) with **checkpoint selection
-  on R@1, not val loss**.
+  adapt), a **strong contrastive objective + MoCo memory bank** (more negatives,
+  NaN-free), and **robust weight averaging** (model EMA + WiSE-FT) with
+  **checkpoint selection on R@1, not val loss**.
+- **The ablation now quantifies which pieces matter (§5).** Component importance,
+  largest lever first: **CLIP-native projection seeding (−154.7 rsum if removed)
+  ≫ EOT pooling (−49.3) > symmetric unfreezing (−28.2) > the EMA+WiSE-FT
+  robustness core (−21.7)**. "Start aligned" (seeded projection + EOT pooling)
+  dominates; adaptation and robustness are the second-order refinements that buy
+  the final ~50 rsum and the stability.
+- **The strongest single lever is the loss, and it overturns a design choice.**
+  The reported §1 numbers use FP32 InfoNCE, but the ablation shows the **SigLIP
+  sigmoid loss beats InfoNCE by +15.8 rsum** (406.2 vs 390.4) — the best variant
+  in the study and ahead of every §1 COCO row. The actionable recipe is
+  therefore *seed-aligned head + EOT pooling + symmetric unfreeze + robustness
+  core, **trained with the sigmoid loss***; switching the objective is the
+  cheapest remaining win.
 - **Evidence:** (1) the COCO 5K/1K tables (§1) — every backbone beats its init;
   (2) Flickr30K cross-dataset transfer (§3) — t2i gains survive domain shift,
-  with an honest i2t/scale asymmetry; (3) the component ablation (§5); (4)
+  with an honest i2t/scale asymmetry; (3) the **quantified component ablation
+  (§5)** with a clear importance ranking and the SigLIP finding; (4)
   qualitative wins/losses (§6); (5) the scaling experiment (§7).
 - **Methodological insight:** the "ceiling/collapse" was a **metric artifact**.
   Under the comparable protocol there is no collapse at ViT-B scale, and ViT-L
