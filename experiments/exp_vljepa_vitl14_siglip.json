@@ -1,0 +1,20 @@
+{
+  "backend": "VL-JEPA checkpoint: experiments/exp_jepa_1024d_20ep/checkpoint_best.pt",
+  "num_images": 5000,
+  "results": {
+    "5k": {
+      "i2t_r1": 64.84,
+      "i2t_r5": 86.86,
+      "i2t_r10": 92.58,
+      "t2i_r1": 48.91,
+      "t2i_r5": 75.3,
+      "t2i_r10": 84.09,
+      "rsum": 452.58
+    },
+    "1k": {
+      "i2t_r1": 82.58,
+      "t2i_r1": 68.41,
+      "rsum": 534.81
+    }
+  }
+}
