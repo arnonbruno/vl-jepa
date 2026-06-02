@@ -1,0 +1,65 @@
+# OpenCLIP ViT-L/14 + SigLIP loss — the strongest recipe variant.
+#
+# Combines the best backbone (ViT-L/14) with the best loss (SigLIP sigmoid).
+# Based on ablation results: SigLIP beats InfoNCE by +15.8 rsum on ViT-B/16.
+# Expected: even larger gain on ViT-L/14 due to better gradient signal from
+# pairwise sigmoid on COCO's many near-duplicate captions.
+#
+# 20 epochs, same memory plan as ViT-L/14 robust (gradient checkpointing,
+# batch 64 + accum 4 = effective 256). WiSE-FT + EMA for stability.
+model:
+  hidden_dim: 1024
+  patch_size: 14
+  image_size: 224
+  mask_ratio: 0.75
+  text_mask_ratio: 0.0
+  predictor_layers: 4
+  momentum_tau: 0.996
+  vision_backbone: openclip
+  text_backbone: openclip
+  openclip_model: ViT-L-14
+  openclip_pretrained: openai
+  freeze_encoders: true
+  projection_dim: 768
+  projection_type: clip_residual
+  text_pool: eot
+  contrastive_loss: siglip
+  contrastive_on_global: true
+
+training:
+  epochs: 20
+  batch_size: 64
+  gradient_accumulation_steps: 4
+  learning_rate: 4.0e-5
+  weight_decay: 0.5
+  warmup_steps: 200
+  unfreeze_after_epoch: 2
+  unfreeze_vision_blocks: 4
+  unfreeze_text_blocks: 4
+  encoder_unfreeze_lr: 8.0e-6
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  memory_bank_size: 16384
+  use_model_ema: true
+  model_ema_decay: 0.999
+  wise_ft_alpha: 0.5
+
+loss:
+  alpha: 0.0
+  beta: 1.0
+  gamma: 0.0
+  label_smoothing: 0.0
+  hard_negative_weight: 0.0
+  hard_negative_margin: 0.2
+
+data:
+  coco_root: ~/.cache/torch/hub/checkpoints
+  image_size: 224
+  num_workers: 4
+  prefetch_factor: 2
+  max_caption_length: 64
+
+output:
+  output_dir: experiments
+  log_interval: 10
+  checkpoint_interval: 4
