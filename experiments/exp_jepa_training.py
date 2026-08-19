@@ -842,6 +842,11 @@ def main() -> None:
                 'gpu_mem_gb': gpu_mem,
                 'skipped_batches': epoch_skipped,
             }
+            # Log logit_scale and logit_bias if available
+            if hasattr(model, 'logit_scale'):
+                epoch_record['logit_scale'] = float(model.logit_scale.detach().cpu().item())
+            if hasattr(model, 'logit_bias'):
+                epoch_record['logit_bias'] = float(model.logit_bias.detach().cpu().item())
             all_metrics.append(epoch_record)
 
             if writer is not None:
