@@ -157,8 +157,9 @@ def _build_zeroshot_backend(model_name: str, pretrained: str, device: str):
     """Return (encode_images, encode_texts, image_size) for a zero-shot OpenCLIP model."""
     import open_clip
 
+    extra = {"force_quick_gelu": True} if pretrained == "openai" else {}
     model, _, preprocess = open_clip.create_model_and_transforms(
-        model_name, pretrained=pretrained, device=device
+        model_name, pretrained=pretrained, device=device, **extra,
     )
     tokenizer = open_clip.get_tokenizer(model_name)
     model.eval()
@@ -179,52 +180,30 @@ def _build_zeroshot_backend(model_name: str, pretrained: str, device: str):
 
 
 def _build_vljepa_backend(checkpoint_path: str, device: str):
-    """Return (encode_images, encode_texts, image_size) for a VL-JEPA checkpoint."""
-    from src.model import VL_JEPA
-    from src.dataset import CaptionTokenizer, CLIP_MEAN, CLIP_STD
-    from torchvision import transforms
+    """Return (encode_images, encode_texts, image_size, preprocess) for a VL-JEPA ckpt.
 
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg = ckpt.get("config", {})
-    model = VL_JEPA(
-        hidden_dim=cfg.get("hidden_dim", 768),
-        patch_size=cfg.get("patch_size", 16),
-        image_size=cfg.get("image_size", 224),
-        mask_ratio=cfg.get("mask_ratio", 0.75),
-        text_mask_ratio=cfg.get("text_mask_ratio", 0.0),
-        predictor_layers=cfg.get("predictor_layers", 4),
-        momentum_tau=cfg.get("momentum_tau", 0.996),
-        vision_backbone=cfg.get("vision_backbone", None),
-        text_backbone=cfg.get("text_backbone", None),
-        openclip_model=cfg.get("openclip_model", None),
-        contrastive_loss=cfg.get("contrastive_loss", "infonce"),
-    ).to(device)
-    model.load_state_dict(ckpt["model"], strict=False)
-    model.eval()
+    Reuses the loader from ``experiments.evaluate_retrieval``: reads
+    ``model_eval_state`` (or ``model_state_dict``) and architecture fields
+    from the nested checkpoint config.
+    """
+    from experiments.evaluate_retrieval import (
+        _build_vljepa_backend as _er_backend,
+        _clip_eval_transform,
+    )
 
-    # Load EMA weights if available
-    ema_state = ckpt.get("ema", None)
-    wise_ft_alpha = cfg.get("wise_ft_alpha", 0.5)
-
-    image_size = cfg.get("image_size", 224)
-    tokenizer = CaptionTokenizer()
-    proj = model.text_proj if hasattr(model, "text_proj") else None
-
-    preprocess = transforms.Compose([
-        transforms.Resize(image_size, antialias=True),
-        transforms.CenterCrop(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=list(CLIP_MEAN), std=list(CLIP_STD)),
-    ])
+    encode_image, encode_text, tokenizer, image_size, _max_len = _er_backend(
+        Path(checkpoint_path), torch.device(device),
+    )
+    preprocess = _clip_eval_transform(image_size)
 
     @torch.no_grad()
     def encode_images(images: torch.Tensor) -> torch.Tensor:
-        return model.encode_image(images.to(device)).float()
+        return encode_image(images.to(device)).float()
 
     @torch.no_grad()
     def encode_texts(texts: list) -> torch.Tensor:
-        tokens = tokenizer(texts).to(device)
-        return model.encode_text(tokens).float()
+        ids, attn = tokenizer.encode(list(texts))
+        return encode_text(ids, attn).float()
 
     return encode_images, encode_texts, image_size, preprocess
 
@@ -277,71 +256,20 @@ def _load_coco(image_size: int, preprocess, batch_size: int = 64, num_workers: i
 # ── Flickr30K data loader ──────────────────────────────────────────────────
 
 def _load_flickr30k(image_size: int, preprocess, batch_size: int = 64, num_workers: int = 4):
-    """Load Flickr30K Karpathy 1K test split."""
-    import ast
-    import io
-    import zipfile
-    from PIL import Image
-    from torch.utils.data import DataLoader, Dataset
-    from huggingface_hub import hf_hub_download
+    """Load Flickr30K Karpathy 1K test split (``split=='test'``)."""
+    from torch.utils.data import DataLoader
 
-    csv_path = hf_hub_download(
-        repo_id="nlphuji/flickr30k", filename="flickr_annotations_30k.csv"
-    )
-    zip_path = hf_hub_download(
-        repo_id="nlphuji/flickr30k", filename="flickr30k-images.zip"
+    from experiments.evaluate_flickr30k import (
+        _ZipImageDataset,
+        _ensure_flickr_assets,
+        _load_test_split,
     )
 
-    import csv as _csv
-    rows = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = _csv.DictReader(f)
-        for r in reader:
-            rows.append(r)
-
-    # Karpathy test split: last 1000 images
-    all_filenames = sorted({r["filename"] for r in rows})
-    test_filenames = set(all_filenames[-1000:])
-
-    test_rows = [r for r in rows if r["filename"] in test_filenames]
-    img_filenames = sorted({r["filename"] for r in test_rows})
-    img_to_idx = {fn: i for i, fn in enumerate(img_filenames)}
-
-    captions = []
-    text_to_image = []
-    for r in test_rows:
-        captions.append(r["raw"])
-        text_to_image.append(img_to_idx[r["filename"]])
-
-    text_to_image = torch.tensor(text_to_image, dtype=torch.long)
-
-    # Image dataset from zip
-    class FlickrZipDataset(Dataset):
-        def __init__(self, zip_path, filenames, transform):
-            self.zip_path = zip_path
-            self.filenames = filenames
-            self.transform = transform
-            self._zf = None
-
-        def _get_zf(self):
-            if self._zf is None:
-                self._zf = zipfile.ZipFile(self.zip_path, "r")
-            return self._zf
-
-        def __len__(self):
-            return len(self.filenames)
-
-        def __getitem__(self, idx):
-            fn = self.filenames[idx]
-            zf = self._get_zf()
-            with zf.open(f"flickr30k-images/{fn}") as f:
-                img = Image.open(io.BytesIO(f.read())).convert("RGB")
-            return self.transform(img)
-
-    ds = FlickrZipDataset(zip_path, img_filenames, preprocess)
+    csv_path, zip_path = _ensure_flickr_assets()
+    filenames, captions, text_to_image = _load_test_split(csv_path)
+    ds = _ZipImageDataset(zip_path, filenames, preprocess)
     loader = DataLoader(ds, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
-
-    return loader, captions, text_to_image, len(img_filenames)
+    return loader, captions, text_to_image, len(filenames)
 
 
 # ── Embedding extraction ───────────────────────────────────────────────────

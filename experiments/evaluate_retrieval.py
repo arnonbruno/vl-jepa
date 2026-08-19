@@ -39,7 +39,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -157,9 +157,25 @@ def _encode_texts(
     return torch.cat(feats, dim=0)
 
 
+def _vljepa_weights_from_ckpt(ckpt: Dict[str, Any]):
+    """Prefer EMA/WiSE-FT eval weights; fall back to the live student."""
+    if ckpt.get("model_eval_state") is not None:
+        return ckpt["model_eval_state"]
+    if ckpt.get("model_state_dict") is not None:
+        return ckpt["model_state_dict"]
+    raise KeyError(
+        "Checkpoint missing 'model_eval_state' and 'model_state_dict'"
+    )
+
+
 def _build_vljepa_backend(checkpoint: Path, device: torch.device):
     ckpt = torch.load(str(checkpoint), map_location=device, weights_only=False)
-    cfg = ckpt.get("config", {})
+    cfg = ckpt.get("config")
+    if not cfg:
+        raise KeyError(
+            f"Checkpoint {checkpoint} has no 'config' key; refusing to guess "
+            "architecture. Re-save with config included."
+        )
     mcfg = cfg.get("model", {})
     model = VL_JEPA(
         hidden_dim=mcfg.get("hidden_dim", 768),
@@ -167,6 +183,7 @@ def _build_vljepa_backend(checkpoint: Path, device: torch.device):
         image_size=mcfg.get("image_size", 224),
         mask_ratio=mcfg.get("mask_ratio", 0.75),
         predictor_layers=mcfg.get("predictor_layers", 4),
+        text_mask_ratio=mcfg.get("text_mask_ratio", 0.0),
         vision_backbone=mcfg.get("vision_backbone", "openclip"),
         text_backbone=mcfg.get("text_backbone", "openclip"),
         openclip_model=mcfg.get("openclip_model", "ViT-B-16"),
@@ -177,22 +194,25 @@ def _build_vljepa_backend(checkpoint: Path, device: torch.device):
         text_pool=mcfg.get("text_pool", "eot"),
         contrastive_loss=mcfg.get("contrastive_loss", "infonce"),
     ).to(device).eval()
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    model.load_state_dict(_vljepa_weights_from_ckpt(ckpt), strict=False)
 
     image_size = mcfg.get("image_size", 224)
     max_len = cfg.get("data", {}).get("max_caption_length", 64)
+    text_backbone = mcfg.get("text_backbone", "openclip")
     tokenizer = CaptionTokenizer(
-        text_backbone="openclip",
+        text_backbone=text_backbone,
         openclip_model=mcfg.get("openclip_model", "ViT-B-16"),
         max_caption_length=max_len,
     )
 
     def encode_image(images):
-        return model.vision_proj.raw(model.context_encoder(images)[:, 0, :].float())
+        vision_emb = model.context_encoder(images)
+        vision_cls = vision_emb[:, 0, :].float()
+        return model.vision_proj(vision_cls)
 
     def encode_text(ids, attn):
         lang = model.language_encoder(ids, attn).float()
-        return model.language_proj.raw(model._pool_language(lang, attn))
+        return model.language_proj(model._pool_language(lang, attn))
 
     return encode_image, encode_text, tokenizer, image_size, max_len
 

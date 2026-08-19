@@ -520,8 +520,9 @@ def _create_openclip_model(model_name: str, pretrained: Optional[str]):
             "open_clip_torch is required for the openclip backbone "
             "(`pip install open_clip_torch`)."
         )
+    extra = {"force_quick_gelu": True} if pretrained == "openai" else {}
     model, _, _ = open_clip.create_model_and_transforms(
-        model_name, pretrained=pretrained,
+        model_name, pretrained=pretrained, **extra,
     )
     return model
 
@@ -1319,9 +1320,14 @@ class VL_JEPA(nn.Module):
         context_images: Optional[torch.Tensor] = None,
         target_images: Optional[torch.Tensor] = None,
         mask_seed: Optional[int] = None,
+        compute_jepa: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Full forward pass for training.
+
+        ``compute_jepa=False`` skips the masked student, EMA teacher, and
+        predictor. Use this when the MSE weight is 0 so a NaN in the unused
+        JEPA branch cannot poison the contrastive loss.
 
         Returns dict with:
           - predicted_patches: (B, N+1, D) predictor output
@@ -1347,25 +1353,29 @@ class VL_JEPA(nn.Module):
             generator.manual_seed(mask_seed)
 
         # ---- Generate masks if not provided ----
-        if patch_mask is None:
+        if compute_jepa and patch_mask is None:
             patch_mask = block_patch_mask(
                 B, num_patches, self.mask_ratio, device, generator=generator,
             )
 
-        # ---- 1. Context encoder (with masking) ----
-        context_emb = self.context_encoder(context_images, patch_mask)  # (B, N+1, D)
+        if compute_jepa:
+            context_emb = self.context_encoder(context_images, patch_mask)
+            with torch.no_grad(), _temporarily_eval(self.target_encoder):
+                target_emb = self.target_encoder(context_images, mask=None)
+            predicted = self.predictor(context_emb)
+            predicted_patches = self.vision_pred_head(predicted)
+            target_patches = target_emb.detach()
+        else:
+            patch_mask = torch.zeros(B, num_patches, dtype=torch.bool, device=device)
+            predicted_patches = torch.zeros(
+                B, 1, self.hidden_dim, device=device, dtype=images.dtype,
+            )
+            target_patches = predicted_patches
 
-        # ---- 2. Target encoders (full local target for MSE, global target for NCE) ----
-        with torch.no_grad(), _temporarily_eval(self.target_encoder):
-            target_emb = self.target_encoder(context_images, mask=None)  # (B, N+1, D)
-
-        # ---- 3. Global unmasked student view for contrastive alignment ----
+        # ---- Global unmasked student view for contrastive alignment ----
         global_student_emb = self.context_encoder(target_images, mask=None)
 
-        # ---- 4. Predictor ----
-        predicted = self.predictor(context_emb)  # (B, N+1, D)
-
-        # ---- 5. Language encoding ----
+        # ---- Language encoding ----
         if token_mask is None and self.training and self.text_mask_ratio > 0:
             token_mask = random_token_mask(
                 B, input_ids.size(1), mask_ratio=self.text_mask_ratio, device=device,
@@ -1375,7 +1385,6 @@ class VL_JEPA(nn.Module):
 
         language_emb = self.language_encoder(input_ids, attention_mask)  # (B, S, D)
 
-        # ---- 6. Joint projections ----
         # Use the full-image student CLS for image-text alignment; the local
         # masked context stays reserved for JEPA patch prediction.
         vision_cls = global_student_emb[:, 0, :]   # (B, D)
@@ -1385,10 +1394,6 @@ class VL_JEPA(nn.Module):
         language_proj_raw = self.language_proj.raw(language_cls)
         vision_proj = F.normalize(vision_proj_raw, p=2, dim=-1, eps=1e-6)
         language_proj = F.normalize(language_proj_raw, p=2, dim=-1, eps=1e-6)
-        target_patches = target_emb.detach()
-
-        # Predictor output mapped to JEPA prediction space.
-        predicted_patches = self.vision_pred_head(predicted)
 
         return {
             'predicted_patches': predicted_patches,   # (B, N+1, D)
@@ -1413,6 +1418,7 @@ class VL_JEPA(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         patch_mask: Optional[torch.Tensor] = None,
         mask_seed: Optional[int] = None,
+        compute_jepa: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Forward pass using precomputed encoder outputs (frozen-encoder fast path)."""
         B = local_patch_emb.size(0)
@@ -1423,22 +1429,27 @@ class VL_JEPA(nn.Module):
             generator = torch.Generator(device=device)
             generator.manual_seed(mask_seed)
 
-        if patch_mask is None:
-            patch_mask = block_patch_mask(
-                B, num_patches, self.mask_ratio, device, generator=generator,
-            )
-
-        mask_token = getattr(self.context_encoder, "mask_token", None)
-        if mask_token is None:
-            raise RuntimeError("context_encoder has no mask_token for cached JEPA masking")
-
-        context_emb = apply_patch_mask_to_embeddings(
-            local_patch_emb, patch_mask, mask_token,
-        )
-        target_emb = local_patch_emb.detach()
         global_student_emb = global_patch_emb
-        predicted = self.predictor(context_emb)
         language_emb = language_emb.float()
+
+        if compute_jepa:
+            if patch_mask is None:
+                patch_mask = block_patch_mask(
+                    B, num_patches, self.mask_ratio, device, generator=generator,
+                )
+            mask_token = getattr(self.context_encoder, "mask_token", None)
+            if mask_token is None:
+                raise RuntimeError("context_encoder has no mask_token for cached JEPA masking")
+            context_emb = apply_patch_mask_to_embeddings(
+                local_patch_emb, patch_mask, mask_token,
+            )
+            target_emb = local_patch_emb.detach()
+            predicted = self.predictor(context_emb)
+            predicted_patches = self.vision_pred_head(predicted)
+        else:
+            patch_mask = torch.zeros(B, num_patches, dtype=torch.bool, device=device)
+            predicted_patches = local_patch_emb.new_zeros(B, 1, local_patch_emb.size(-1))
+            target_emb = predicted_patches
 
         vision_cls = global_student_emb[:, 0, :]
         language_cls = self._pool_language(language_emb, attention_mask)
@@ -1447,7 +1458,6 @@ class VL_JEPA(nn.Module):
         language_proj_raw = self.language_proj.raw(language_cls)
         vision_proj = F.normalize(vision_proj_raw, p=2, dim=-1, eps=1e-6)
         language_proj = F.normalize(language_proj_raw, p=2, dim=-1, eps=1e-6)
-        predicted_patches = self.vision_pred_head(predicted)
 
         return {
             'predicted_patches': predicted_patches,
@@ -1675,34 +1685,39 @@ def compute_jepa_loss(
     L_var: VICReg-style variance loss on pre-normalized projections (prevents collapse).
     L_hardneg: VSE++ max-violation hinge on the hardest in-batch negative,
            sharpening Recall@1 once in-batch accuracy saturates (δ defaults to 0).
-    """
-    predicted = outputs['predicted_patches']   # (B, N+1, D)
-    target = outputs['target_patches']          # (B, N+1, D), detached
-    patch_mask = outputs['patch_mask']          # (B, N)
 
+    When ``alpha == 0`` the masked-patch MSE is not computed (a NaN in unused
+    JEPA tensors cannot poison ``total_loss``). Same for ``gamma == 0`` and
+    the variance term.
+    """
     vision_proj = outputs['vision_proj'].float()        # (B, D) normalized
     language_proj = outputs['language_proj'].float()    # (B, D) normalized
 
     # ---- MSE on masked patches (skip [CLS] at index 0) ----
-    # predicted[:, 1:] and target[:, 1:] -> (B, N, D)
-    # FP32 MSE avoids AMP overflow when predictor/teacher magnitudes grow.
-    pred_patches = predicted[:, 1:, :].float()
-    tgt_patches = target[:, 1:, :].float()
+    # 0.0 * nan is nan, so skip the term entirely when alpha is 0.
+    if alpha != 0:
+        predicted = outputs['predicted_patches']   # (B, N+1, D)
+        target = outputs['target_patches']          # (B, N+1, D), detached
+        patch_mask = outputs['patch_mask']          # (B, N)
+        pred_patches = predicted[:, 1:, :].float()
+        tgt_patches = target[:, 1:, :].float()
 
-    mse_all = F.mse_loss(pred_patches, tgt_patches, reduction='none')  # (B, N, D)
-    mse_all = mse_all.mean(dim=-1)  # (B, N) — average over feature dim
+        mse_all = F.mse_loss(pred_patches, tgt_patches, reduction='none')  # (B, N, D)
+        mse_all = mse_all.mean(dim=-1)  # (B, N)
 
-    # Mask out unmasked positions. Average per sample first so a zero-mask
-    # sample contributes 0 instead of changing the whole-batch denominator.
-    patch_mask_expanded = patch_mask.to(dtype=mse_all.dtype)  # (B, N) — 1 = masked
-    masked_counts = patch_mask_expanded.sum(dim=1)
-    masked_sums = (mse_all * patch_mask_expanded).sum(dim=1)
-    mse_per_sample = torch.where(
-        masked_counts > 0,
-        masked_sums / masked_counts.clamp(min=1),
-        torch.zeros_like(masked_sums),
-    )
-    mse_masked = mse_per_sample.mean()
+        # Mask out unmasked positions. Average per sample first so a zero-mask
+        # sample contributes 0 instead of changing the whole-batch denominator.
+        patch_mask_expanded = patch_mask.to(dtype=mse_all.dtype)  # (B, N)
+        masked_counts = patch_mask_expanded.sum(dim=1)
+        masked_sums = (mse_all * patch_mask_expanded).sum(dim=1)
+        mse_per_sample = torch.where(
+            masked_counts > 0,
+            masked_sums / masked_counts.clamp(min=1),
+            torch.zeros_like(masked_sums),
+        )
+        mse_masked = mse_per_sample.mean()
+    else:
+        mse_masked = vision_proj.new_zeros(())
 
     # ---- Contrastive loss (FP32 for AMP stability) ----
     batch_size = vision_proj.size(0)
@@ -1742,9 +1757,12 @@ def compute_jepa_loss(
         raise ValueError(f"Unknown contrastive loss type: {loss_type!r}")
 
     # ---- Variance regularization (pre-normalized projections) ----
-    vision_raw = outputs['vision_proj_raw'].float()
-    language_raw = outputs['language_proj_raw'].float()
-    var_loss = (variance_loss(vision_raw) + variance_loss(language_raw)) / 2
+    if gamma != 0:
+        vision_raw = outputs['vision_proj_raw'].float()
+        language_raw = outputs['language_proj_raw'].float()
+        var_loss = (variance_loss(vision_raw) + variance_loss(language_raw)) / 2
+    else:
+        var_loss = vision_proj.new_zeros(())
 
     # ---- Hard-negative ranking (VSE++ max-violation) ----
     if hard_negative_weight > 0.0:

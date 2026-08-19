@@ -42,6 +42,7 @@ _CHECKPOINT_STATE_KEYS = frozenset({
     'scaler_state_dict',
     'memory_bank_state_dict',
     'model_ema_state_dict',
+    'model_eval_state',
     'step',
     'running_loss',
     'running_steps',
@@ -749,6 +750,8 @@ class VL_JEPA_Trainer:
         nonfinite_location: Optional[str] = None,
     ) -> Dict[str, float]:
         """Metrics for batches skipped due to NaN/Inf loss, inputs, outputs, or weights."""
+        self.optimizer.zero_grad(set_to_none=True)
+        self._accum_counter = 0
         self._skipped_batches += 1
         self._save_nan_diagnostic(
             reason,
@@ -804,11 +807,14 @@ class VL_JEPA_Trainer:
                 language_emb.float(),
                 attention_mask,
                 mask_seed=mask_seed,
+                compute_jepa=self.alpha != 0,
             )
 
+        compute_jepa = self.alpha != 0
         if not self.use_multi_crop:
             return self.model(
                 images, input_ids, attention_mask, mask_seed=mask_seed,
+                compute_jepa=compute_jepa,
             )
 
         views = make_multicrop_views(
@@ -824,6 +830,7 @@ class VL_JEPA_Trainer:
             context_images=views['local'],
             target_images=views['global'],
             mask_seed=mask_seed,
+            compute_jepa=compute_jepa,
         )
 
     @staticmethod
@@ -1120,7 +1127,7 @@ class VL_JEPA_Trainer:
                 language_emb=language_emb,
             )
             loss_dict = compute_jepa_loss(
-                outputs, self.alpha, self.beta, self.gamma, memory_bank=self.memory_bank,
+                outputs, self.alpha, self.beta, self.gamma, memory_bank=None,
                 label_smoothing=self.label_smoothing,
                 hard_negative_weight=self.hard_negative_weight,
                 hard_negative_margin=self.hard_negative_margin,
@@ -1313,6 +1320,7 @@ class VL_JEPA_Trainer:
         """Save full training state."""
         state = {
             'model_state_dict': self.model.state_dict(),
+            'model_eval_state': self.build_eval_state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,

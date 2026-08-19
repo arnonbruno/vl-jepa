@@ -883,7 +883,7 @@ def main() -> None:
 
             if (epoch + 1) % out_cfg["checkpoint_interval"] == 0:
                 ckpt_path = exp_dir / f'checkpoint_epoch{epoch+1}.pt'
-                trainer.save_checkpoint(str(ckpt_path), {'epoch': epoch + 1})
+                trainer.save_checkpoint(str(ckpt_path), {'epoch': epoch + 1, 'config': cfg})
                 print(f"  → Checkpoint saved: epoch {epoch+1}")
 
             with open(exp_dir / 'metrics.json', 'w') as f:
