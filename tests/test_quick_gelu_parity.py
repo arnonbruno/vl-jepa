@@ -73,6 +73,24 @@ def test_force_quick_gelu_typeerror_fallback(monkeypatch) -> None:
     assert "force_quick_gelu" not in calls[1]
 
 
+def test_force_quick_gelu_unrelated_typeerror_is_not_swallowed(monkeypatch) -> None:
+    calls = []
+
+    def exploding(model_name, pretrained=None, **kwargs):
+        calls.append(dict(kwargs))
+        if "force_quick_gelu" in kwargs:
+            raise TypeError("GELU constructor got invalid dtype")
+        return object(), None, None
+
+    monkeypatch.setattr(
+        "src.model.open_clip",
+        types.SimpleNamespace(create_model_and_transforms=exploding),
+    )
+    with pytest.raises(TypeError, match="invalid dtype"):
+        _create_openclip_model("ViT-B-16", "openai")
+    assert len(calls) == 1
+
+
 def test_installed_openclip_force_quick_gelu_signature() -> None:
     open_clip = pytest.importorskip("open_clip")
     sig = inspect.signature(open_clip.create_model_and_transforms)

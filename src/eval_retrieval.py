@@ -138,6 +138,11 @@ def _require_str_captions(captions: Sequence[str]) -> None:
             raise ValueError(
                 f"captions[{i}] must be a string; got {type(cap).__name__}"
             )
+        if not cap.strip():
+            raise ValueError(
+                f"captions[{i}] is empty after str.strip(); "
+                "refusing to form an ambiguity group from a malformed caption"
+            )
 
 
 def _caption_image_groups(
@@ -372,14 +377,15 @@ def compute_retrieval_metrics(
 
     if diagnostics:
         assert captions is not None
-        normalized, groups = _caption_image_groups(
+        positives = caption_positive_images(
             captions, text_to_image, image_embs.size(0),
         )
-        positives = [
-            torch.tensor(sorted(groups[key]), dtype=torch.int64) for key in normalized
-        ]
         multiplicity = torch.tensor([len(s) for s in positives], dtype=torch.int64)
+        normalized = [cap.strip() for cap in captions]
         occ = Counter(normalized)
+        unique_pos = {}
+        for key, pos in zip(normalized, positives):
+            unique_pos.setdefault(key, pos)
         cap_min, cap_max, cap_mean = _captions_per_image_stats(
             text_to_image, image_embs.size(0),
         )
@@ -400,7 +406,7 @@ def compute_retrieval_metrics(
         diag["frac_ambiguous_captions"] = float((multiplicity > 1).float().mean().item())
         diag["n_duplicate_text_groups"] = int(sum(1 for n in occ.values() if n > 1))
         diag["n_cross_image_duplicate_groups"] = int(
-            sum(1 for imgs in groups.values() if len(imgs) > 1)
+            sum(1 for pos in unique_pos.values() if len(pos) > 1)
         )
         diag["captions_per_image_min"] = cap_min
         diag["captions_per_image_max"] = cap_max

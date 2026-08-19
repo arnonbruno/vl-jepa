@@ -254,7 +254,10 @@ def _load_flickr30k(image_size: int, preprocess, batch_size: int = 64, num_worke
     csv_path, zip_path = _ensure_flickr_assets()
     filenames, captions, text_to_image = _load_test_split(csv_path)
     ds = _ZipImageDataset(zip_path, filenames, preprocess)
-    loader = DataLoader(ds, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    loader = DataLoader(
+        ds, batch_size=batch_size, num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
     return loader, captions, text_to_image, len(filenames)
 
 

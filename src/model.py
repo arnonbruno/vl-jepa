@@ -536,9 +536,13 @@ def create_openclip_model_and_transforms(
         return open_clip.create_model_and_transforms(
             model_name, pretrained=pretrained, **extra,
         )
-    except TypeError:
-        if not extra.pop("force_quick_gelu", False):
+    except TypeError as exc:
+        if extra.get("force_quick_gelu") is not True:
             raise
+        msg = str(exc)
+        if "unexpected keyword argument" not in msg or "force_quick_gelu" not in msg:
+            raise
+        extra.pop("force_quick_gelu", None)
         return open_clip.create_model_and_transforms(
             model_name, pretrained=pretrained, **extra,
         )

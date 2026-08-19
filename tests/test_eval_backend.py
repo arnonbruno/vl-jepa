@@ -172,10 +172,12 @@ def test_backend_accepts_complete_legacy_flat_config(tmp_path: Path) -> None:
     }
     path = tmp_path / "flat.pt"
     torch.save({"model_state_dict": model.state_dict(), "config": flat}, path)
-    encode_image, encode_text, _tok, image_size, _max_len = _build_vljepa_backend(
+    encode_image, encode_text, tok, image_size, max_len = _build_vljepa_backend(
         path, torch.device("cpu"),
     )
     assert image_size == 64
+    assert max_len == 64
+    assert tok.max_caption_length == 64
     images = torch.randn(1, 3, 64, 64)
     ids = torch.randint(0, 100, (1, 8))
     attn = torch.ones(1, 8, dtype=torch.long)
@@ -235,6 +237,56 @@ def test_backend_torch_load_weights_only_typeerror_fallback(
         vis = encode_image(images)
         txt = encode_text(ids, attn)
     assert vis.shape[0] == 1 and txt.shape[0] == 1
+
+
+def test_backend_torch_load_unrelated_typeerror_is_not_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from experiments import evaluate_retrieval as er
+
+    cfg = _tiny_config()
+    model = VL_JEPA(
+        hidden_dim=96, patch_size=16, image_size=64, predictor_layers=1,
+        freeze_encoders=False, projection_dim=96,
+        projection_type="mlp", text_pool="mean",
+    )
+    path = _save_ckpt(tmp_path, model, cfg)
+    real_load = torch.load
+    calls = []
+
+    def fake_load(*args, **kwargs):
+        calls.append(kwargs)
+        if "weights_only" in kwargs:
+            raise TypeError("expected Tensor but got dict")
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(er.torch, "load", fake_load)
+    with pytest.raises(TypeError, match="expected Tensor"):
+        er._build_vljepa_backend(path, torch.device("cpu"))
+    assert len(calls) == 1
+
+
+def test_backend_omitted_non_arch_keys_use_documented_defaults(
+    tmp_path: Path,
+) -> None:
+    from experiments.evaluate_retrieval import _build_vljepa_backend
+
+    cfg = _tiny_config()
+    for key in ("mask_ratio", "freeze_encoders", "contrastive_loss", "text_mask_ratio"):
+        cfg["model"].pop(key, None)
+    cfg["data"].pop("max_caption_length", None)
+    model = VL_JEPA(
+        hidden_dim=96, patch_size=16, image_size=64, predictor_layers=1,
+        freeze_encoders=False, projection_dim=96,
+        projection_type="mlp", text_pool="mean",
+    )
+    path = _save_ckpt(tmp_path, model, cfg)
+    _enc_i, _enc_t, tok, image_size, max_len = _build_vljepa_backend(
+        path, torch.device("cpu"),
+    )
+    assert image_size == 64
+    assert max_len == 64
+    assert tok.max_caption_length == 64
 
 
 @pytest.mark.skipif(not _HAS_OPEN_CLIP, reason="open_clip_torch not installed")

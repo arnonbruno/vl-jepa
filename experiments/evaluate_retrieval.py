@@ -192,6 +192,21 @@ def _model_cfg_from_checkpoint_config(cfg: Dict[str, Any]) -> Tuple[Dict[str, An
     A complete legacy *flat* config (architecture keys at the top level, no
     nested ``model`` dict) is accepted only when every required key is present.
     Incomplete nested configs are never filled with guessed defaults.
+
+    Optional keys that are *not* architecture (eval encoding does not depend
+    on them) keep the same defaults as ``VL_JEPA.__init__`` / training:
+
+    * ``mask_ratio`` (0.75) and ``text_mask_ratio`` (0.0): training masks;
+      eval uses the unmasked context/language encoders.
+    * ``freeze_encoders`` (True): ``requires_grad`` only.
+    * ``contrastive_loss`` (``"infonce"``): training loss selector.
+
+    Tokenizer length is also not an architecture key. When
+    ``max_caption_length`` is omitted, eval uses 64, matching
+    ``CaptionTokenizer`` and the training default. ``openclip_model`` /
+    ``openclip_pretrained`` remain required when either backbone is
+    ``openclip``; the constructor defaults below apply only to custom
+    backbones, where those arguments are unused.
     """
     if not isinstance(cfg, dict) or not cfg:
         raise KeyError("Checkpoint config must be a non-empty dict")
@@ -215,11 +230,18 @@ def _model_cfg_from_checkpoint_config(cfg: Dict[str, Any]) -> Tuple[Dict[str, An
     return mcfg, data_cfg
 
 
+def _is_unexpected_kwarg_typeerror(exc: TypeError, keyword: str) -> bool:
+    msg = str(exc)
+    return "unexpected keyword argument" in msg and keyword in msg
+
+
 def _torch_load_checkpoint(path: Path, map_location):
     """Load a checkpoint; fall back if this torch build rejects ``weights_only``."""
     try:
         return torch.load(str(path), map_location=map_location, weights_only=False)
-    except TypeError:
+    except TypeError as exc:
+        if not _is_unexpected_kwarg_typeerror(exc, "weights_only"):
+            raise
         return torch.load(str(path), map_location=map_location)
 
 
@@ -232,6 +254,9 @@ def _build_vljepa_backend(checkpoint: Path, device: torch.device):
             "architecture. Re-save with config included."
         )
     mcfg, data_cfg = _model_cfg_from_checkpoint_config(cfg)
+    # Non-architectural eval defaults: training knobs and tokenizer length.
+    # See _model_cfg_from_checkpoint_config. Do not treat these as reconstructed
+    # old-checkpoint architecture.
     model = VL_JEPA(
         hidden_dim=mcfg["hidden_dim"],
         patch_size=mcfg["patch_size"],
@@ -311,10 +336,11 @@ def _eval_5k(image_embs, text_embs, text_to_image, **metric_kw) -> Dict[str, Any
     )
 
 
-def _eval_1k(image_embs, text_embs, text_to_image) -> Dict[str, float]:
-    """Average standard metrics over complete disjoint 1000-image folds."""
+def _eval_1k(
+    image_embs, text_embs, text_to_image, fold_size: int = 1000,
+) -> Dict[str, float]:
+    """Average standard metrics over complete disjoint ``fold_size``-image folds."""
     num_images = image_embs.size(0)
-    fold_size = 1000
     n_folds = num_images // fold_size
     if n_folds == 0:
         return _eval_5k(image_embs, text_embs, text_to_image)

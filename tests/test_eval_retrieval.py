@@ -412,6 +412,7 @@ def test_eval_1k_does_not_forward_diagnostics_or_use_caps_per_image():
 
     sig = inspect.signature(_eval_1k)
     assert "caps_per_image" not in sig.parameters
+    assert sig.parameters["fold_size"].default == 1000
     torch.manual_seed(4)
     n_images = 2000
     images = torch.randn(n_images, 4)
@@ -424,6 +425,52 @@ def test_eval_1k_does_not_forward_diagnostics_or_use_caps_per_image():
         avg["i2t_r1"] + avg["i2t_r5"] + avg["i2t_r10"]
         + avg["t2i_r1"] + avg["t2i_r5"] + avg["t2i_r10"]
     )
+
+
+def _five_caption_fold_fixture(n_images: int = 8, caps: int = 5, dim: int = 4):
+    torch.manual_seed(7)
+    images = torch.randn(n_images, dim)
+    text_to_image = torch.arange(n_images).repeat_interleave(caps)
+    texts = torch.randn(n_images * caps, dim)
+    return images, texts, text_to_image
+
+
+def _assert_five_caption_fold_calls(calls, fold_size: int, caps: int = 5) -> None:
+    assert len(calls) == 2
+    for i, call in enumerate(calls):
+        n_img, n_txt, t2i, kwargs = call
+        assert n_img == fold_size
+        assert n_txt == fold_size * caps
+        assert int(t2i.min()) >= 0
+        assert int(t2i.max()) < fold_size
+        assert torch.equal(t2i, torch.arange(fold_size).repeat_interleave(caps))
+        assert kwargs.get("diagnostics") is not True
+
+
+def test_eval_1k_five_captions_per_image_remaps_fold_indices(monkeypatch):
+    from experiments.evaluate_retrieval import _eval_1k
+
+    calls = []
+    real = compute_retrieval_metrics
+
+    def spy(image_embs, text_embs, text_to_image, **kwargs):
+        calls.append((
+            int(image_embs.size(0)),
+            int(text_embs.size(0)),
+            text_to_image.detach().cpu().clone(),
+            dict(kwargs),
+        ))
+        assert kwargs.get("diagnostics") is not True
+        return real(image_embs, text_embs, text_to_image, **kwargs)
+
+    monkeypatch.setattr(
+        "experiments.evaluate_retrieval.compute_retrieval_metrics", spy,
+    )
+    images, texts, text_to_image = _five_caption_fold_fixture()
+    avg = _eval_1k(images, texts, text_to_image, fold_size=4)
+    _assert_five_caption_fold_calls(calls, fold_size=4)
+    assert "diagnostics" not in avg
+    assert "t2i_r1_any_gt" not in avg
 
 
 def test_coco_1k_fold_helper_uses_complete_folds_only():
@@ -467,3 +514,54 @@ def test_coco_1k_preserves_five_folds_on_5000_images(monkeypatch):
     text_to_image = torch.arange(n)
     _coco_1k_5fold(images, texts, text_to_image, n_images=n)
     assert sizes == [1000, 1000, 1000, 1000, 1000]
+
+
+def test_coco_1k_five_captions_per_image_remaps_fold_indices(monkeypatch):
+    from src.eval_all_checkpoints import _coco_1k_5fold
+
+    calls = []
+    real = compute_retrieval_metrics
+
+    def spy(image_embs, text_embs, text_to_image, **kwargs):
+        calls.append((
+            int(image_embs.size(0)),
+            int(text_embs.size(0)),
+            text_to_image.detach().cpu().clone(),
+            dict(kwargs),
+        ))
+        assert kwargs.get("diagnostics") is not True
+        return real(image_embs, text_embs, text_to_image, **kwargs)
+
+    monkeypatch.setattr("src.eval_all_checkpoints.compute_retrieval_metrics", spy)
+    images, texts, text_to_image = _five_caption_fold_fixture()
+    avg = _coco_1k_5fold(
+        images, texts, text_to_image, n_images=8, fold_size=4,
+    )
+    _assert_five_caption_fold_calls(calls, fold_size=4)
+    assert "diagnostics" not in avg
+    assert "t2i_r1_any_gt" not in avg
+
+
+def test_diagnostics_reject_empty_after_strip_captions():
+    images = torch.eye(2)
+    texts = torch.eye(2)
+    text_to_image = torch.tensor([0, 1])
+    with pytest.raises(ValueError, match="empty"):
+        compute_retrieval_metrics(
+            images, texts, text_to_image, normalize=False,
+            captions=["ok", "   "], diagnostics=True,
+        )
+    with pytest.raises(ValueError, match="empty"):
+        compute_retrieval_metrics(
+            images, texts, text_to_image, normalize=False,
+            captions=["ok", ""], diagnostics=True,
+        )
+    with pytest.raises(ValueError, match="empty"):
+        caption_positive_images(
+            ["dog", ""], text_to_image, num_images=2,
+        )
+    ignored = compute_retrieval_metrics(
+        images, texts, text_to_image, normalize=False,
+        captions=["", "   "], diagnostics=False,
+    )
+    assert "diagnostics" not in ignored

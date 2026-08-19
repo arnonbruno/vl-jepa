@@ -60,3 +60,5 @@ def test_eval_all_checkpoints_flickr_delegates_to_split_test() -> None:
     assert "[-1000:]" not in src
     assert "_load_test_split" in src
     assert "split" in inspect.getsource(m)
+    assert "pin_memory=torch.cuda.is_available()" in src
+    assert "pin_memory=True" not in src
