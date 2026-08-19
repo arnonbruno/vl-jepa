@@ -90,3 +90,24 @@ def test_unified_load_coco_five_captions_sorted_ids_and_map(
     batch = next(iter(loader))
     assert batch.shape[0] == 2
     assert batch.shape[1] == 3
+
+    raw = json.loads((tmp_path / "annotations" / "captions_val2017.json").read_text())
+    from collections import Counter
+    per_image = Counter(a["image_id"] for a in raw["annotations"])
+    assert per_image[20] == 7
+    assert per_image[3] == 5
+
+    from src.eval_retrieval import compute_retrieval_metrics
+
+    dummy_images = torch.eye(n_images)
+    dummy_texts = torch.nn.functional.one_hot(
+        text_to_image, num_classes=n_images,
+    ).float()
+    tagged = compute_retrieval_metrics(
+        dummy_images, dummy_texts, text_to_image, normalize=False,
+        captions=captions, diagnostics=True,
+    )
+    diag = tagged["diagnostics"]
+    assert diag["captions_per_image_min"] == 5
+    assert diag["captions_per_image_max"] == 5
+    assert diag["captions_per_image_mean"] == 5.0

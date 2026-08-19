@@ -42,7 +42,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -160,6 +160,14 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument(
+        "--ambiguity-diagnostics",
+        action="store_true",
+        help=(
+            "Also write nested caption-string diagnostics for the Flickr test "
+            "pool (not a leaderboard metric, never part of rsum)"
+        ),
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -200,18 +208,34 @@ def main() -> None:
     text_embs = _encode_texts(encode_text, input_ids, attention_mask, device, args.batch_size)
     print(f"  {tuple(text_embs.shape)} in {time.time() - t1:.1f}s")
 
-    metrics = compute_retrieval_metrics(image_embs, text_embs, text_to_image, normalize=False)
+    metrics = compute_retrieval_metrics(
+        image_embs, text_embs, text_to_image, normalize=False,
+        captions=texts if args.ambiguity_diagnostics else None,
+        diagnostics=args.ambiguity_diagnostics,
+    )
+    diagnostics = metrics.pop("diagnostics", None) if args.ambiguity_diagnostics else None
     print("\n--- Flickr30K 1K test ---")
     print(format_metrics(metrics))
+    if diagnostics is not None:
+        print(
+            "  [diagnostic] evaluation-only; not a retrieval result. "
+            f"t2i_r1_any_gt={diagnostics['t2i_r1_any_gt']:.2f} "
+            f"(standard t2i_r1={metrics['t2i_r1']:.2f})"
+        )
+        print(f"  {diagnostics['note']}")
 
     if args.output:
         out_path = Path(args.output).expanduser().resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = {
+            "backend": backend,
+            "num_images": len(filenames),
+            "results": {"flickr1k": metrics},
+        }
+        if diagnostics is not None:
+            payload["diagnostics"] = diagnostics
         with open(out_path, "w") as f:
-            json.dump(
-                {"backend": backend, "num_images": len(filenames),
-                 "results": {"flickr1k": metrics}}, f, indent=2,
-            )
+            json.dump(payload, f, indent=2)
         print(f"\nSaved metrics to {out_path}")
 
 

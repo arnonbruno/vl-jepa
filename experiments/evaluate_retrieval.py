@@ -55,7 +55,11 @@ from src.dataset import (  # noqa: E402
     _image_root,
     ensure_coco_2017,
 )
-from src.eval_retrieval import compute_retrieval_metrics, format_metrics  # noqa: E402
+from src.eval_retrieval import (  # noqa: E402
+    average_standard_metrics,
+    compute_retrieval_metrics,
+    format_metrics,
+)
 from src.model import VL_JEPA, create_openclip_model_and_transforms  # noqa: E402
 
 try:
@@ -211,8 +215,16 @@ def _model_cfg_from_checkpoint_config(cfg: Dict[str, Any]) -> Tuple[Dict[str, An
     return mcfg, data_cfg
 
 
+def _torch_load_checkpoint(path: Path, map_location):
+    """Load a checkpoint; fall back if this torch build rejects ``weights_only``."""
+    try:
+        return torch.load(str(path), map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(str(path), map_location=map_location)
+
+
 def _build_vljepa_backend(checkpoint: Path, device: torch.device):
-    ckpt = torch.load(str(checkpoint), map_location=device, weights_only=False)
+    ckpt = _torch_load_checkpoint(checkpoint, map_location=device)
     cfg = ckpt.get("config")
     if not cfg:
         raise KeyError(
@@ -293,34 +305,30 @@ def _build_zeroshot_backend(model_name: str, pretrained: str, device: torch.devi
 # Protocol drivers
 # ---------------------------------------------------------------------------
 
-def _eval_5k(image_embs, text_embs, text_to_image, **metric_kw) -> Dict[str, float]:
+def _eval_5k(image_embs, text_embs, text_to_image, **metric_kw) -> Dict[str, Any]:
     return compute_retrieval_metrics(
         image_embs, text_embs, text_to_image, normalize=False, **metric_kw,
     )
 
 
-def _eval_1k(image_embs, text_embs, text_to_image, caps_per_image: int) -> Dict[str, float]:
-    """Average metrics over 5 disjoint 1000-image folds (classic COCO 1K)."""
+def _eval_1k(image_embs, text_embs, text_to_image) -> Dict[str, float]:
+    """Average standard metrics over complete disjoint 1000-image folds."""
     num_images = image_embs.size(0)
     fold_size = 1000
     n_folds = num_images // fold_size
     if n_folds == 0:
         return _eval_5k(image_embs, text_embs, text_to_image)
-    keys = None
-    acc: Dict[str, float] = {}
+    folds: List[Dict[str, Any]] = []
     for fold in range(n_folds):
         lo, hi = fold * fold_size, (fold + 1) * fold_size
         img_fold = image_embs[lo:hi]
         text_mask = (text_to_image >= lo) & (text_to_image < hi)
         txt_fold = text_embs[text_mask]
         t2i_fold = text_to_image[text_mask] - lo
-        m = compute_retrieval_metrics(img_fold, txt_fold, t2i_fold, normalize=False)
-        if keys is None:
-            keys = list(m.keys())
-            acc = {k: 0.0 for k in keys}
-        for k in keys:
-            acc[k] += m[k]
-    return {k: v / n_folds for k, v in acc.items()}
+        folds.append(
+            compute_retrieval_metrics(img_fold, txt_fold, t2i_fold, normalize=False)
+        )
+    return average_standard_metrics(folds)
 
 
 def main() -> None:
@@ -337,8 +345,9 @@ def main() -> None:
         "--ambiguity-diagnostics",
         action="store_true",
         help=(
-            "Also report caption-string multiplicity diagnostics (not a "
-            "leaderboard metric)"
+            "Also report nested caption-string multiplicity diagnostics "
+            "for the full evaluation pool (not a leaderboard metric, not "
+            "fold-averaged, never part of rsum)"
         ),
     )
     parser.add_argument("--max-images", type=int, default=None,
@@ -377,7 +386,6 @@ def main() -> None:
 
     if args.max_images is not None:
         keep = args.max_images
-        image_ds.coco = coco  # keep reference; subset via mask below
         mask = text_to_image < keep
         text_to_image = text_to_image[mask]
         texts = [t for t, m in zip(texts, mask.tolist()) if m]
@@ -409,35 +417,50 @@ def main() -> None:
     )
     print(f"  {text_embs.shape} in {time.time() - t1:.1f}s")
 
-    results: Dict[str, Dict[str, float]] = {}
-    diag_kw = (
-        {"captions": texts, "diagnostics": True}
-        if args.ambiguity_diagnostics else {}
-    )
+    results: Dict[str, Dict[str, Any]] = {}
+    diagnostics: Optional[Dict[str, Any]] = None
     if args.protocol in ("5k", "both"):
-        m5k = _eval_5k(image_embs, text_embs, text_to_image, **diag_kw)
+        m5k = _eval_5k(
+            image_embs, text_embs, text_to_image,
+            captions=texts if args.ambiguity_diagnostics else None,
+            diagnostics=args.ambiguity_diagnostics,
+        )
+        if args.ambiguity_diagnostics:
+            diagnostics = m5k.pop("diagnostics")
         results["5k"] = m5k
         print(f"\n--- COCO {num_images}-image (5K protocol) ---")
         print(format_metrics(m5k))
-        if args.ambiguity_diagnostics:
+        if diagnostics is not None:
             print(
-                "  [diagnostic] caption multiplicity "
-                f"mean={m5k['diag_caption_multiplicity_mean']:.3f} "
-                f"frac_ambiguous={m5k['diag_frac_ambiguous_captions']:.3f} "
-                f"t2i_r1_any_gt={m5k['diag_t2i_r1_any_gt']:.2f}"
+                "  [diagnostic] evaluation-only; not a retrieval result. "
+                f"t2i_r1_any_gt={diagnostics['t2i_r1_any_gt']:.2f} "
+                f"(standard t2i_r1={m5k['t2i_r1']:.2f})"
             )
-            print(f"  {m5k['diag_note']}")
+            print(f"  {diagnostics['note']}")
     if args.protocol in ("1k", "both"):
-        m1k = _eval_1k(image_embs, text_embs, text_to_image, args.captions_per_image)
+        m1k = _eval_1k(image_embs, text_embs, text_to_image)
         results["1k"] = m1k
-        print(f"\n--- COCO 1K protocol (5-fold avg) ---")
+        print("\n--- COCO 1K protocol (mean of complete 1000-image folds) ---")
         print(format_metrics(m1k))
+    if args.ambiguity_diagnostics and diagnostics is None:
+        tagged = compute_retrieval_metrics(
+            image_embs, text_embs, text_to_image, normalize=False,
+            captions=texts, diagnostics=True,
+        )
+        diagnostics = tagged["diagnostics"]
+        print("\n  [diagnostic] computed on the full pool (not fold-averaged)")
+        print(f"  {diagnostics['note']}")
 
     if args.output:
         out_path = Path(args.output).expanduser().resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = {
+            "backend": backend, "num_images": num_images, "results": results,
+        }
+        if diagnostics is not None:
+            payload["diagnostics"] = diagnostics
         with open(out_path, "w") as f:
-            json.dump({"backend": backend, "num_images": num_images, "results": results}, f, indent=2)
+            json.dump(payload, f, indent=2)
         print(f"\nSaved metrics to {out_path}")
 
 

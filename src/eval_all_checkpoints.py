@@ -27,14 +27,15 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 
 # Project imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.eval_retrieval import compute_retrieval_metrics  # noqa: E402
+from src.eval_retrieval import (  # noqa: E402
+    average_standard_metrics,
+    compute_retrieval_metrics,
+)
 
 
 # ── Model definitions ──────────────────────────────────────────────────────
@@ -282,36 +283,47 @@ def _encode_captions_in_chunks(captions: list, encode_fn, chunk_size: int = 256)
 
 # ── COCO 1K 5-fold protocol ───────────────────────────────────────────────
 
-def _coco_1k_5fold(image_embs, text_embs, text_to_image, n_images=5000):
-    """Compute COCO 1K metrics: average over 5 disjoint 1000-image folds."""
-    from src.eval_retrieval import compute_retrieval_metrics
+def _coco_1k_5fold(image_embs, text_embs, text_to_image, n_images=None, fold_size=1000):
+    """Average COCO 1K metrics over complete disjoint ``fold_size``-image folds.
 
-    fold_size = 1000
+    The number of folds is ``len(image_embs) // fold_size``. Empty trailing
+    folds are never created. A 5000-image input still yields the standard
+    5 folds of 1000. If there is no complete fold, the full pool is scored
+    once instead. Nested diagnostics are never averaged.
+    """
+    if image_embs.dim() != 2 or text_embs.dim() != 2:
+        raise ValueError("image_embs and text_embs must be 2-D")
+    actual = int(image_embs.size(0))
+    if n_images is None:
+        n_images = actual
+    if n_images != actual:
+        raise ValueError(
+            f"n_images={n_images} does not match image_embs size {actual}"
+        )
+    if text_to_image.dim() != 1:
+        raise ValueError("text_to_image must be a 1-D tensor")
+    if text_embs.size(0) != text_to_image.size(0):
+        raise ValueError(
+            f"text_embs has {text_embs.size(0)} rows but text_to_image has "
+            f"{text_to_image.size(0)} entries"
+        )
+
+    n_folds = n_images // fold_size
+    if n_folds == 0:
+        return compute_retrieval_metrics(image_embs, text_embs, text_to_image)
+
     all_metrics = []
-
-    for fold in range(5):
+    for fold in range(n_folds):
         start = fold * fold_size
         end = start + fold_size
-
-        # Filter images
-        img_mask = torch.zeros(n_images, dtype=torch.bool)
-        img_mask[start:end] = True
-
-        # Filter captions that belong to these images
-        cap_mask = img_mask[text_to_image]
-
+        cap_mask = (text_to_image >= start) & (text_to_image < end)
         fold_img_embs = image_embs[start:end]
         fold_text_embs = text_embs[cap_mask]
-        fold_t2i = text_to_image[cap_mask] - start  # re-index to 0..999
-
-        m = compute_retrieval_metrics(fold_img_embs, fold_text_embs, fold_t2i)
-        all_metrics.append(m)
-
-    # Average
-    avg = {}
-    for key in all_metrics[0]:
-        avg[key] = float(np.mean([m[key] for m in all_metrics]))
-    return avg
+        fold_t2i = text_to_image[cap_mask] - start
+        all_metrics.append(
+            compute_retrieval_metrics(fold_img_embs, fold_text_embs, fold_t2i)
+        )
+    return average_standard_metrics(all_metrics)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -324,6 +336,15 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--models", nargs="*", default=None,
                         help="Subset of run_ids to evaluate (default: all)")
+    parser.add_argument(
+        "--ambiguity-diagnostics",
+        action="store_true",
+        help=(
+            "Also write nested caption-string diagnostics for the full COCO 5K "
+            "and Flickr pools (not a leaderboard metric; excluded from 1K folds "
+            "and the summary table)"
+        ),
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -391,12 +412,17 @@ def main():
 
         # COCO 5K
         print("  Computing COCO 5K metrics...")
-        coco_5k = compute_retrieval_metrics(coco_img_embs, coco_txt_embs, coco_t2i)
+        coco_5k = compute_retrieval_metrics(
+            coco_img_embs, coco_txt_embs, coco_t2i,
+            captions=coco_captions if args.ambiguity_diagnostics else None,
+            diagnostics=args.ambiguity_diagnostics,
+        )
+        coco_diag = coco_5k.pop("diagnostics", None) if args.ambiguity_diagnostics else None
         result["coco_5k"] = coco_5k
         print(f"    COCO 5K: rsum={coco_5k['rsum']:.2f}")
 
-        # COCO 1K (5-fold)
-        print("  Computing COCO 1K metrics (5-fold)...")
+        # COCO 1K (complete 1000-image folds; diagnostics never enter the mean)
+        print("  Computing COCO 1K metrics (complete 1000-image folds)...")
         coco_1k = _coco_1k_5fold(coco_img_embs, coco_txt_embs, coco_t2i, n_coco_images)
         result["coco_1k"] = coco_1k
         print(f"    COCO 1K: rsum={coco_1k['rsum']:.2f}")
@@ -413,9 +439,21 @@ def main():
         flickr_txt_embs = _encode_captions_in_chunks(flickr_captions, encode_texts)
 
         print("  Computing Flickr30K metrics...")
-        flickr = compute_retrieval_metrics(flickr_img_embs, flickr_txt_embs, flickr_t2i)
+        flickr = compute_retrieval_metrics(
+            flickr_img_embs, flickr_txt_embs, flickr_t2i,
+            captions=flickr_captions if args.ambiguity_diagnostics else None,
+            diagnostics=args.ambiguity_diagnostics,
+        )
+        flickr_diag = flickr.pop("diagnostics", None) if args.ambiguity_diagnostics else None
         result["flickr30k"] = flickr
         print(f"    Flickr30K: rsum={flickr['rsum']:.2f}")
+
+        if args.ambiguity_diagnostics:
+            result["diagnostics"] = {}
+            if coco_diag is not None:
+                result["diagnostics"]["coco_5k"] = coco_diag
+            if flickr_diag is not None:
+                result["diagnostics"]["flickr30k"] = flickr_diag
 
         elapsed = time.time() - t0
         result["eval_time_seconds"] = round(elapsed, 1)
