@@ -23,7 +23,8 @@ synthetic embeddings and reused by both the experiment script and notebooks.
 
 from __future__ import annotations
 
-from typing import Dict, List, Sequence
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -101,6 +102,78 @@ def _recall_summary(ranks: torch.Tensor, ks: Sequence[int]) -> Dict[str, float]:
     return out
 
 
+def caption_positive_multiplicity(
+    captions: Sequence[str],
+    text_to_image: torch.Tensor,
+    num_images: int,
+) -> torch.Tensor:
+    """Per-caption count of annotated images that share an exact GT caption string.
+
+    This is an **evaluation diagnostic**, not a training objective or a SOTA
+    claim. Standard COCO t2i Recall@K treats only the source image as positive.
+    When the same caption string is a ground-truth annotation on more than one
+    image, ranking one of those other annotated images is a provenance-valid
+    hit that the standard protocol still scores as a false negative.
+
+    Matching is exact ``str.strip()`` equality on the provided captions. No
+    learned similarity, paraphrases, or extra data are used.
+    """
+    if len(captions) != text_to_image.numel():
+        raise ValueError(
+            f"captions has {len(captions)} entries but text_to_image has "
+            f"{text_to_image.numel()}"
+        )
+    cap_to_images: dict[str, set[int]] = defaultdict(set)
+    for cap, image_idx in zip(captions, text_to_image.long().view(-1).tolist()):
+        if not 0 <= image_idx < num_images:
+            raise ValueError(
+                f"text_to_image image index {image_idx} out of range [0, {num_images})"
+            )
+        cap_to_images[str(cap).strip()].add(int(image_idx))
+    return torch.tensor(
+        [len(cap_to_images[str(cap).strip()]) for cap in captions],
+        dtype=torch.long,
+    )
+
+
+def _caption_string_positives(
+    captions: Sequence[str],
+    text_to_image: torch.Tensor,
+    num_images: int,
+) -> List[torch.Tensor]:
+    cap_to_images: dict[str, set[int]] = defaultdict(set)
+    for cap, image_idx in zip(captions, text_to_image.long().view(-1).tolist()):
+        if not 0 <= image_idx < num_images:
+            raise ValueError(
+                f"text_to_image image index {image_idx} out of range [0, {num_images})"
+            )
+        cap_to_images[str(cap).strip()].add(int(image_idx))
+    return [
+        torch.tensor(sorted(cap_to_images[str(cap).strip()]), dtype=torch.long)
+        for cap in captions
+    ]
+
+
+@torch.no_grad()
+def _t2i_ranks_any_positive(
+    text_embs: torch.Tensor,
+    image_embs: torch.Tensor,
+    positives: Sequence[torch.Tensor],
+    chunk: int,
+) -> torch.Tensor:
+    """0-indexed rank of each caption's best provenance-valid image."""
+    num_texts = text_embs.size(0)
+    ranks = torch.empty(num_texts, dtype=torch.long)
+    for start in range(0, num_texts, chunk):
+        end = min(start + chunk, num_texts)
+        sims = text_embs[start:end] @ image_embs.t()
+        for j in range(end - start):
+            cols = positives[start + j].to(sims.device)
+            best_pos_sim = sims[j, cols].max()
+            ranks[start + j] = int((sims[j] > best_pos_sim).sum().item())
+    return ranks
+
+
 @torch.no_grad()
 def compute_retrieval_metrics(
     image_embs: torch.Tensor,
@@ -110,7 +183,9 @@ def compute_retrieval_metrics(
     ks: Sequence[int] = (1, 5, 10),
     chunk: int = 1024,
     normalize: bool = True,
-) -> Dict[str, float]:
+    captions: Optional[Sequence[str]] = None,
+    diagnostics: bool = False,
+) -> Dict[str, Any]:
     """Compute the standard COCO/Flickr multi-caption retrieval metrics.
 
     Args:
@@ -120,6 +195,11 @@ def compute_retrieval_metrics(
         ks: recall cutoffs to report.
         chunk: query-dimension chunk size to bound peak memory.
         normalize: L2-normalize embeddings before the dot product (cosine sim).
+        captions: optional caption strings; required when ``diagnostics=True``.
+        diagnostics: if True, also emit caption-string multiplicity stats and
+            an ambiguity-aware t2i Recall@K. These ``diag_*`` keys are an
+            evaluation diagnostic, not a replacement for standard Recall@K
+            and not a scientific performance claim.
 
     Returns:
         Flat dict with ``i2t_r{k}``, ``t2i_r{k}``, ``i2t_medr``, ``t2i_medr``,
@@ -152,7 +232,7 @@ def compute_retrieval_metrics(
         _i2t_ranks(image_embs, text_embs, image_to_texts, chunk), ks
     )
 
-    out: Dict[str, float] = {}
+    out: Dict[str, Any] = {}
     for k in ks:
         out[f"i2t_r{k}"] = i2t[f"r{k}"]
         out[f"t2i_r{k}"] = t2i[f"r{k}"]
@@ -161,6 +241,29 @@ def compute_retrieval_metrics(
     out["i2t_meanr"] = i2t["meanr"]
     out["t2i_meanr"] = t2i["meanr"]
     out["rsum"] = sum(out[f"i2t_r{k}"] + out[f"t2i_r{k}"] for k in ks)
+
+    if diagnostics:
+        if captions is None:
+            raise ValueError("diagnostics=True requires captions")
+        multiplicity = caption_positive_multiplicity(
+            captions, text_to_image, image_embs.size(0),
+        )
+        positives = _caption_string_positives(
+            captions, text_to_image, image_embs.size(0),
+        )
+        diag_t2i = _recall_summary(
+            _t2i_ranks_any_positive(text_embs, image_embs, positives, chunk), ks
+        )
+        out["diag_caption_multiplicity_mean"] = float(multiplicity.float().mean().item())
+        out["diag_caption_multiplicity_max"] = float(multiplicity.max().item())
+        out["diag_frac_ambiguous_captions"] = float(
+            (multiplicity > 1).float().mean().item()
+        )
+        out["diag_t2i_r1_any_gt"] = diag_t2i["r1"]
+        out["diag_note"] = (
+            "evaluation diagnostic: t2i any-GT uses exact caption-string "
+            "multiplicity from the annotation map; not a leaderboard metric"
+        )
     return out
 
 

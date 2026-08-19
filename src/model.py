@@ -513,17 +513,40 @@ class TimmVisionEncoder(nn.Module):
         return feats
 
 
-def _create_openclip_model(model_name: str, pretrained: Optional[str]):
-    """Instantiate an open_clip model (vision + text) with a clear error path."""
+def create_openclip_model_and_transforms(
+    model_name: str,
+    pretrained: Optional[str] = None,
+    **kwargs,
+):
+    """Create an open_clip model, preserving QuickGELU for OpenAI weights.
+
+    OpenAI CLIP checkpoints were trained with QuickGELU. Newer ``open_clip``
+    builds may reject ``force_quick_gelu``; retry without the kwarg rather
+    than crashing. Non-OpenAI weights never receive the flag.
+    """
     if open_clip is None:
         raise ImportError(
             "open_clip_torch is required for the openclip backbone "
             "(`pip install open_clip_torch`)."
         )
-    extra = {"force_quick_gelu": True} if pretrained == "openai" else {}
-    model, _, _ = open_clip.create_model_and_transforms(
-        model_name, pretrained=pretrained, **extra,
-    )
+    extra = dict(kwargs)
+    if pretrained == "openai":
+        extra["force_quick_gelu"] = True
+    try:
+        return open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained, **extra,
+        )
+    except TypeError:
+        if not extra.pop("force_quick_gelu", False):
+            raise
+        return open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained, **extra,
+        )
+
+
+def _create_openclip_model(model_name: str, pretrained: Optional[str]):
+    """Instantiate an open_clip model (vision + text) with a clear error path."""
+    model, _, _ = create_openclip_model_and_transforms(model_name, pretrained)
     return model
 
 

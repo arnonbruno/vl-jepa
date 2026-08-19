@@ -157,9 +157,10 @@ def _build_zeroshot_backend(model_name: str, pretrained: str, device: str):
     """Return (encode_images, encode_texts, image_size) for a zero-shot OpenCLIP model."""
     import open_clip
 
-    extra = {"force_quick_gelu": True} if pretrained == "openai" else {}
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        model_name, pretrained=pretrained, device=device, **extra,
+    from src.model import create_openclip_model_and_transforms
+
+    model, _, preprocess = create_openclip_model_and_transforms(
+        model_name, pretrained=pretrained, device=device,
     )
     tokenizer = open_clip.get_tokenizer(model_name)
     model.eval()
@@ -210,47 +211,31 @@ def _build_vljepa_backend(checkpoint_path: str, device: str):
 
 # ── COCO data loader ───────────────────────────────────────────────────────
 
-def _load_coco(image_size: int, preprocess, batch_size: int = 64, num_workers: int = 4):
-    """Load COCO val2017 and return (image_loader, captions, text_to_image)."""
-    from torchvision.datasets import CocoCaptions
+def _load_coco(image_size: int, preprocess, batch_size: int = 64, num_workers: int = 4,
+               coco_root: Optional[Path] = None, captions_per_image: int = 5):
+    """Load COCO val2017 with the evaluate_retrieval 5-caption protocol."""
     from torch.utils.data import DataLoader
 
-    from src.dataset import ensure_coco_2017, _image_root, _caption_ann_path
+    from experiments.evaluate_retrieval import (
+        _ImageDataset,
+        _gather_captions,
+        _load_coco as _er_load_coco,
+    )
+    from src.dataset import _default_coco_root
 
-    ensure_coco_2017()
-    img_root = _image_root()
-    ann_path = _caption_ann_path()
-
-    class ImageDataset:
-        def __init__(self, root, ann, transform):
-            self.ds = CocoCaptions(root=root, annFile=ann, transform=transform)
-        def __len__(self):
-            return len(self.ds)
-        def __getitem__(self, idx):
-            img, _ = self.ds[idx]
-            return img
-
-    ds = ImageDataset(img_root, ann_path, preprocess)
-    loader = DataLoader(ds, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
-
-    # Load captions and image mapping
-    import json as _json
-    with open(ann_path) as f:
-        ann = _json.load(f)
-
-    # Build ordered lists
-    img_ids = sorted({a["image_id"] for a in ann["annotations"]})
-    img_id_to_idx = {iid: i for i, iid in enumerate(img_ids)}
-
-    captions = []
-    text_to_image = []
-    for a in ann["annotations"]:
-        captions.append(a["caption"])
-        text_to_image.append(img_id_to_idx[a["image_id"]])
-
-    text_to_image = torch.tensor(text_to_image, dtype=torch.long)
-
-    return loader, captions, text_to_image, len(img_ids)
+    root = (
+        Path(coco_root).expanduser().resolve()
+        if coco_root is not None
+        else _default_coco_root()
+    )
+    coco = _er_load_coco(root)
+    captions, text_to_image = _gather_captions(coco, captions_per_image)
+    ds = _ImageDataset(coco, preprocess)
+    loader = DataLoader(
+        ds, batch_size=batch_size, num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+    return loader, captions, text_to_image, len(coco)
 
 
 # ── Flickr30K data loader ──────────────────────────────────────────────────

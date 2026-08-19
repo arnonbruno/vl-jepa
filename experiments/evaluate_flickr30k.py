@@ -80,19 +80,22 @@ def _ensure_flickr_assets() -> Tuple[Path, Path]:
 
 def _load_test_split(csv_path: Path) -> Tuple[List[str], List[str], torch.Tensor]:
     """Parse the Karpathy ``test`` split: filenames, flat captions, t2i map."""
-    import pandas as pd
+    import csv
 
-    df = pd.read_csv(csv_path)
-    df = df[df["split"] == "test"].reset_index(drop=True)
     filenames: List[str] = []
     texts: List[str] = []
     text_to_image: List[int] = []
-    for image_idx, row in df.iterrows():
-        caps = ast.literal_eval(row["raw"])
-        filenames.append(str(row["filename"]))
-        for cap in caps:
-            texts.append(str(cap).strip())
-            text_to_image.append(int(image_idx))
+    image_idx = 0
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if row.get("split") != "test":
+                continue
+            caps = ast.literal_eval(row["raw"])
+            filenames.append(str(row["filename"]))
+            for cap in caps:
+                texts.append(str(cap).strip())
+                text_to_image.append(image_idx)
+            image_idx += 1
     return filenames, texts, torch.tensor(text_to_image, dtype=torch.long)
 
 

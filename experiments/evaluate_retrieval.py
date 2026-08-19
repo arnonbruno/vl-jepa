@@ -56,7 +56,7 @@ from src.dataset import (  # noqa: E402
     ensure_coco_2017,
 )
 from src.eval_retrieval import compute_retrieval_metrics, format_metrics  # noqa: E402
-from src.model import VL_JEPA  # noqa: E402
+from src.model import VL_JEPA, create_openclip_model_and_transforms  # noqa: E402
 
 try:
     import open_clip
@@ -159,13 +159,56 @@ def _encode_texts(
 
 def _vljepa_weights_from_ckpt(ckpt: Dict[str, Any]):
     """Prefer EMA/WiSE-FT eval weights; fall back to the live student."""
-    if ckpt.get("model_eval_state") is not None:
-        return ckpt["model_eval_state"]
-    if ckpt.get("model_state_dict") is not None:
+    eval_state = ckpt.get("model_eval_state")
+    if eval_state:
+        return eval_state
+    if ckpt.get("model_state_dict"):
         return ckpt["model_state_dict"]
     raise KeyError(
         "Checkpoint missing 'model_eval_state' and 'model_state_dict'"
     )
+
+
+_VLJEPA_REQUIRED_ARCH_KEYS = (
+    "hidden_dim",
+    "patch_size",
+    "image_size",
+    "predictor_layers",
+    "vision_backbone",
+    "text_backbone",
+    "projection_dim",
+    "projection_type",
+    "text_pool",
+)
+
+
+def _model_cfg_from_checkpoint_config(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Validate architecture keys. Nested ``config['model']`` is the current schema.
+
+    A complete legacy *flat* config (architecture keys at the top level, no
+    nested ``model`` dict) is accepted only when every required key is present.
+    Incomplete nested configs are never filled with guessed defaults.
+    """
+    if not isinstance(cfg, dict) or not cfg:
+        raise KeyError("Checkpoint config must be a non-empty dict")
+    if isinstance(cfg.get("model"), dict):
+        mcfg = cfg["model"]
+        source = "config['model']"
+        data_cfg = cfg.get("data") if isinstance(cfg.get("data"), dict) else {}
+    else:
+        mcfg = cfg
+        source = "legacy flat config"
+        data_cfg = cfg.get("data") if isinstance(cfg.get("data"), dict) else {}
+    missing = [k for k in _VLJEPA_REQUIRED_ARCH_KEYS if k not in mcfg]
+    if mcfg.get("vision_backbone") == "openclip" or mcfg.get("text_backbone") == "openclip":
+        for key in ("openclip_model", "openclip_pretrained"):
+            if key not in mcfg:
+                missing.append(key)
+    if missing:
+        raise KeyError(
+            f"Checkpoint {source} missing required architecture keys: {missing}"
+        )
+    return mcfg, data_cfg
 
 
 def _build_vljepa_backend(checkpoint: Path, device: torch.device):
@@ -176,29 +219,29 @@ def _build_vljepa_backend(checkpoint: Path, device: torch.device):
             f"Checkpoint {checkpoint} has no 'config' key; refusing to guess "
             "architecture. Re-save with config included."
         )
-    mcfg = cfg.get("model", {})
+    mcfg, data_cfg = _model_cfg_from_checkpoint_config(cfg)
     model = VL_JEPA(
-        hidden_dim=mcfg.get("hidden_dim", 768),
-        patch_size=mcfg.get("patch_size", 16),
-        image_size=mcfg.get("image_size", 224),
+        hidden_dim=mcfg["hidden_dim"],
+        patch_size=mcfg["patch_size"],
+        image_size=mcfg["image_size"],
         mask_ratio=mcfg.get("mask_ratio", 0.75),
-        predictor_layers=mcfg.get("predictor_layers", 4),
+        predictor_layers=mcfg["predictor_layers"],
         text_mask_ratio=mcfg.get("text_mask_ratio", 0.0),
-        vision_backbone=mcfg.get("vision_backbone", "openclip"),
-        text_backbone=mcfg.get("text_backbone", "openclip"),
+        vision_backbone=mcfg["vision_backbone"],
+        text_backbone=mcfg["text_backbone"],
         openclip_model=mcfg.get("openclip_model", "ViT-B-16"),
         openclip_pretrained=mcfg.get("openclip_pretrained", "openai"),
         freeze_encoders=mcfg.get("freeze_encoders", True),
-        projection_dim=mcfg.get("projection_dim", 512),
-        projection_type=mcfg.get("projection_type", "clip_residual"),
-        text_pool=mcfg.get("text_pool", "eot"),
+        projection_dim=mcfg["projection_dim"],
+        projection_type=mcfg["projection_type"],
+        text_pool=mcfg["text_pool"],
         contrastive_loss=mcfg.get("contrastive_loss", "infonce"),
     ).to(device).eval()
-    model.load_state_dict(_vljepa_weights_from_ckpt(ckpt), strict=False)
+    model.load_state_dict(_vljepa_weights_from_ckpt(ckpt), strict=True)
 
-    image_size = mcfg.get("image_size", 224)
-    max_len = cfg.get("data", {}).get("max_caption_length", 64)
-    text_backbone = mcfg.get("text_backbone", "openclip")
+    image_size = mcfg["image_size"]
+    max_len = data_cfg.get("max_caption_length", cfg.get("max_caption_length", 64))
+    text_backbone = mcfg["text_backbone"]
     tokenizer = CaptionTokenizer(
         text_backbone=text_backbone,
         openclip_model=mcfg.get("openclip_model", "ViT-B-16"),
@@ -222,10 +265,10 @@ def _build_zeroshot_backend(model_name: str, pretrained: str, device: torch.devi
         raise ImportError("open_clip_torch is required for --zeroshot")
     # OpenAI CLIP weights were trained with QuickGELU; open_clip's default
     # configs use plain GELU, which silently degrades the model (a noticeable
-    # retrieval drop). Force QuickGELU so the baseline is the real CLIP.
-    extra = {"force_quick_gelu": True} if pretrained == "openai" else {}
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        model_name, pretrained=pretrained, **extra,
+    # retrieval drop). Force QuickGELU so the baseline is the real CLIP, with
+    # a TypeError fallback for open_clip builds that reject the kwarg.
+    model, _, preprocess = create_openclip_model_and_transforms(
+        model_name, pretrained=pretrained,
     )
     model = model.to(device).eval()
     image_size = model.visual.image_size
@@ -250,8 +293,10 @@ def _build_zeroshot_backend(model_name: str, pretrained: str, device: torch.devi
 # Protocol drivers
 # ---------------------------------------------------------------------------
 
-def _eval_5k(image_embs, text_embs, text_to_image) -> Dict[str, float]:
-    return compute_retrieval_metrics(image_embs, text_embs, text_to_image, normalize=False)
+def _eval_5k(image_embs, text_embs, text_to_image, **metric_kw) -> Dict[str, float]:
+    return compute_retrieval_metrics(
+        image_embs, text_embs, text_to_image, normalize=False, **metric_kw,
+    )
 
 
 def _eval_1k(image_embs, text_embs, text_to_image, caps_per_image: int) -> Dict[str, float]:
@@ -288,6 +333,14 @@ def main() -> None:
     parser.add_argument("--coco-root", type=str, default="~/.cache/torch/hub/checkpoints")
     parser.add_argument("--protocol", choices=("5k", "1k", "both"), default="both")
     parser.add_argument("--captions-per-image", type=int, default=5)
+    parser.add_argument(
+        "--ambiguity-diagnostics",
+        action="store_true",
+        help=(
+            "Also report caption-string multiplicity diagnostics (not a "
+            "leaderboard metric)"
+        ),
+    )
     parser.add_argument("--max-images", type=int, default=None,
                         help="Cap images (quick smoke); default: full val set")
     parser.add_argument("--batch-size", type=int, default=128)
@@ -357,11 +410,23 @@ def main() -> None:
     print(f"  {text_embs.shape} in {time.time() - t1:.1f}s")
 
     results: Dict[str, Dict[str, float]] = {}
+    diag_kw = (
+        {"captions": texts, "diagnostics": True}
+        if args.ambiguity_diagnostics else {}
+    )
     if args.protocol in ("5k", "both"):
-        m5k = _eval_5k(image_embs, text_embs, text_to_image)
+        m5k = _eval_5k(image_embs, text_embs, text_to_image, **diag_kw)
         results["5k"] = m5k
         print(f"\n--- COCO {num_images}-image (5K protocol) ---")
         print(format_metrics(m5k))
+        if args.ambiguity_diagnostics:
+            print(
+                "  [diagnostic] caption multiplicity "
+                f"mean={m5k['diag_caption_multiplicity_mean']:.3f} "
+                f"frac_ambiguous={m5k['diag_frac_ambiguous_captions']:.3f} "
+                f"t2i_r1_any_gt={m5k['diag_t2i_r1_any_gt']:.2f}"
+            )
+            print(f"  {m5k['diag_note']}")
     if args.protocol in ("1k", "both"):
         m1k = _eval_1k(image_embs, text_embs, text_to_image, args.captions_per_image)
         results["1k"] = m1k

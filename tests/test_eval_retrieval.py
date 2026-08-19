@@ -109,3 +109,50 @@ def test_format_metrics_runs():
     texts = torch.randn(50, 8)
     out = format_metrics(compute_retrieval_metrics(images, texts, text_to_image))
     assert "I2T" in out and "T2I" in out and "rsum" in out
+
+
+def test_ambiguity_diagnostic_is_opt_in_and_conservative():
+    """Duplicate GT caption strings are extra t2i positives, not a SOTA metric.
+
+    Standard Recall@K is unchanged. The diagnostic reports per-caption
+    positive multiplicity from exact caption-string provenance so a caption
+    that is a valid description of two annotated images is not scored as a
+    false negative under t2i. It is not a new retrieval leaderboard number.
+    """
+    from src.eval_retrieval import caption_positive_multiplicity
+
+    images = torch.nn.functional.normalize(torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ]), dim=-1)
+    # Two captions per image; "shared dog" is annotated on both images.
+    captions = ["shared dog", "only image0", "shared dog", "only image1"]
+    text_to_image = torch.tensor([0, 0, 1, 1])
+    texts = torch.nn.functional.normalize(torch.tensor([
+        [0.2, 0.8],   # closer to image 1 than to its source image 0
+        [1.0, 0.0],
+        [0.8, 0.2],   # closer to image 0 than to its source image 1
+        [0.0, 1.0],
+    ]), dim=-1)
+
+    standard = compute_retrieval_metrics(images, texts, text_to_image, normalize=False)
+    assert "diag_t2i_r1_any_gt" not in standard
+    assert "diag_caption_multiplicity_mean" not in standard
+
+    tagged = compute_retrieval_metrics(
+        images, texts, text_to_image, normalize=False,
+        captions=captions, diagnostics=True,
+    )
+    for key in ("i2t_r1", "t2i_r1", "rsum"):
+        assert tagged[key] == pytest.approx(standard[key])
+
+    mult = caption_positive_multiplicity(captions, text_to_image, num_images=2)
+    assert torch.equal(mult, torch.tensor([2, 1, 2, 1]))
+    assert tagged["diag_caption_multiplicity_mean"] == pytest.approx(1.5)
+    assert tagged["diag_caption_multiplicity_max"] == pytest.approx(2.0)
+    assert tagged["diag_frac_ambiguous_captions"] == pytest.approx(0.5)
+    # Standard t2i R@1 misses the two swapped "shared dog" captions (50%).
+    # Ambiguity-aware t2i treats the other annotated image as a valid positive.
+    assert tagged["t2i_r1"] == pytest.approx(50.0)
+    assert tagged["diag_t2i_r1_any_gt"] == pytest.approx(100.0)
+    assert tagged["diag_note"].startswith("evaluation diagnostic")

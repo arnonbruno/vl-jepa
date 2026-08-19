@@ -472,6 +472,8 @@ class VL_JEPA_Trainer:
                 name: tensor.detach().cpu().clone()
                 for name, tensor in self.model.state_dict().items()
             }
+        self._holding_eval_weights = False
+        self._eval_live_snapshot: Optional[Dict[str, torch.Tensor]] = None
         projection_dim = getattr(model, "projection_dim", model.hidden_dim)
         self.memory_bank = (
             MemoryBank(memory_bank_size, projection_dim, device)
@@ -854,7 +856,10 @@ class VL_JEPA_Trainer:
         Gradients accumulate across micro-batches. ``zero_grad`` runs only when a
         new accumulation window starts; the optimizer/scheduler/EMA updates run
         only when ``step_optimizer`` is True. The micro-batch loss is scaled by
-        ``1 / accumulation_steps`` so the summed gradient matches a full batch.
+        ``1 / accumulation_steps`` so a *full* window matches a full-batch mean
+        gradient. A short final window (``len % accum != 0``) is rescaled by
+        ``accumulation_steps / actual_microbatches`` before the clip/step so the
+        partial window is not under-weighted.
 
         Returns (success, grad_norm). For pure-accumulation calls (no optimizer
         step) success reflects only that backward ran and grad_norm is the last
@@ -878,6 +883,15 @@ class VL_JEPA_Trainer:
 
         if self.scaler is not None:
             self.scaler.unscale_(self.optimizer)
+
+        actual = self._accum_counter
+        if actual > 0 and actual != accumulation_steps:
+            scale = accumulation_steps / float(actual)
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad.mul_(scale)
+
+        if self.scaler is not None:
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 self.max_grad_norm,
@@ -1269,29 +1283,52 @@ class VL_JEPA_Trainer:
             raise ValueError("Cannot evaluate an empty validation loader")
         return {k: v / count for k, v in metrics_sum.items()}
 
-    def build_eval_state_dict(self) -> Dict[str, torch.Tensor]:
+    def build_eval_state_dict(
+        self,
+        live_state_dict: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor]:
         """Return the state dict to evaluate with (EMA + WiSE-FT applied).
 
         Precedence: start from the EMA weights if model EMA is enabled, else the
-        live weights; then, if ``wise_ft_alpha < 1``, interpolate toward the
-        zero-shot init. This is the "robust" model that should be evaluated and
-        checkpointed instead of the raw last-step weights.
+        live student (``live_state_dict`` when provided, otherwise
+        ``model.state_dict()``); then, if ``wise_ft_alpha < 1``, interpolate
+        toward the zero-shot init. Passing the live snapshot is required when
+        the module currently holds eval weights so WiSE-FT is not applied twice.
         """
         # Build the eval state on CPU. The interpolation and any large-backbone
         # weight juggling happens off the GPU so it cannot OOM on top of the
         # live training allocation; eval_weights() loads it back to the GPU
         # parameter-by-parameter at the end.
-        src = (
-            self.model_ema.state_dict()
-            if self.model_ema is not None
-            else self.model.state_dict()
-        )
+        if self.model_ema is not None:
+            src = self.model_ema.state_dict()
+        elif live_state_dict is not None:
+            src = live_state_dict
+        elif self._eval_live_snapshot is not None:
+            src = self._eval_live_snapshot
+        else:
+            src = self.model.state_dict()
         base = {k: v.detach().to("cpu") for k, v in src.items()}
         if self._zeroshot_state is not None and self.wise_ft_alpha < 1.0:
             base = wise_ft_interpolate(
                 self._zeroshot_state, base, self.wise_ft_alpha,
             )
         return base
+
+    def snapshot_live_state(self) -> Dict[str, torch.Tensor]:
+        """CPU clone of the live student weights (for best-checkpoint saves)."""
+        return {
+            k: v.detach().to("cpu").clone() for k, v in self.model.state_dict().items()
+        }
+
+    @staticmethod
+    def _cpu_clone_state(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                out[key] = value.detach().to("cpu").clone()
+            else:
+                out[key] = value
+        return out
 
     @contextlib.contextmanager
     def eval_weights(self):
@@ -1309,18 +1346,50 @@ class VL_JEPA_Trainer:
         # of the model in VRAM while evaluating. load_state_dict copies each
         # parameter back in place, so the CPU->GPU transfer is one tensor at a
         # time rather than a full GPU duplicate.
-        live = {k: v.detach().to("cpu").clone() for k, v in self.model.state_dict().items()}
+        live = self.snapshot_live_state()
+        self._eval_live_snapshot = live
+        self._holding_eval_weights = True
         try:
-            self.model.load_state_dict(self.build_eval_state_dict(), strict=False)
+            self.model.load_state_dict(
+                self.build_eval_state_dict(live_state_dict=live), strict=False,
+            )
             yield
         finally:
             self.model.load_state_dict(live, strict=False)
+            self._holding_eval_weights = False
+            self._eval_live_snapshot = None
 
-    def save_checkpoint(self, path: str, extra: Optional[Dict] = None):
-        """Save full training state."""
+    def save_checkpoint(
+        self,
+        path: str,
+        extra: Optional[Dict] = None,
+        live_state_dict: Optional[Dict[str, torch.Tensor]] = None,
+    ):
+        """Save full training state.
+
+        ``model_state_dict`` is always the live student. Pass ``live_state_dict``
+        (or rely on the snapshot taken by ``eval_weights``) when saving inside
+        that context so the swapped eval tensors are not written as the student.
+        ``model_eval_state`` is the EMA/WiSE-FT weights that produced the
+        retrieval score — a single interpolation, never a second WiSE-FT apply
+        on already-interpolated tensors.
+        """
+        holding = self._holding_eval_weights
+        if live_state_dict is not None:
+            model_state = self._cpu_clone_state(live_state_dict)
+        elif holding and self._eval_live_snapshot is not None:
+            model_state = self._cpu_clone_state(self._eval_live_snapshot)
+        else:
+            model_state = self.model.state_dict()
+
+        if holding:
+            eval_state = self._cpu_clone_state(self.model.state_dict())
+        else:
+            eval_state = self.build_eval_state_dict(live_state_dict=model_state)
+
         state = {
-            'model_state_dict': self.model.state_dict(),
-            'model_eval_state': self.build_eval_state_dict(),
+            'model_state_dict': model_state,
+            'model_eval_state': eval_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,

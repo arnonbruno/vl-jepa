@@ -85,3 +85,28 @@ def test_alpha_zero_train_step_does_not_run_predictor() -> None:
     assert metrics.get("skipped") is False
     assert math.isfinite(metrics["total_loss"])
     assert math.isfinite(metrics["nce_loss"])
+
+
+def test_alpha_zero_cached_and_live_forward_share_contract() -> None:
+    model = _tiny()
+    model.eval()
+    images = torch.randn(2, 3, 64, 64)
+    input_ids = torch.randint(0, 100, (2, 8))
+    attn = torch.ones(2, 8, dtype=torch.long)
+    with torch.no_grad():
+        live = model(images, input_ids, attn, compute_jepa=False)
+        local = model.context_encoder(images, mask=None)
+        language = model.language_encoder(input_ids, attn)
+        cached = model.forward_from_cache(
+            local, local, language, attn, compute_jepa=False,
+        )
+    assert set(live) == set(cached)
+    assert live["predicted_patches"].shape[1] == 1
+    assert cached["predicted_patches"].shape[1] == 1
+    assert live["predicted_patches"].dtype == cached["predicted_patches"].dtype
+    assert torch.isfinite(live["predicted_patches"]).all()
+    assert torch.isfinite(cached["predicted_patches"]).all()
+    assert live["vision_proj"].shape == cached["vision_proj"].shape
+    assert live["language_proj"].shape == cached["language_proj"].shape
+    assert torch.allclose(live["vision_proj"], cached["vision_proj"], atol=1e-5)
+    assert torch.allclose(live["language_proj"], cached["language_proj"], atol=1e-5)
