@@ -867,15 +867,18 @@ def main() -> None:
             if retrieval_score > best_retrieval:
                 best_retrieval = retrieval_score
                 ckpt_path = exp_dir / 'checkpoint_best.pt'
-                # Persist the robust (EMA/WiSE-FT) weights so the saved best
-                # checkpoint matches the weights that produced this R@1.
+                # Persist live student weights plus the robust (EMA/WiSE-FT)
+                # eval tensors that produced this R@1. Snapshot live *before*
+                # entering eval_weights so model_state_dict is never the
+                # interpolated eval copy.
+                live_state = trainer.snapshot_live_state()
                 with trainer.eval_weights():
                     trainer.save_checkpoint(str(ckpt_path), {
                         'epoch': epoch + 1,
                         'val_loss': val_loss,
                         'retrieval_score': retrieval_score,
                         'config': cfg,
-                    })
+                    }, live_state_dict=live_state)
                 print(
                     f"  → Best model saved (mean R@1 {retrieval_score:.2%}, "
                     f"val_loss {val_loss:.4f})"
@@ -883,7 +886,7 @@ def main() -> None:
 
             if (epoch + 1) % out_cfg["checkpoint_interval"] == 0:
                 ckpt_path = exp_dir / f'checkpoint_epoch{epoch+1}.pt'
-                trainer.save_checkpoint(str(ckpt_path), {'epoch': epoch + 1})
+                trainer.save_checkpoint(str(ckpt_path), {'epoch': epoch + 1, 'config': cfg})
                 print(f"  → Checkpoint saved: epoch {epoch+1}")
 
             with open(exp_dir / 'metrics.json', 'w') as f:

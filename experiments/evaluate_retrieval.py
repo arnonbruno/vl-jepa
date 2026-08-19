@@ -39,7 +39,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -55,8 +55,12 @@ from src.dataset import (  # noqa: E402
     _image_root,
     ensure_coco_2017,
 )
-from src.eval_retrieval import compute_retrieval_metrics, format_metrics  # noqa: E402
-from src.model import VL_JEPA  # noqa: E402
+from src.eval_retrieval import (  # noqa: E402
+    average_standard_metrics,
+    compute_retrieval_metrics,
+    format_metrics,
+)
+from src.model import VL_JEPA, create_openclip_model_and_transforms  # noqa: E402
 
 try:
     import open_clip
@@ -157,42 +161,138 @@ def _encode_texts(
     return torch.cat(feats, dim=0)
 
 
+def _vljepa_weights_from_ckpt(ckpt: Dict[str, Any]):
+    """Prefer EMA/WiSE-FT eval weights; fall back to the live student."""
+    eval_state = ckpt.get("model_eval_state")
+    if eval_state:
+        return eval_state
+    if ckpt.get("model_state_dict"):
+        return ckpt["model_state_dict"]
+    raise KeyError(
+        "Checkpoint missing 'model_eval_state' and 'model_state_dict'"
+    )
+
+
+_VLJEPA_REQUIRED_ARCH_KEYS = (
+    "hidden_dim",
+    "patch_size",
+    "image_size",
+    "predictor_layers",
+    "vision_backbone",
+    "text_backbone",
+    "projection_dim",
+    "projection_type",
+    "text_pool",
+)
+
+
+def _model_cfg_from_checkpoint_config(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Validate architecture keys. Nested ``config['model']`` is the current schema.
+
+    A complete legacy *flat* config (architecture keys at the top level, no
+    nested ``model`` dict) is accepted only when every required key is present.
+    Incomplete nested configs are never filled with guessed defaults.
+
+    Optional keys that are *not* architecture (eval encoding does not depend
+    on them) keep the same defaults as ``VL_JEPA.__init__`` / training:
+
+    * ``mask_ratio`` (0.75) and ``text_mask_ratio`` (0.0): training masks;
+      eval uses the unmasked context/language encoders.
+    * ``freeze_encoders`` (True): ``requires_grad`` only.
+    * ``contrastive_loss`` (``"infonce"``): training loss selector.
+
+    Tokenizer length is also not an architecture key. When
+    ``max_caption_length`` is omitted, eval uses 64, matching
+    ``CaptionTokenizer`` and the training default. ``openclip_model`` /
+    ``openclip_pretrained`` remain required when either backbone is
+    ``openclip``; the constructor defaults below apply only to custom
+    backbones, where those arguments are unused.
+    """
+    if not isinstance(cfg, dict) or not cfg:
+        raise KeyError("Checkpoint config must be a non-empty dict")
+    if isinstance(cfg.get("model"), dict):
+        mcfg = cfg["model"]
+        source = "config['model']"
+        data_cfg = cfg.get("data") if isinstance(cfg.get("data"), dict) else {}
+    else:
+        mcfg = cfg
+        source = "legacy flat config"
+        data_cfg = cfg.get("data") if isinstance(cfg.get("data"), dict) else {}
+    missing = [k for k in _VLJEPA_REQUIRED_ARCH_KEYS if k not in mcfg]
+    if mcfg.get("vision_backbone") == "openclip" or mcfg.get("text_backbone") == "openclip":
+        for key in ("openclip_model", "openclip_pretrained"):
+            if key not in mcfg:
+                missing.append(key)
+    if missing:
+        raise KeyError(
+            f"Checkpoint {source} missing required architecture keys: {missing}"
+        )
+    return mcfg, data_cfg
+
+
+def _is_unexpected_kwarg_typeerror(exc: TypeError, keyword: str) -> bool:
+    msg = str(exc)
+    return "unexpected keyword argument" in msg and keyword in msg
+
+
+def _torch_load_checkpoint(path: Path, map_location):
+    """Load a checkpoint; fall back if this torch build rejects ``weights_only``."""
+    try:
+        return torch.load(str(path), map_location=map_location, weights_only=False)
+    except TypeError as exc:
+        if not _is_unexpected_kwarg_typeerror(exc, "weights_only"):
+            raise
+        return torch.load(str(path), map_location=map_location)
+
+
 def _build_vljepa_backend(checkpoint: Path, device: torch.device):
-    ckpt = torch.load(str(checkpoint), map_location=device, weights_only=False)
-    cfg = ckpt.get("config", {})
-    mcfg = cfg.get("model", {})
+    ckpt = _torch_load_checkpoint(checkpoint, map_location=device)
+    cfg = ckpt.get("config")
+    if not cfg:
+        raise KeyError(
+            f"Checkpoint {checkpoint} has no 'config' key; refusing to guess "
+            "architecture. Re-save with config included."
+        )
+    mcfg, data_cfg = _model_cfg_from_checkpoint_config(cfg)
+    # Non-architectural eval defaults: training knobs and tokenizer length.
+    # See _model_cfg_from_checkpoint_config. Do not treat these as reconstructed
+    # old-checkpoint architecture.
     model = VL_JEPA(
-        hidden_dim=mcfg.get("hidden_dim", 768),
-        patch_size=mcfg.get("patch_size", 16),
-        image_size=mcfg.get("image_size", 224),
+        hidden_dim=mcfg["hidden_dim"],
+        patch_size=mcfg["patch_size"],
+        image_size=mcfg["image_size"],
         mask_ratio=mcfg.get("mask_ratio", 0.75),
-        predictor_layers=mcfg.get("predictor_layers", 4),
-        vision_backbone=mcfg.get("vision_backbone", "openclip"),
-        text_backbone=mcfg.get("text_backbone", "openclip"),
+        predictor_layers=mcfg["predictor_layers"],
+        text_mask_ratio=mcfg.get("text_mask_ratio", 0.0),
+        vision_backbone=mcfg["vision_backbone"],
+        text_backbone=mcfg["text_backbone"],
         openclip_model=mcfg.get("openclip_model", "ViT-B-16"),
         openclip_pretrained=mcfg.get("openclip_pretrained", "openai"),
         freeze_encoders=mcfg.get("freeze_encoders", True),
-        projection_dim=mcfg.get("projection_dim", 512),
-        projection_type=mcfg.get("projection_type", "clip_residual"),
-        text_pool=mcfg.get("text_pool", "eot"),
+        projection_dim=mcfg["projection_dim"],
+        projection_type=mcfg["projection_type"],
+        text_pool=mcfg["text_pool"],
         contrastive_loss=mcfg.get("contrastive_loss", "infonce"),
     ).to(device).eval()
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    model.load_state_dict(_vljepa_weights_from_ckpt(ckpt), strict=True)
 
-    image_size = mcfg.get("image_size", 224)
-    max_len = cfg.get("data", {}).get("max_caption_length", 64)
+    image_size = mcfg["image_size"]
+    max_len = data_cfg.get("max_caption_length", cfg.get("max_caption_length", 64))
+    text_backbone = mcfg["text_backbone"]
     tokenizer = CaptionTokenizer(
-        text_backbone="openclip",
+        text_backbone=text_backbone,
         openclip_model=mcfg.get("openclip_model", "ViT-B-16"),
         max_caption_length=max_len,
     )
 
     def encode_image(images):
-        return model.vision_proj.raw(model.context_encoder(images)[:, 0, :].float())
+        vision_emb = model.context_encoder(images)
+        vision_cls = vision_emb[:, 0, :].float()
+        return model.vision_proj(vision_cls)
 
     def encode_text(ids, attn):
         lang = model.language_encoder(ids, attn).float()
-        return model.language_proj.raw(model._pool_language(lang, attn))
+        return model.language_proj(model._pool_language(lang, attn))
 
     return encode_image, encode_text, tokenizer, image_size, max_len
 
@@ -202,10 +302,10 @@ def _build_zeroshot_backend(model_name: str, pretrained: str, device: torch.devi
         raise ImportError("open_clip_torch is required for --zeroshot")
     # OpenAI CLIP weights were trained with QuickGELU; open_clip's default
     # configs use plain GELU, which silently degrades the model (a noticeable
-    # retrieval drop). Force QuickGELU so the baseline is the real CLIP.
-    extra = {"force_quick_gelu": True} if pretrained == "openai" else {}
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        model_name, pretrained=pretrained, **extra,
+    # retrieval drop). Force QuickGELU so the baseline is the real CLIP, with
+    # a TypeError fallback for open_clip builds that reject the kwarg.
+    model, _, preprocess = create_openclip_model_and_transforms(
+        model_name, pretrained=pretrained,
     )
     model = model.to(device).eval()
     image_size = model.visual.image_size
@@ -230,32 +330,31 @@ def _build_zeroshot_backend(model_name: str, pretrained: str, device: torch.devi
 # Protocol drivers
 # ---------------------------------------------------------------------------
 
-def _eval_5k(image_embs, text_embs, text_to_image) -> Dict[str, float]:
-    return compute_retrieval_metrics(image_embs, text_embs, text_to_image, normalize=False)
+def _eval_5k(image_embs, text_embs, text_to_image, **metric_kw) -> Dict[str, Any]:
+    return compute_retrieval_metrics(
+        image_embs, text_embs, text_to_image, normalize=False, **metric_kw,
+    )
 
 
-def _eval_1k(image_embs, text_embs, text_to_image, caps_per_image: int) -> Dict[str, float]:
-    """Average metrics over 5 disjoint 1000-image folds (classic COCO 1K)."""
+def _eval_1k(
+    image_embs, text_embs, text_to_image, fold_size: int = 1000,
+) -> Dict[str, float]:
+    """Average standard metrics over complete disjoint ``fold_size``-image folds."""
     num_images = image_embs.size(0)
-    fold_size = 1000
     n_folds = num_images // fold_size
     if n_folds == 0:
         return _eval_5k(image_embs, text_embs, text_to_image)
-    keys = None
-    acc: Dict[str, float] = {}
+    folds: List[Dict[str, Any]] = []
     for fold in range(n_folds):
         lo, hi = fold * fold_size, (fold + 1) * fold_size
         img_fold = image_embs[lo:hi]
         text_mask = (text_to_image >= lo) & (text_to_image < hi)
         txt_fold = text_embs[text_mask]
         t2i_fold = text_to_image[text_mask] - lo
-        m = compute_retrieval_metrics(img_fold, txt_fold, t2i_fold, normalize=False)
-        if keys is None:
-            keys = list(m.keys())
-            acc = {k: 0.0 for k in keys}
-        for k in keys:
-            acc[k] += m[k]
-    return {k: v / n_folds for k, v in acc.items()}
+        folds.append(
+            compute_retrieval_metrics(img_fold, txt_fold, t2i_fold, normalize=False)
+        )
+    return average_standard_metrics(folds)
 
 
 def main() -> None:
@@ -268,6 +367,15 @@ def main() -> None:
     parser.add_argument("--coco-root", type=str, default="~/.cache/torch/hub/checkpoints")
     parser.add_argument("--protocol", choices=("5k", "1k", "both"), default="both")
     parser.add_argument("--captions-per-image", type=int, default=5)
+    parser.add_argument(
+        "--ambiguity-diagnostics",
+        action="store_true",
+        help=(
+            "Also report nested caption-string multiplicity diagnostics "
+            "for the full evaluation pool (not a leaderboard metric, not "
+            "fold-averaged, never part of rsum)"
+        ),
+    )
     parser.add_argument("--max-images", type=int, default=None,
                         help="Cap images (quick smoke); default: full val set")
     parser.add_argument("--batch-size", type=int, default=128)
@@ -304,7 +412,6 @@ def main() -> None:
 
     if args.max_images is not None:
         keep = args.max_images
-        image_ds.coco = coco  # keep reference; subset via mask below
         mask = text_to_image < keep
         text_to_image = text_to_image[mask]
         texts = [t for t, m in zip(texts, mask.tolist()) if m]
@@ -336,23 +443,50 @@ def main() -> None:
     )
     print(f"  {text_embs.shape} in {time.time() - t1:.1f}s")
 
-    results: Dict[str, Dict[str, float]] = {}
+    results: Dict[str, Dict[str, Any]] = {}
+    diagnostics: Optional[Dict[str, Any]] = None
     if args.protocol in ("5k", "both"):
-        m5k = _eval_5k(image_embs, text_embs, text_to_image)
+        m5k = _eval_5k(
+            image_embs, text_embs, text_to_image,
+            captions=texts if args.ambiguity_diagnostics else None,
+            diagnostics=args.ambiguity_diagnostics,
+        )
+        if args.ambiguity_diagnostics:
+            diagnostics = m5k.pop("diagnostics")
         results["5k"] = m5k
         print(f"\n--- COCO {num_images}-image (5K protocol) ---")
         print(format_metrics(m5k))
+        if diagnostics is not None:
+            print(
+                "  [diagnostic] evaluation-only; not a retrieval result. "
+                f"t2i_r1_any_gt={diagnostics['t2i_r1_any_gt']:.2f} "
+                f"(standard t2i_r1={m5k['t2i_r1']:.2f})"
+            )
+            print(f"  {diagnostics['note']}")
     if args.protocol in ("1k", "both"):
-        m1k = _eval_1k(image_embs, text_embs, text_to_image, args.captions_per_image)
+        m1k = _eval_1k(image_embs, text_embs, text_to_image)
         results["1k"] = m1k
-        print(f"\n--- COCO 1K protocol (5-fold avg) ---")
+        print("\n--- COCO 1K protocol (mean of complete 1000-image folds) ---")
         print(format_metrics(m1k))
+    if args.ambiguity_diagnostics and diagnostics is None:
+        tagged = compute_retrieval_metrics(
+            image_embs, text_embs, text_to_image, normalize=False,
+            captions=texts, diagnostics=True,
+        )
+        diagnostics = tagged["diagnostics"]
+        print("\n  [diagnostic] computed on the full pool (not fold-averaged)")
+        print(f"  {diagnostics['note']}")
 
     if args.output:
         out_path = Path(args.output).expanduser().resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = {
+            "backend": backend, "num_images": num_images, "results": results,
+        }
+        if diagnostics is not None:
+            payload["diagnostics"] = diagnostics
         with open(out_path, "w") as f:
-            json.dump({"backend": backend, "num_images": num_images, "results": results}, f, indent=2)
+            json.dump(payload, f, indent=2)
         print(f"\nSaved metrics to {out_path}")
 
 
