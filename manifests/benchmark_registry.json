@@ -1,0 +1,56 @@
+{
+  "coco_sentence_histogram": {
+    "5": 122959,
+    "6": 324,
+    "7": 4
+  },
+  "counts": {
+    "clean_dev": 5000,
+    "clean_train": 113287,
+    "flickr30k_test": 1000,
+    "flickr30k_train": 29000,
+    "flickr30k_val": 1014,
+    "karpathy_coco_restval": 30504,
+    "karpathy_coco_test": 5000,
+    "karpathy_coco_train": 82783,
+    "karpathy_coco_val": 5000,
+    "removed_from_train": 0,
+    "restval_included_in_clean_train": true
+  },
+  "development_split": "karpathy_coco_val_minus_loaded_final_benchmark_ids",
+  "disjointness": {
+    "claimed_disjoint_from_not_loaded_benchmarks": false,
+    "clean_train_disjoint_from_karpathy_coco_test": true,
+    "clean_train_disjoint_from_karpathy_coco_val": true,
+    "pretraining_contamination": "unknown_not_ruled_out",
+    "train2017_adapted_checkpoint_is_clean_karpathy_test": false
+  },
+  "five_caption_rule": "first_five_sentences_in_file_order",
+  "flickr_sentence_histogram": {
+    "5": 31014
+  },
+  "images_on_disk": false,
+  "label": "Karpathy-derived, benchmark-disjoint training set",
+  "loaded_final_benchmarks": {
+    "coco_karpathy_test": {
+      "canonical_form": "coco:{cocoid}",
+      "id_space": "coco",
+      "n": 5000
+    },
+    "flickr30k_karpathy_test": {
+      "canonical_form": "flickr30k:{filename}",
+      "id_space": "flickr30k",
+      "n": 1000,
+      "note": "Flickr ids are a different space from COCO. Removing them does not remove COCO images, and a COCO-trained checkpoint is not thereby a clean Flickr model in the pretraining sense."
+    }
+  },
+  "not_labeled_as": "unmodified COCO train2017",
+  "not_loaded": [
+    "sugarcrepe++",
+    "winoground",
+    "gqa",
+    "visual_genome",
+    "oxford_iiit_pets"
+  ],
+  "restval_included": true
+}

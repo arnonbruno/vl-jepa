@@ -1,0 +1,11 @@
+{
+  "status": "measured",
+  "scope": "throughput_probe_not_a_result",
+  "device": "NVIDIA GeForce RTX 5080",
+  "batch": 8,
+  "tokens": 197,
+  "seconds_per_step": 0.009271114016883075,
+  "peak_vram_bytes": 286137856,
+  "excludes": "clip_image_and_text_encoding",
+  "note": "Timing uses cached-style random tokens. It is not a COCO step and not a leaderboard row."
+}

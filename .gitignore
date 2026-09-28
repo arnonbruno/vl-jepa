@@ -37,6 +37,19 @@ data/
 *.json
 !exp_*.json
 
+# Protocol handoff artifacts. Global *.csv / *.json would hide these.
+!manifests/
+!manifests/**
+!manifests/**/*.csv
+!manifests/**/*.json
+!manifests/**/*.md
+!experiment_registry.csv
+!final_results.csv
+!cache_manifest.json
+!runs/
+!runs/**/*.json
+!runs/**/*.csv
+
 # Logs
 logs/
 *.log

@@ -1,0 +1,9 @@
+{
+  "coco_cache_built": false,
+  "dataset": "synthetic_reference",
+  "feature_dropout_masks_before_encoder": false,
+  "fingerprint": "8cce640d75deb7c8c49ec8cb010e3ad6f30694ad042efdd4928c47965e0751bf",
+  "note": "Synthetic float16 parity. The 113287-image cache was not built.",
+  "parity_max_abs": 5.906820297241211e-05,
+  "precision": "float16"
+}

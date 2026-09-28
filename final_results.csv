@@ -1,0 +1,7 @@
+row_id,scope,protocol,split,seed,metric,value,uncertainty,cost,status,source
+historical_vitb16_zeroshot,archived_regression_only,historical_protocol_b_coco_val2017,coco_val2017_5k_not_karpathy_test,not_recorded,rsum,373.2879966497421,not_recorded,not_recorded,archived_not_remeasured,experiments/exp_baseline_vitb16_zeroshot.json
+historical_vitb16_robust,archived_regression_only,historical_protocol_b_coco_val2017,coco_val2017_5k_not_karpathy_test,not_recorded,rsum,393.09600591659546,not_recorded,not_recorded,archived_not_remeasured,experiments/exp_vljepa_vitb16_robust.json
+phase0-reference-seed0,phase0_reference_not_a_benchmark,synthetic_token_reference,synthetic_reference,0,final_step_loss,0.9423322677612305,single_run,0.225858s_cpu,not_a_benchmark,runs/phase0-reference-seed0/record.json
+target_screen,scientific,not_run,not_run,not_run,not_applicable,,,0 runs,not_launched,src/conditional/screen.py
+mechanism_screen,scientific,not_run,not_run,not_run,not_applicable,,,0 runs,not_launched,src/conditional/mechanism.py
+confirmation,scientific,not_run,not_run,"0,1,2_preregistered",not_applicable,,,0 runs,preregistered_not_unblinded,src/protocol/preregistration.py

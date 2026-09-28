@@ -1,0 +1,39 @@
+{
+  "all_karpathy_n": 123287,
+  "karpathy_ids_outside_coco2017": 0,
+  "karpathy_test_in_train2017": 4407,
+  "karpathy_test_in_val2017": 593,
+  "per_karpathy_split": {
+    "restval": {
+      "in_neither": 0,
+      "in_train2017": 26705,
+      "in_val2017": 3799,
+      "n": 30504
+    },
+    "test": {
+      "in_neither": 0,
+      "in_train2017": 4407,
+      "in_val2017": 593,
+      "n": 5000
+    },
+    "train": {
+      "in_neither": 0,
+      "in_train2017": 82783,
+      "in_val2017": 0,
+      "n": 82783
+    },
+    "val": {
+      "in_neither": 0,
+      "in_train2017": 4392,
+      "in_val2017": 608,
+      "n": 5000
+    }
+  },
+  "train2017_adapted_checkpoint_is_clean_karpathy_test": false,
+  "train2017_equals_all_karpathy_ids": false,
+  "train2017_equals_karpathy_minus_val2017": true,
+  "train2017_n": 118287,
+  "train2017_val2017_overlap": 0,
+  "val2017_n": 5000,
+  "val2017_subset_of_karpathy_ids": true
+}

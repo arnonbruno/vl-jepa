@@ -1,0 +1,24 @@
+{
+  "canonical_coco_id": "coco:{cocoid}",
+  "canonical_flickr_id": "flickr30k:{filename}",
+  "coco_annotations_url": "http://images.cocodataset.org/annotations/annotations_trainval2017.zip",
+  "filename_cocoid_checked": true,
+  "images_downloaded": false,
+  "karpathy_url": "http://cs.stanford.edu/people/karpathy/deepimagesent/caption_datasets.zip",
+  "paths": {
+    "coco_ann_zip": "data/external/coco_ann/annotations_trainval2017.zip",
+    "coco_train2017": "data/external/coco_ann/annotations/captions_train2017.json",
+    "coco_val2017": "data/external/coco_ann/annotations/captions_val2017.json",
+    "karpathy_coco": "data/external/dataset_coco.json",
+    "karpathy_flickr": "data/external/dataset_flickr30k.json",
+    "karpathy_zip": "data/external/caption_datasets.zip"
+  },
+  "sha256": {
+    "coco_ann_zip": "113a836d90195ee1f884e704da6304dfaaecff1f023f49b6ca93c4aaae470268",
+    "coco_train2017": "4b62086319480e0739ef390d04084515defb9c213ff13605a036061e33314317",
+    "coco_val2017": "afe3b30e403dd7f228e2373023abbd60042a6e10ec6874d3652df034d289ebb9",
+    "karpathy_coco": "2fd999220673258012acfb411a4e7e66af7d488050b2519b0badcc49b7600b8d",
+    "karpathy_flickr": "db779ee2c5df40c25ff0eebeca464f6124b620cc4a9398650aea71fd1b53d4af",
+    "karpathy_zip": "4cfd70132527b80933105e5829dc9034eaab9573482e2e680abbab6130244817"
+  }
+}
