@@ -62,9 +62,10 @@ EMBEDDING_GEMMA_300M = TargetSpec(
     },
     documents_receive_instruction=True,
     notes=(
-        "Mean-pool the prompt together with the text. Matryoshka truncation "
-        "keeps the leading dimensions and renormalizes. Captions used as "
-        "documents take the document prompt. The role has to be explicit."
+        "Mean-pool the prompt together with the text, then apply the released "
+        "768 to 3072 to 768 post-pooling projections. Truncate that native "
+        "768-d vector to 512 and L2-normalize. Inference is float32 or bfloat16. "
+        "Captions used as documents take the document prompt."
     ),
 )
 

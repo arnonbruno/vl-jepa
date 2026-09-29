@@ -1,6 +1,6 @@
 # OpenCLIP ViT-L/14 — robust retrieval fine-tuning to break the ViT-B/16 ceiling.
 #
-# Rationale (see RESULTS.md): under the *standard* COCO 5K protocol the robust
+# Rationale: under the standard COCO 5K protocol the robust
 # ViT-B/16 recipe already beats CLIP ViT-B/16 zero-shot (rsum 393.1 vs 356.9).
 # The remaining headroom is encoder capacity: CLIP ViT-L/14 zero-shot starts
 # from a much stronger representation, so the same robust recipe on top of it is
