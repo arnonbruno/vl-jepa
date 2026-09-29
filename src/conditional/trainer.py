@@ -137,6 +137,7 @@ class ConditionalTrainer:
         self.sampler_state = None
         self.grad_clip = float(config.grad_clip)
         self.last_preclip_grad_norm: float | None = None
+        self.grad_norm_trace: list[float] = []
         self.last_postclip_grad_norm: float | None = None
 
     def train_step(self, batch: Mapping[str, Any]) -> float:
@@ -163,6 +164,7 @@ class ConditionalTrainer:
         self.last_preclip_grad_norm = float(
             torch.nn.utils.clip_grad_norm_(parameters, self.grad_clip).item()
         )
+        self.grad_norm_trace.append(self.last_preclip_grad_norm)
         self.last_postclip_grad_norm = _grad_norm(parameters)
         self.optimizer.step()
         self.scheduler.step()

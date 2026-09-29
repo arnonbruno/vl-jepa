@@ -1,5 +1,5 @@
 # VL-JEPA default training configuration
-# See README.md and INVESTIGATION.md for architecture context.
+# See README.md for architecture context.
 
 model:
   hidden_dim: 768          # ViT-Large / BERT-base scale (12-layer encoders)

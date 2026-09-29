@@ -42,6 +42,34 @@ def paraphrase_margin(
     return float((anchor * positive - anchor * negative).sum(dim=-1).mean().item())
 
 
+def neighborhood_mean_cosine(embeddings: torch.Tensor, k: int) -> float:
+    """Mean cosine from each vector to its ``k`` nearest other vectors."""
+    if embeddings.dim() != 2 or embeddings.size(0) < 2:
+        raise ValueError("neighborhood statistics need a (N, D) sample with N >= 2")
+    if k < 1 or k >= embeddings.size(0):
+        raise ValueError("k must be at least 1 and smaller than the sample")
+    unit = F.normalize(embeddings.float(), dim=-1, eps=1e-6)
+    similarity = unit @ unit.T
+    similarity.fill_diagonal_(float("-inf"))
+    return float(similarity.topk(k, dim=1).values.mean().item())
+
+
+def exact_collision_pairs(embeddings: torch.Tensor, *, atol: float = 0.0) -> int:
+    """Count unordered pairs whose vectors are equal within ``atol``."""
+    if embeddings.dim() != 2 or embeddings.size(0) < 2:
+        raise ValueError("collision check needs a (N, D) sample with N >= 2")
+    distance = torch.cdist(embeddings.float(), embeddings.float())
+    upper = torch.triu(torch.ones_like(distance, dtype=torch.bool), diagonal=1)
+    return int((distance <= atol)[upper].sum().item())
+
+
+def collision_action(embeddings: torch.Tensor) -> str:
+    """Exact copies cannot be split by a function of the pooled vector."""
+    if exact_collision_pairs(embeddings, atol=0.0) > 0:
+        return "switch_encoder_or_prepooling_tokens"
+    return "adapter_may_reshape_near_collisions"
+
+
 def separation_sufficient(prediction: torch.Tensor, positive: torch.Tensor, negative: torch.Tensor) -> bool:
     """Sufficient condition from the execution plan, not a necessary one.
 
